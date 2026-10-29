@@ -165,11 +165,21 @@ runs:
     - name: Set compiler cache environment
       shell: bash
       run: |
+        # Some dependencies build with -march=native (RocksDB with its
+        # default PORTABLE=0, fsst), and runners with the same label can have
+        # different CPUs. Hashing the CPU's instruction-set flags keeps an
+        # object built for one CPU from being reused on a CPU that cannot run
+        # it (SIGILL in the tests).
+        cpu_flags_file="${RUNNER_TEMP}/ccache-cpu-flags"
+        sed -n '/^flags/{s/^flags[[:space:]]*:[[:space:]]*//p;q}' /proc/cpuinfo |
+          tr ' ' '\n' | sort -u > "${cpu_flags_file}"
+        echo "CPU flags hashed by ccache: $(wc -w < "${cpu_flags_file}")"
         {
           echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache"
           echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
           echo "CCACHE_NOHASHDIR=true"
           echo "CCACHE_COMPILERCHECK=content"
+          echo "CCACHE_EXTRAFILES=${cpu_flags_file}"
           # Compiler-cache generations and the source cache share the
           # repository's cache quota.
           echo "CCACHE_MAXSIZE=4G"

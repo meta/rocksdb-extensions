@@ -1,0 +1,4 @@
+# RocksDB's style, which this code follows.
+---
+BasedOnStyle: Google
+...
