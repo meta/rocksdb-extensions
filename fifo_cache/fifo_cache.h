@@ -27,6 +27,16 @@ class FIFOCache
  public:
   explicit FIFOCache(const FIFOCacheOptions& opts);
   const char* Name() const override { return "FIFOCache"; }
+
+  // Total charge of the entries in the probation queues, and of those last
+  // seen pinned, which don't count toward probation's share.
+  size_t TEST_GetProbationUsage() const;
+  size_t TEST_GetProbationPinnedUsage() const;
+  // Probation's share of capacity, summed over shards.
+  size_t TEST_GetProbationTarget() const;
+  // What kFullChargeCacheMetadata charges for the tables: slots, their
+  // probation words and the probation queues' rings.
+  size_t TEST_GetMetadataCharge() const;
 };
 
 }  // namespace fifo_cache

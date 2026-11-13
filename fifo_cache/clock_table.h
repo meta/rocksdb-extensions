@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -584,6 +585,73 @@ class BaseClockTable {
   const uint32_t& hash_seed_;
 };
 
+// FIFOCache: the probation queue's order, a lock-free FIFO of 64-bit values
+// that grows with the table. It is a chain of bounded rings, each Vyukov's
+// MPMC ring buffer and each a larger power of two than the one before,
+// carved in order from one lazily zeroed reservation, so only rings in use
+// take memory. Pushes go to the newest ring and pops drain the oldest.
+// Adding a ring closes the one before it with a flag on its enqueue
+// position, as LCRQ does, and pops move past a closed ring once every
+// position pushed to it has been taken. Push and Pop never wait for another
+// thread: a full ring, or a cell another thread has claimed and not yet
+// filled, makes them report full or empty, and the caller falls back to the
+// resident queue. Rings are unmapped only with the queue, so a thread that
+// stalls inside an old ring never reads freed memory.
+class ProbationQueue {
+ public:
+  // Rings start at first_ring_capacity cells and stop at max_ring_capacity,
+  // both powers of two.
+  ProbationQueue(size_t first_ring_capacity, size_t max_ring_capacity);
+
+  // Appends v. Returns false if the newest ring is full or its next cell is
+  // still held by a pop.
+  bool Push(uint64_t v);
+  // Takes the oldest value. Returns false if there is none, or the oldest
+  // was claimed by a push that has not filled it yet.
+  bool Pop(uint64_t* v);
+  // Takes the oldest value only if pred(value) holds. Returns false if it
+  // doesn't, or for the reasons Pop does.
+  template <typename Pred>
+  bool PopIf(uint64_t* v, const Pred& pred);
+
+  // Cells in the newest ring.
+  size_t RingCapacity() const;
+  // Adds a ring of `capacity` cells, a power of two larger than the newest
+  // ring's and no larger than max_ring_capacity, after the newest ring.
+  // Returns true if this call added it, false if another thread is adding a
+  // ring or capacity is out of range.
+  bool TryAddRing(size_t capacity);
+  // Cells in every ring added so far.
+  size_t CellCount() const;
+
+  struct Cell {
+    // The Vyukov sequence number minus the cell's index in its ring, so
+    // that zeroed memory is a ring with nothing pushed.
+    std::atomic<uint64_t> seq;
+    RelaxedAtomic<uint64_t> value;
+  };
+
+ private:
+  struct Ring {
+    Cell* cells = nullptr;
+    uint64_t mask = 0;
+    ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> enqueue{0};
+    ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> dequeue{0};
+  };
+  // Set on a ring's enqueue position once a newer ring takes its pushes.
+  static constexpr uint64_t kClosed = uint64_t{1} << 63;
+
+  const TypedMemMapping<Cell> cells_;
+  const size_t max_ring_capacity_;
+  const uint32_t max_rings_;
+  const std::unique_ptr<Ring[]> rings_;
+  // The ring pops take from, the ring pushes go to, and how many rings have
+  // been claimed (tail_ + 2 while a ring is being added, else tail_ + 1).
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint32_t> head_{0};
+  std::atomic<uint32_t> tail_{0};
+  std::atomic<uint32_t> rings_claimed_{1};
+};
+
 // Hash table for cache entries that resizes automatically based on occupancy.
 // However, it depends on a contiguous memory region to grow into
 // incrementally, using linear hashing, so uses an anonymous mmap so that
@@ -778,6 +846,9 @@ class AutoHyperClockTable : public BaseClockTable {
   struct InsertState {
     uint64_t saved_length_info = 0;
     size_t likely_empty_slot = 0;
+    // FIFOCache: the charge of the entry being inserted that will go into
+    // the probation queue, which Evict counts toward probation's share.
+    size_t probation_charge = 0;
   };
 
   void StartInsert(InsertState& state);
@@ -809,6 +880,52 @@ class AutoHyperClockTable : public BaseClockTable {
   size_t GetOccupancyLimit() const;
 
   const HandleImpl* HandlePtr(size_t idx) const { return &array_[idx]; }
+
+  // FIFOCache: total charge of the entries in the probation queue, and of
+  // those last seen pinned.
+  size_t GetProbationUsage() const { return probation_usage_.LoadRelaxed(); }
+  size_t GetProbationPinnedUsage() const {
+    return probation_pinned_usage_.LoadRelaxed();
+  }
+  // FIFOCache: kProbationPercent of capacity, rounded down.
+  size_t ProbationTarget() const;
+
+  // FIFOCache: what kFullChargeCacheMetadata charges for the table: its
+  // slots, their probation words and the probation queue's rings.
+  size_t GetMetadataCharge() const;
+
+  // FIFOCache: S3-FIFO's constants, as in FIFOCache before this table. A
+  // probation head hit at least kPromoteThreshold times is promoted to the
+  // resident queue, and probation's share is kProbationPercent of capacity
+  // by charge. The resident clock caps counts at kMaxCountdown, the same 3.
+  static constexpr uint32_t kPromoteThreshold = 2;
+  static constexpr size_t kProbationPercent = 12;
+  // FIFOCache: how many stale cells an insert into a full probation queue
+  // drops to make room before sending its entry to the resident queue.
+  static constexpr size_t kMaxStaleDropsPerPush = 8;
+
+  // FIFOCache: each slot has a 32-bit probation word beside it, since
+  // HandleImpl has no spare bits. kInProbation is set while the entry is in the
+  // probation queue. kCountsInsertRef is set while a probation entry's counters
+  // still include the reference Insert returned with it, whose Release adds one
+  // to them without being a hit. Promotion resets the counters; an entry that
+  // leaves probation any other way (when the queue has no room for it) keeps
+  // them, so in the resident queue that Release counts as a hit, as in
+  // HyperClockCache. kSeenPinned is set on a probation entry last seen pinned
+  // by a probation step or the resident sweep, and takes its charge out of
+  // probation's share (see Evict). The bits above count inserts into the slot,
+  // so that a queue cell naming a slot and word can tell a later entry in the
+  // slot from the one it was pushed for; with kInProbation they are the word's
+  // identity, which the other two bits can change under without invalidating
+  // the cell. The slot's owner writes the word before publishing the entry.
+  // Whoever takes the entry out of the probation queue clears kInProbation and
+  // kSeenPinned, and kCountsInsertRef too unless it is removing the entry.
+  static constexpr uint32_t kInProbation = 1;
+  static constexpr uint32_t kCountsInsertRef = 2;
+  static constexpr uint32_t kSeenPinned = 4;
+  static constexpr uint32_t kProbationGenerationOne = 8;
+  static constexpr uint32_t kProbationIdentity =
+      ~(kCountsInsertRef | kSeenPinned);
 
 #ifndef NDEBUG
   size_t& TEST_MutableOccupancyLimit() {
@@ -878,6 +995,49 @@ class AutoHyperClockTable : public BaseClockTable {
   // the corresponding old home.)
   void CatchUpLengthInfoNoWait(size_t known_usable_grow_home);
 
+  // FIFOCache: the S3-FIFO pieces on top of the table.
+
+  // TryInsert for DoInsert that also writes the slot's probation word, with
+  // word_flags, while the slot is under construction, so the entry is
+  // published with it. Sets *word to the word written.
+  bool TryInsertSlot(const ClockHandleBasicData& proto, size_t idx,
+                     uint32_t initial_countdown, uint32_t word_flags,
+                     uint32_t* word, bool* already_matches);
+  // Pushes (slot idx, word) onto the probation queue, adding a larger ring
+  // first if the newest is full and the table has outgrown it.
+  bool ProbationPush(size_t idx, uint32_t word);
+  // Whether a queued value no longer names the entry it was pushed for.
+  bool IsStaleProbationCell(uint64_t v) const;
+  // Moves the entry in slot idx from the probation queue to the resident
+  // queue if its probation word's identity is still word's. Returns whether
+  // this call moved it.
+  bool LeaveProbation(size_t idx, uint32_t word, size_t total_charge);
+  // LeaveProbation for a caller holding no reference to the entry: takes
+  // one to read its charge, unless the entry is already leaving the table.
+  void LeaveProbationUnowned(size_t idx, uint32_t word);
+  // Runs fn(entry) holding a reference to the entry in slot idx, as Lookup
+  // takes one, so its charge can be read, unless the slot is empty or under
+  // (de)construction. Dropping the reference frees an entry erased
+  // meanwhile if it was the last.
+  template <typename Fn>
+  void WithReference(size_t idx, const Fn& fn);
+  // The resident sweep's part for a probation entry it skips, under the
+  // chain's lock: keeps kSeenPinned matching whether it is pinned.
+  void SweepProbationEntry(HandleImpl& h, uint32_t word, bool pinned);
+  // For whoever took ownership of the entry in slot idx to remove it: takes
+  // it out of whichever queue's accounting it is in.
+  void TrackRemoval(size_t idx, size_t total_charge);
+  // Handles one probation head: skips it if stale, rotates it to the tail
+  // if pinned, promotes it if hit kPromoteThreshold times (setting
+  // *promoted), else evicts it. Returns false if the queue had nothing to
+  // pop.
+  bool ProbationStep(EvictionData* data, bool* promoted);
+  // Marks the probation entry in slot idx seen pinned, if its word's
+  // identity is still word's, taking a reference to read its charge.
+  void MarkSeenPinned(size_t idx, uint32_t word);
+  // The probation queue's ring size for a table with this occupancy limit.
+  static size_t ProbationRingCapacity(size_t occupancy_limit);
+
  private:  // data
   // mmaped area holding handles
   const TypedMemMapping<HandleImpl> array_;
@@ -914,6 +1074,23 @@ class AutoHyperClockTable : public BaseClockTable {
   // See explanation in AutoHyperClockTable::Evict
   // (Relaxed: allowed to lag behind clock_pointer_ and length_info_ state)
   RelaxedAtomic<size_t> clock_pointer_mask_;
+
+  // FIFOCache: one probation word per slot of array_ (see kInProbation),
+  // lazily zeroed like array_.
+  const TypedMemMapping<RelaxedAtomic<uint32_t>> probation_words_;
+
+  // FIFOCache: the probation queue's order, as (slot index << 32 | word).
+  ProbationQueue probation_;
+
+  // FIFOCache: charge of the entries with kInProbation set, and of those
+  // that also have kSeenPinned set.
+  ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<size_t> probation_usage_{};
+  RelaxedAtomic<size_t> probation_pinned_usage_{};
+
+  // FIFOCache: entries in the table that are in the resident queue. Signed
+  // because racing updates can take it below zero for a moment; Evict reads
+  // zero or less as an empty resident queue.
+  RelaxedAtomic<int64_t> resident_count_{};
 };  // class AutoHyperClockTable
 
 // A single shard of sharded cache.

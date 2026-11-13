@@ -32,6 +32,26 @@ HyperClockCacheOptions TableOptions(const FIFOCacheOptions& opts) {
 FIFOCache::FIFOCache(const FIFOCacheOptions& opts)
     : AutoHyperClockCache(TableOptions(opts)) {}
 
+size_t FIFOCache::TEST_GetProbationUsage() const {
+  return SumOverShards(
+      [](Shard& shard) { return shard.GetTable().GetProbationUsage(); });
+}
+
+size_t FIFOCache::TEST_GetProbationPinnedUsage() const {
+  return SumOverShards(
+      [](Shard& shard) { return shard.GetTable().GetProbationPinnedUsage(); });
+}
+
+size_t FIFOCache::TEST_GetProbationTarget() const {
+  return SumOverShards(
+      [](Shard& shard) { return shard.GetTable().ProbationTarget(); });
+}
+
+size_t FIFOCache::TEST_GetMetadataCharge() const {
+  return SumOverShards(
+      [](Shard& shard) { return shard.GetTable().GetMetadataCharge(); });
+}
+
 }  // namespace fifo_cache
 
 const std::unordered_map<std::string, OptionTypeInfo>&
