@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -33,8 +34,8 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {
 
-// Block cache keys are 16 bytes, the only length the cache takes for now.
-// Names up to 16 bytes, padded with zeros.
+// Block cache keys are 16 bytes, the length the cache keeps as a
+// reversible hash. Names up to 16 bytes, padded with zeros.
 std::string K(const std::string& name) {
   EXPECT_LE(name.size(), size_t{16});
   std::string key = name;
@@ -47,6 +48,28 @@ std::string K(uint32_t i) {
   snprintf(buf, sizeof(buf), "key%013u", i);
   return std::string(buf, 16);
 }
+
+// Keys of several lengths, all distinct: by i % 3, "k" and i's digits (2
+// to 11 bytes), K(i), or i's digits padded with 'x' to 17 + i % 100 bytes.
+// Only the 16-byte ones skip the HeapKey.
+std::string L(uint32_t i) {
+  switch (i % 3) {
+    case 0:
+      return "k" + std::to_string(i);
+    case 1:
+      return K(i);
+    default: {
+      std::string key = std::to_string(i);
+      key.resize(17 + i % 100, 'x');
+      return key;
+    }
+  }
+}
+
+// Under kFullChargeCacheMetadata a key that isn't 16 bytes is charged for
+// its copy: its length and a header of a helper pointer, a charge and a
+// length.
+constexpr size_t kHeapKeyHeader = sizeof(void*) + 2 * sizeof(size_t);
 
 // Under kFullChargeCacheMetadata each slot the table has grown to is
 // charged 64 bytes for itself, 4 for its probation word and 4 for its ghost
@@ -157,7 +180,6 @@ class FIFOCacheTest : public testing::Test {
   // bits of the hash the home comes from), so none of their tags replaces
   // another's.
   static std::vector<std::string> NineKeysWithOwnHomes(Cache* cache) {
-    using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
     std::set<uint64_t> taken;
     for (uint32_t i = 0; i < 9; ++i) {
       taken.insert(Shard::ComputeHash(K(i), cache->GetHashSeed())[1] & 63);
@@ -203,6 +225,46 @@ class FIFOCacheTest : public testing::Test {
     HitNTimes(cache, K("big"), 3);
     ASSERT_EQ(21 * kU, fifo->TEST_GetProbationUsage());
   }
+
+  // HeapKeys allocated and not yet freed, in every cache. Release builds
+  // don't count them and give 0.
+  static int64_t LiveHeapKeys() {
+#ifndef NDEBUG
+    return fifo_cache::TEST_LiveHeapKeys();
+#else
+    return 0;
+#endif  // !NDEBUG
+  }
+
+  // That n more HeapKeys are allocated than were at base, from LiveHeapKeys.
+  // Always true in Release builds.
+  static testing::AssertionResult HeapKeysAbove(int64_t base, int64_t n) {
+#ifndef NDEBUG
+    const int64_t more = fifo_cache::TEST_LiveHeapKeys() - base;
+    if (more != n) {
+      return testing::AssertionFailure()
+             << more << " more HeapKeys, expected " << n;
+    }
+#else
+    (void)base;
+    (void)n;
+#endif  // !NDEBUG
+    return testing::AssertionSuccess();
+  }
+
+  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
+
+  // A shard on its own, so a test can give a key any hash.
+  struct LoneShard {
+    explicit LoneShard(size_t capacity, bool strict = false)
+        : shard(capacity, strict, kDontChargeCacheMetadata,
+                /*allocator*/ nullptr, &callback, &seed,
+                fifo_cache::AutoHyperClockTable::Opts(
+                    HyperClockCacheOptions(/*capacity*/ 0))) {}
+    const Cache::EvictionCallback callback;
+    const uint32_t seed = 12345;
+    Shard shard;
+  };
 
   static void HitNTimes(Cache* cache, const std::string& key, int n) {
     for (int i = 0; i < n; ++i) {
@@ -800,9 +862,10 @@ TEST_F(FIFOCacheTest, LookupIgnoresSecondaryParameters) {
                                    Cache::Priority::HIGH, nullptr));
 }
 
-// A 16-byte key is stored as a reversible hash; ApplyToAllEntries and the
-// eviction callback give back the exact key, under a nonzero seed and on
-// several shards.
+// A 16-byte key is stored as a reversible hash and any other in a HeapKey;
+// ApplyToAllEntries and the eviction callback give back the exact key of
+// every length, the empty key too, under a nonzero seed and on several
+// shards.
 TEST_F(FIFOCacheTest, KeysComeBackExact) {
   FIFOCacheOptions opts(/*capacity*/ 1 << 20, /*num_shard_bits*/ 2,
                         /*strict_capacity_limit*/ false, nullptr,
@@ -810,10 +873,11 @@ TEST_F(FIFOCacheTest, KeysComeBackExact) {
   opts.hash_seed = 12345;
   std::shared_ptr<Cache> cache = opts.MakeSharedCache();
   ASSERT_NE(nullptr, cache);
-  std::set<std::string> inserted;
+  std::set<std::string> inserted = {std::string()};
+  ASSERT_OK(Insert(cache.get(), std::string(), /*charge*/ 1000));
   for (uint32_t i = 0; i < 200; ++i) {
-    inserted.insert(K(i));
-    ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 1000));
+    inserted.insert(L(i));
+    ASSERT_OK(Insert(cache.get(), L(i), /*charge*/ 1000));
   }
   EXPECT_EQ(inserted, Keys(cache.get()));
   for (const std::string& key : inserted) {
@@ -828,8 +892,8 @@ TEST_F(FIFOCacheTest, KeysComeBackExact) {
         return false;
       });
   for (uint32_t i = 1000; i < 3000; ++i) {
-    inserted.insert(K(i));
-    ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 1000));
+    inserted.insert(L(i));
+    ASSERT_OK(Insert(cache.get(), L(i), /*charge*/ 1000));
   }
   const std::set<std::string> remaining = Keys(cache.get());
   EXPECT_FALSE(evicted.empty());
@@ -843,24 +907,25 @@ TEST_F(FIFOCacheTest, KeysComeBackExact) {
 
 // The eviction callback runs for evictions, not for Erase or
 // EraseUnRefEntries, and a callback that returns true takes the value
-// instead of the cache deleting it.
+// instead of the cache deleting it. The cache still frees a HeapKey.
 TEST_F(FIFOCacheTest, EvictionCallbackTakesValues) {
   std::vector<CountedValue*> taken;
+  const int64_t heap_keys = LiveHeapKeys();
   {
     std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 5);
     Cache* raw = cache.get();
     cache->SetEvictionCallback(
         [&taken, raw](const Slice& key, Cache::Handle* h, bool /*was_hit*/) {
           auto* value = static_cast<CountedValue*>(raw->Value(h));
-          EXPECT_EQ(K(value->key), key.ToString());
+          EXPECT_EQ(L(value->key), key.ToString());
           taken.push_back(value);
           return true;
         });
-    ASSERT_OK(cache->Insert(K(0), new CountedValue(0), CountedHelper(), 1));
-    cache->Erase(K(0));
+    ASSERT_OK(cache->Insert(L(0), new CountedValue(0), CountedHelper(), 1));
+    cache->Erase(L(0));
     EXPECT_TRUE(taken.empty());
     for (uint32_t i = 1; i <= 20; ++i) {
-      ASSERT_OK(cache->Insert(K(i), new CountedValue(i), CountedHelper(), 1));
+      ASSERT_OK(cache->Insert(L(i), new CountedValue(i), CountedHelper(), 1));
     }
     EXPECT_GE(taken.size(), 15);
     for (CountedValue* value : taken) {
@@ -870,7 +935,9 @@ TEST_F(FIFOCacheTest, EvictionCallbackTakesValues) {
     cache->EraseUnRefEntries();
     EXPECT_EQ(evicted, taken.size());
   }
-  // The cache deleted everything but the values the callback took.
+  // The cache deleted everything but the values the callback took, and
+  // freed every key.
+  EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
   EXPECT_EQ(static_cast<int64_t>(taken.size()), LiveValues().load());
   for (CountedValue* value : taken) {
     DeleteCountedValue(value, nullptr);
@@ -894,29 +961,340 @@ TEST_F(FIFOCacheTest, EraseUnRefEntriesKeepsPinned) {
   EXPECT_EQ(0, cache->GetPinnedUsage());
 }
 
-// Keys of any length but 16 bytes are refused: Insert returns NotSupported,
-// Lookup and CreateStandalone find or make nothing, and Erase does nothing.
-TEST_F(FIFOCacheTest, KeysOfOtherLengthsAreRefused) {
-  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 100);
-  ASSERT_OK(Insert(cache.get(), K("a")));
-  for (const std::string& key :
-       {std::string(), std::string("a"), std::string(15, 'x'),
-        std::string(17, 'x'), K("a") + "!"}) {
-    SCOPED_TRACE(key.size());
-    Cache::Handle* h = nullptr;
-    Status s = Insert(cache.get(), key, 1, &h);
-    EXPECT_TRUE(s.IsNotSupported()) << s.ToString();
-    EXPECT_EQ(nullptr, h);
-    EXPECT_TRUE(Insert(cache.get(), key).IsNotSupported());
-    EXPECT_EQ(nullptr, cache->Lookup(key));
-    EXPECT_EQ(nullptr,
-              cache->CreateStandalone(key, nullptr, &kNoopCacheItemHelper, 1,
-                                      /*allow_uncharged*/ true));
-    cache->Erase(key);
+// Keys are cached and found by their bytes whatever their length: the
+// empty key, keys that differ only in length or in one byte, and a 16-byte
+// key next to its 17-byte extension. Erasing one leaves the others.
+TEST_F(FIFOCacheTest, KeysOfAnyLengthAreKeptApart) {
+  const int64_t heap_keys = LiveHeapKeys();
+  {
+    std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 20);
+    const std::vector<std::string> keys = {
+        std::string(), "a",    std::string("a\0", 2), "b",
+        "ab",          K("a"), K("a") + '\0',         std::string(1000, 'a')};
+    for (uint32_t i = 0; i < keys.size(); ++i) {
+      ASSERT_OK(
+          cache->Insert(keys[i], new CountedValue(i), CountedHelper(), 1));
+    }
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, keys.size() - 1));
+    EXPECT_EQ(std::set<std::string>(keys.begin(), keys.end()),
+              Keys(cache.get()));
+    for (uint32_t i = 0; i < keys.size(); ++i) {
+      Cache::Handle* h = cache->Lookup(keys[i]);
+      ASSERT_NE(nullptr, h) << i;
+      CheckCountedValue(cache.get(), h, i);
+      cache->Release(h);
+    }
+    for (const std::string& absent :
+         {std::string("c"), std::string("a\1", 2), std::string(15, 'a'),
+          std::string(999, 'a')}) {
+      EXPECT_EQ(nullptr, cache->Lookup(absent));
+    }
+    for (uint32_t i = 0; i < keys.size(); ++i) {
+      cache->Erase(keys[i]);
+      for (uint32_t j = 0; j < keys.size(); ++j) {
+        EXPECT_EQ(j > i, Contains(cache.get(), keys[j])) << i << " " << j;
+      }
+    }
+    EXPECT_EQ(0, LiveValues().load());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
   }
-  EXPECT_EQ(1, cache->GetUsage());
-  EXPECT_EQ(1, cache->GetOccupancyCount());
-  EXPECT_TRUE(Contains(cache.get(), K("a")));
+}
+
+// Keys with the same 128-bit hash, one of 16 bytes and twelve that aren't,
+// share a home in a shard. Each is found by its own bytes, including those
+// past the ten entries Lookup checks before its full search, each insert
+// goes in although an entry with the hash is at the home, and Erase takes
+// only the key it names.
+TEST_F(FIFOCacheTest, KeysWithOneHashAreKeptApart) {
+  const int64_t heap_keys = LiveHeapKeys();
+  {
+    LoneShard lone(/*capacity*/ 1 << 20);
+    Shard& shard = lone.shard;
+    const UniqueId64x2 hash = Shard::ComputeHash(K("c"), lone.seed);
+    std::vector<std::string> keys = {K("c")};
+    for (uint32_t i = 1; i <= 12; ++i) {
+      keys.push_back("h" + std::to_string(i));
+    }
+    for (uint32_t i = 0; i < keys.size(); ++i) {
+      ASSERT_OK(shard.Insert(keys[i], hash, new CountedValue(i),
+                             CountedHelper(), /*charge*/ 1,
+                             /*handle*/ nullptr, Cache::Priority::LOW));
+    }
+    EXPECT_EQ(keys.size(), shard.GetOccupancyCount());
+    // The value's number, or -1 if the key isn't found.
+    auto find = [&](const std::string& key) -> int64_t {
+      Shard::HandleImpl* h = shard.Lookup(key, hash);
+      if (h == nullptr) {
+        return -1;
+      }
+      const int64_t found = static_cast<CountedValue*>(h->value)->key;
+      shard.Release(h, /*useful*/ true, /*erase_if_last_ref*/ false);
+      return found;
+    };
+    for (uint32_t i = 0; i < keys.size(); ++i) {
+      EXPECT_EQ(i, find(keys[i])) << i;
+    }
+    EXPECT_EQ(-1, find("h13"));
+    EXPECT_EQ(-1, find(std::string()));
+    shard.Erase(keys[0], hash);
+    shard.Erase(keys[5], hash);
+    for (uint32_t i = 0; i < keys.size(); ++i) {
+      EXPECT_EQ(i == 0 || i == 5 ? -1 : int64_t{i}, find(keys[i])) << i;
+    }
+    EXPECT_EQ(keys.size() - 2, shard.GetOccupancyCount());
+    EXPECT_EQ(keys.size() - 2, LiveValues().load());
+  }
+  EXPECT_EQ(0, LiveValues().load());
+  EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
+}
+
+// Under kFullChargeCacheMetadata a key that isn't 16 bytes adds its copy's
+// size to usage and pinned usage, and under kDontChargeCacheMetadata
+// nothing. GetCharge, ApplyToHandle and ApplyToAllEntries give the charge
+// the entry was inserted with, and its helper comes back.
+TEST_F(FIFOCacheTest, HeapKeyChargedAsMetadata) {
+  for (CacheMetadataChargePolicy policy :
+       {kDontChargeCacheMetadata, kFullChargeCacheMetadata}) {
+    SCOPED_TRACE(policy);
+    const bool full = policy == kFullChargeCacheMetadata;
+    const size_t key_charge = full ? kHeapKeyHeader + 3 : 0;
+    // Pinned usage also counts a pinned entry's slot, as HyperClockCache's
+    // does.
+    const size_t slot_charge = full ? 64 : 0;
+    std::shared_ptr<Cache> cache = NewCache(1 << 20, /*strict*/ false, policy);
+    const size_t base = cache->GetUsage();
+    ASSERT_OK(Insert(cache.get(), K("a"), /*charge*/ 10));
+    EXPECT_EQ(base + 10, cache->GetUsage());
+    Cache::Handle* h = nullptr;
+    ASSERT_OK(Insert(cache.get(), "abc", /*charge*/ 20, &h));
+    EXPECT_EQ(base + 30 + key_charge, cache->GetUsage());
+    EXPECT_EQ(20 + key_charge + slot_charge, cache->GetPinnedUsage());
+    EXPECT_EQ(20, cache->GetCharge(h));
+    EXPECT_EQ(&kNoopCacheItemHelper, cache->GetCacheItemHelper(h));
+    int applied = 0;
+    cache->ApplyToHandle(
+        cache.get(), h,
+        [&](const Slice& key, Cache::ObjectPtr /*value*/, size_t charge,
+            const Cache::CacheItemHelper* helper) {
+          ++applied;
+          EXPECT_EQ("abc", key.ToString());
+          EXPECT_EQ(20, charge);
+          EXPECT_EQ(&kNoopCacheItemHelper, helper);
+        });
+    EXPECT_EQ(1, applied);
+    std::map<std::string, size_t> charges;
+    cache->ApplyToAllEntries(
+        [&](const Slice& key, Cache::ObjectPtr /*value*/, size_t charge,
+            const Cache::CacheItemHelper* helper) {
+          EXPECT_EQ(&kNoopCacheItemHelper, helper);
+          charges[key.ToString()] = charge;
+        },
+        {});
+    EXPECT_EQ((std::map<std::string, size_t>{{K("a"), 10}, {"abc", 20}}),
+              charges);
+    EXPECT_FALSE(cache->Release(h));
+    EXPECT_EQ(0, cache->GetPinnedUsage());
+    cache->Erase("abc");
+    EXPECT_EQ(base + 10, cache->GetUsage());
+  }
+}
+
+// Each way an entry with a HeapKey leaves the cache frees its copy once
+// and takes the copy's charge out of usage: Erase, unpinned or pinned and
+// then released, a release that erases, an insert of a cached key without
+// a handle or with one, a standalone entry's release, EraseUnRefEntries,
+// eviction and the cache's destruction.
+TEST_F(FIFOCacheTest, HeapKeyFreedOnEveryRemovalPath) {
+  const int64_t heap_keys = LiveHeapKeys();
+  {
+    std::shared_ptr<Cache> cache =
+        NewCache(64 * kU, /*strict*/ false, kFullChargeCacheMetadata);
+    Cache* c = cache.get();
+    FIFOCache* fifo = Fifo(c);
+    const size_t base = fifo->TEST_GetMetadataCharge();
+    ASSERT_EQ(base, c->GetUsage());
+    // A one-byte key.
+    const size_t charged = kU + kHeapKeyHeader + 1;
+
+    ASSERT_OK(Insert(c, "a", kU));
+    EXPECT_EQ(base + charged, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 1));
+    c->Erase("a");
+    EXPECT_EQ(base, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
+
+    Cache::Handle* h = nullptr;
+    ASSERT_OK(Insert(c, "a", kU, &h));
+    c->Erase("a");
+    EXPECT_EQ(base + charged, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 1));
+    EXPECT_TRUE(c->Release(h));
+    EXPECT_EQ(base, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
+
+    ASSERT_OK(Insert(c, "a", kU, &h));
+    EXPECT_TRUE(c->Release(h, /*erase_if_last_ref*/ true));
+    EXPECT_EQ(base, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
+
+    // Found at its home: dropped without a handle, standalone with one.
+    ASSERT_OK(Insert(c, "a", kU));
+    ASSERT_OK(Insert(c, "a", kU));
+    EXPECT_EQ(base + charged, c->GetUsage());
+    EXPECT_EQ(1, c->GetOccupancyCount());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 1));
+    Status s = Insert(c, "a", kU, &h);
+    ASSERT_TRUE(s.IsOkOverwritten()) << s.ToString();
+    EXPECT_EQ(base + 2 * charged, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 2));
+    EXPECT_TRUE(c->Release(h));
+    EXPECT_EQ(base + charged, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 1));
+
+    h = c->CreateStandalone("s", nullptr, &kNoopCacheItemHelper, kU,
+                            /*allow_uncharged*/ false);
+    ASSERT_NE(nullptr, h);
+    EXPECT_EQ(base + 2 * charged, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 2));
+    EXPECT_TRUE(c->Release(h));
+    EXPECT_EQ(base + charged, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 1));
+
+    c->EraseUnRefEntries();
+    EXPECT_EQ(base, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
+
+    std::vector<std::string> evicted;
+    RecordEvictions(c, &evicted);
+    size_t inserted = 0;
+    for (uint32_t i = 0; i < 100; ++i) {
+      ASSERT_OK(Insert(c, "e" + std::to_string(i), kU));
+      inserted += kU + kHeapKeyHeader + 1 + std::to_string(i).size();
+    }
+    ASSERT_FALSE(evicted.empty());
+    size_t freed = 0;
+    for (const std::string& key : evicted) {
+      freed += kU + kHeapKeyHeader + key.size();
+    }
+    EXPECT_EQ(fifo->TEST_GetMetadataCharge() + inserted - freed, c->GetUsage());
+    EXPECT_EQ(100 - evicted.size(), c->GetOccupancyCount());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 100 - evicted.size()));
+  }
+  EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
+}
+
+// An insert or CreateStandalone that strict_capacity_limit refuses frees
+// the key's copy, charges nothing and leaves the value with the caller. An
+// uncharged standalone entry charges nothing for its key either, and
+// reports a charge of 0.
+TEST_F(FIFOCacheTest, HeapKeyFreedWhenStrictInsertFails) {
+  const int64_t heap_keys = LiveHeapKeys();
+  {
+    std::shared_ptr<Cache> cache =
+        NewCache(1 << 20, /*strict*/ true, kFullChargeCacheMetadata);
+    Cache* c = cache.get();
+    Cache::Handle* pinned = nullptr;
+    ASSERT_OK(Insert(c, K("p"), (1 << 20) - c->GetUsage(), &pinned));
+    ASSERT_EQ(1 << 20, c->GetUsage());
+
+    auto* value = new CountedValue(1);
+    Cache::Handle* h = nullptr;
+    Status s = c->Insert("a", value, CountedHelper(), 1, &h);
+    EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+    EXPECT_EQ(nullptr, h);
+    s = c->Insert("a", value, CountedHelper(), 1);
+    EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+    EXPECT_EQ(kLiveMagic, value->magic.load());
+    DeleteCountedValue(value, nullptr);
+    EXPECT_EQ(nullptr,
+              c->CreateStandalone("a", nullptr, &kNoopCacheItemHelper, 1,
+                                  /*allow_uncharged*/ false));
+    EXPECT_EQ(1 << 20, c->GetUsage());
+    EXPECT_EQ(1, c->GetOccupancyCount());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
+
+    h = c->CreateStandalone("s", nullptr, &kNoopCacheItemHelper, 3,
+                            /*allow_uncharged*/ true);
+    ASSERT_NE(nullptr, h);
+    EXPECT_EQ(0, c->GetCharge(h));
+    EXPECT_EQ(1 << 20, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 1));
+    EXPECT_TRUE(c->Release(h));
+    EXPECT_EQ(1 << 20, c->GetUsage());
+    EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
+    EXPECT_FALSE(c->Release(pinned));
+  }
+}
+
+// The key's charge is added to the entry's without wrapping, so a strict
+// insert with a charge near SIZE_MAX is still too big for the cache.
+TEST_F(FIFOCacheTest, HeapKeyChargeSaturates) {
+  std::shared_ptr<Cache> cache =
+      NewCache(1 << 20, /*strict*/ true, kFullChargeCacheMetadata);
+  const size_t usage = cache->GetUsage();
+  Status s = Insert(cache.get(), "abc", SIZE_MAX - 10);
+  EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+  EXPECT_EQ(usage, cache->GetUsage());
+  EXPECT_EQ(0, cache->GetOccupancyCount());
+}
+
+// A copy of the key that can't be allocated fails Insert with MemoryLimit
+// and CreateStandalone with nullptr, caching and charging nothing: a length
+// whose copy wouldn't fit in a size_t is refused before malloc, and malloc
+// refuses one of half that. The key's bytes are never read, as the shard
+// is given the hash.
+TEST_F(FIFOCacheTest, KeyAllocationFailureFailsInsert) {
+  LoneShard lone(/*capacity*/ 1 << 20);
+  const char byte = 'k';
+  std::vector<size_t> sizes = {SIZE_MAX - 1};
+#if !defined(MUST_FREE_HEAP_ALLOCATIONS) && !defined(__SANITIZE_THREAD__)
+  // Sanitizer allocators abort on such a request rather than return nullptr.
+  sizes.push_back(SIZE_MAX / 2);
+#endif
+  for (size_t size : sizes) {
+    SCOPED_TRACE(size);
+    const Slice huge(&byte, size);
+    const UniqueId64x2 hash{{1, 2}};
+    Shard::HandleImpl* h = nullptr;
+    Status s =
+        lone.shard.Insert(huge, hash, /*value*/ nullptr, &kNoopCacheItemHelper,
+                          /*charge*/ 1, &h, Cache::Priority::LOW);
+    EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
+    EXPECT_EQ(nullptr, h);
+    EXPECT_EQ(nullptr,
+              lone.shard.CreateStandalone(huge, hash, /*value*/ nullptr,
+                                          &kNoopCacheItemHelper, /*charge*/ 1,
+                                          /*allow_uncharged*/ true));
+  }
+  EXPECT_EQ(0, lone.shard.GetUsage());
+  EXPECT_EQ(0, lone.shard.GetOccupancyCount());
+}
+
+// A key that isn't 16 bytes leaves a ghost when evicted from probation and
+// is readmitted by it. Its placeholder, which kFullChargeCacheMetadata
+// charges for the key's copy, still neither takes the ghost nor goes to
+// the resident queue.
+TEST_F(FIFOCacheTest, GhostKeepsKeysOfAnyLength) {
+  std::shared_ptr<Cache> cache =
+      NewCache(1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), "a", kU));
+  for (uint32_t i = 0; i < 9; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  cache->SetCapacity(cache->GetUsage());
+  // Evicts a.
+  ASSERT_OK(Insert(cache.get(), K("x"), kU));
+  ASSERT_FALSE(Holds(cache.get(), "a"));
+  ASSERT_TRUE(fifo->TEST_InGhost("a"));
+  ASSERT_OK(Insert(cache.get(), "a", /*charge*/ 0));
+  EXPECT_TRUE(fifo->TEST_InProbation("a"));
+  EXPECT_TRUE(fifo->TEST_InGhost("a"));
+  cache->Erase("a");
+  ASSERT_OK(Insert(cache.get(), "a", kU));
+  EXPECT_TRUE(Holds(cache.get(), "a"));
+  EXPECT_FALSE(fifo->TEST_InProbation("a"));
+  EXPECT_FALSE(fifo->TEST_InGhost("a"));
 }
 
 // ApplyToAllEntries visits the slots a batch at a time without holding
@@ -955,33 +1333,34 @@ TEST_F(FIFOCacheTest, ApplyToAllEntriesCoversEachKeyOnceAcrossGrowth) {
   }
 }
 
-// The table grows as entries arrive, and every key stays findable through
-// growth and erasure.
+// The table grows as entries arrive, and every key, of whatever length,
+// stays findable through growth and erasure.
 TEST_F(FIFOCacheTest, TableGrowthKeepsEveryKeyFindable) {
   // Room in the table for every key.
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 8 << 20);
   const size_t initial_slots = cache->GetTableAddressCount();
   constexpr uint32_t kKeys = 5000;
   for (uint32_t i = 0; i < kKeys; ++i) {
-    ASSERT_OK(Insert(cache.get(), K(i)));
+    ASSERT_OK(Insert(cache.get(), L(i)));
   }
   EXPECT_GT(cache->GetTableAddressCount(), initial_slots);
   EXPECT_EQ(kKeys, cache->GetOccupancyCount());
   for (uint32_t i = 0; i < kKeys; ++i) {
-    ASSERT_TRUE(Contains(cache.get(), K(i))) << i;
+    ASSERT_TRUE(Contains(cache.get(), L(i))) << i;
   }
   for (uint32_t i = 0; i < kKeys; i += 3) {
-    cache->Erase(K(i));
+    cache->Erase(L(i));
   }
   for (uint32_t i = 0; i < kKeys; ++i) {
-    ASSERT_EQ(i % 3 != 0, Contains(cache.get(), K(i))) << i;
+    ASSERT_EQ(i % 3 != 0, Contains(cache.get(), L(i))) << i;
   }
 }
 
 // Inserts, lookups, erases, releases that erase, and capacity changes from
-// several threads: every handle reads its own live value, and each value
-// is deleted exactly once.
+// several threads, with keys of several lengths: every handle reads its own
+// live value, and each value and HeapKey is freed exactly once.
 TEST_F(FIFOCacheTest, ConcurrentStressKeepsLifetimeExact) {
+  const int64_t heap_keys = LiveHeapKeys();
   {
     std::shared_ptr<Cache> cache = NewCache(
         /*capacity*/ 64 << 10, /*strict*/ false, kFullChargeCacheMetadata,
@@ -1001,7 +1380,7 @@ TEST_F(FIFOCacheTest, ConcurrentStressKeepsLifetimeExact) {
             case 1:
             case 2: {
               Cache::Handle* h = nullptr;
-              Status s = cache->Insert(K(k), new CountedValue(k),
+              Status s = cache->Insert(L(k), new CountedValue(k),
                                        CountedHelper(), 64 + rnd.Uniform(2048),
                                        rnd.OneIn(2) ? &h : nullptr);
               ASSERT_TRUE(s.ok() || s.IsOkOverwritten()) << s.ToString();
@@ -1012,7 +1391,7 @@ TEST_F(FIFOCacheTest, ConcurrentStressKeepsLifetimeExact) {
               break;
             }
             case 3:
-              cache->Erase(K(k));
+              cache->Erase(L(k));
               break;
             case 4:
               if (rnd.OneIn(100)) {
@@ -1020,7 +1399,7 @@ TEST_F(FIFOCacheTest, ConcurrentStressKeepsLifetimeExact) {
               }
               break;
             default: {
-              Cache::Handle* h = cache->Lookup(K(k));
+              Cache::Handle* h = cache->Lookup(L(k));
               if (h == nullptr) {
                 break;
               }
@@ -1082,6 +1461,7 @@ TEST_F(FIFOCacheTest, ConcurrentStressKeepsLifetimeExact) {
     EXPECT_EQ(0, Fifo(cache.get())->TEST_GetProbationUsage());
   }
   EXPECT_EQ(0, LiveValues().load());
+  EXPECT_TRUE(HeapKeysAbove(heap_keys, 0));
 }
 
 // Under strict_capacity_limit, concurrent inserts (with and without a
@@ -2419,7 +2799,6 @@ TEST_F(FIFOCacheTest, GhostRemembersNewestVictim) {
 // The ghost keeps 32 bits of a key's hash at its home, so another key with
 // the same home and the same 32 bits is readmitted as if it were the victim.
 TEST_F(FIFOCacheTest, GhostTagCollisionAdmitsToResident) {
-  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
   std::shared_ptr<Cache> cache = NewCache(10 * kU);
   FIFOCache* fifo = Fifo(cache.get());
   UniqueId64x2 hashed = Shard::ComputeHash(K("a"), cache->GetHashSeed());
@@ -2442,7 +2821,6 @@ TEST_F(FIFOCacheTest, GhostTagCollisionAdmitsToResident) {
 // An insert takes its key's tag before it evicts, so the victim it evicts
 // can't replace the tag first, even when the victim's key has the same home.
 TEST_F(FIFOCacheTest, GhostTagTakenBeforeTheInsertEvicts) {
-  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
   std::shared_ptr<Cache> cache = NewCache(10 * kU);
   FIFOCache* fifo = Fifo(cache.get());
   // The same home, from the same hashed_key[1], and another tag.
@@ -2469,7 +2847,6 @@ TEST_F(FIFOCacheTest, GhostTagTakenBeforeTheInsertEvicts) {
 // A strict insert that can't make room puts back the tag it took, unless a
 // victim it evicted before giving up has replaced it.
 TEST_F(FIFOCacheTest, GhostTagPutBackWhenStrictInsertFails) {
-  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
   std::shared_ptr<Cache> cache = NewCache(10 * kU, /*strict*/ true);
   FIFOCache* fifo = Fifo(cache.get());
   UniqueId64x2 hashed = Shard::ComputeHash(K("a"), cache->GetHashSeed());
@@ -2519,7 +2896,6 @@ TEST_F(FIFOCacheTest, GhostTagPutBackWhenInsertGoesStandalone) {
   cache->Release(h);
   // One whose key wasn't in the ghost leaves no tag, at a home other than
   // a's.
-  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
   UniqueId64x2 hashed = Shard::ComputeHash(K("a"), cache->GetHashSeed());
   hashed[1] ^= 1;
   UniqueId64x2 unhashed;
@@ -2748,7 +3124,6 @@ TEST_F(FIFOCacheTest, GhostTagsSurviveTableGrowth) {
 // A ghost tag is never 0, the empty value, so a key whose hash has zeros
 // in the 32 bits the tag comes from isn't found in an empty ghost.
 TEST_F(FIFOCacheTest, KeyWithZeroTagBitsIsNotInEmptyGhost) {
-  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
   std::shared_ptr<Cache> cache = NewCache(10 * kU);
   FIFOCache* fifo = Fifo(cache.get());
   const UniqueId64x2 hashed{uint64_t{0xabcd} << 32, 0x1234};

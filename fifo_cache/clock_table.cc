@@ -21,6 +21,7 @@
 #include "plugin/fifo_cache/clock_table.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cinttypes>
@@ -246,7 +247,7 @@ inline bool BeginSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
   // Like Lookup
   if (old_meta.IsVisible()) {
     // Acquired a read reference
-    if (h.hashed_key == proto.hashed_key) {
+    if (h.SameKeyAs(proto)) {
       // Match. Release in a way that boosts the clock state
       auto add_release =
           ReleaseCounter::PlusTransformPromiseNoOverflow(initial_countdown);
@@ -339,9 +340,80 @@ uint32_t SanitizeEvictionEffortCap(int eviction_effort_cap) {
 }  // namespace
 
 void ClockHandleBasicData::FreeData(MemoryAllocator* allocator) const {
+  const Cache::CacheItemHelper* helper = GetHelper();
   if (helper->del_cb) {
     helper->del_cb(value, allocator);
   }
+  FreeHeapKey();
+}
+
+#ifndef NDEBUG
+namespace {
+std::atomic<int64_t> live_heap_keys{0};
+}  // namespace
+
+int64_t TEST_LiveHeapKeys() { return live_heap_keys.load(); }
+#endif  // !NDEBUG
+
+void ClockHandleBasicData::FreeHeapKey() const {
+  if (HasHeapKey()) {
+    free(const_cast<HeapKey*>(GetHeapKey()));
+#ifndef NDEBUG
+    live_heap_keys.fetch_sub(1);
+#endif  // !NDEBUG
+  }
+}
+
+bool ClockHandleBasicData::SetKeyAndHelper(const Slice& key,
+                                           const Cache::CacheItemHelper* helper,
+                                           CacheMetadataChargePolicy policy) {
+  static_assert(alignof(HeapKey) > 1 && alignof(Cache::CacheItemHelper) > 1,
+                "the low bit marks a HeapKey");
+  if (key.size() == kCacheKeySize) {
+    helper_or_heap_key = reinterpret_cast<uintptr_t>(helper);
+    return true;
+  }
+  constexpr size_t kHeader = offsetof(HeapKey, data);
+  if (key.size() > SIZE_MAX - kHeader) {
+    return false;
+  }
+  auto* heap_key = static_cast<HeapKey*>(malloc(kHeader + key.size()));
+  if (heap_key == nullptr) {
+    return false;
+  }
+#ifndef NDEBUG
+  live_heap_keys.fetch_add(1);
+#endif  // !NDEBUG
+  heap_key->helper = helper;
+  heap_key->size = key.size();
+  if (key.size() > 0) {
+    memcpy(heap_key->data, key.data(), key.size());
+  }
+  heap_key->charge = 0;
+  if (policy == kFullChargeCacheMetadata) {
+    // Saturating, so a huge charge doesn't wrap.
+    const size_t own = kHeader + key.size();
+    heap_key->charge = std::min(own, SIZE_MAX - total_charge);
+    total_charge += heap_key->charge;
+  }
+  helper_or_heap_key = reinterpret_cast<uintptr_t>(heap_key) | 1;
+  return true;
+}
+
+void ClockHandleBasicData::ClearCharge() {
+  total_charge = 0;
+  if (HasHeapKey()) {
+    const_cast<HeapKey*>(GetHeapKey())->charge = 0;
+  }
+}
+
+Slice ClockHandleBasicData::GetKey(UniqueId64x2* unhashed,
+                                   uint32_t seed) const {
+  if (HasHeapKey()) {
+    return GetHeapKey()->key();
+  }
+  return ClockCacheShard<AutoHyperClockTable>::ReverseHash(hashed_key, unhashed,
+                                                           seed);
 }
 
 BaseClockTable::BaseClockTable(size_t capacity, bool strict_capacity_limit,
@@ -396,7 +468,7 @@ typename Table::HandleImpl* BaseClockTable::CreateStandalone(
         /*need_evict_for_occupancy=*/false, state);
     if (!s.ok()) {
       if (allow_uncharged) {
-        proto.total_charge = 0;
+        proto.ClearCharge();
       } else {
         return nullptr;
       }
@@ -541,13 +613,15 @@ void BaseClockTable::TrackAndReleaseEvictedEntry(ClockHandle* h) {
   if (eviction_callback_) {
     // For key reconstructed from hash
     UniqueId64x2 unhashed;
-    took_value_ownership = eviction_callback_(
-        ClockCacheShard<AutoHyperClockTable>::ReverseHash(
-            h->GetHash(), &unhashed, hash_seed_),
-        static_cast<Cache::Handle*>(h), h->meta.LoadRelaxed().GetHit());
+    took_value_ownership = eviction_callback_(h->GetKey(&unhashed, hash_seed_),
+                                              static_cast<Cache::Handle*>(h),
+                                              h->meta.LoadRelaxed().GetHit());
   }
   if (!took_value_ownership) {
     h->FreeData(allocator_);
+  } else {
+    // FIFOCache: the key is still the cache's.
+    h->FreeHeapKey();
   }
   MarkEmpty(*h);
 }
@@ -758,8 +832,8 @@ void ClockCacheShard<Table>::ApplyToSomeEntries(
   ConstApplyToEntriesRange(
       [callback, hash_seed](const HandleImpl& h) {
         UniqueId64x2 unhashed;
-        callback(ReverseHash(h.hashed_key, &unhashed, hash_seed), h.value,
-                 h.GetTotalCharge(), h.helper);
+        callback(h.GetKey(&unhashed, hash_seed), h.value, h.GetCharge(),
+                 h.GetHelper());
       },
       table_.HandlePtr(index_begin), table_.HandlePtr(index_end), false);
 }
@@ -784,40 +858,46 @@ Status ClockCacheShard<Table>::Insert(const Slice& key,
                                       const Cache::CacheItemHelper* helper,
                                       size_t charge, HandleImpl** handle,
                                       Cache::Priority priority) {
-  if (UNLIKELY(key.size() != kCacheKeySize)) {
-    return Status::NotSupported("FIFOCache only supports key size " +
-                                std::to_string(kCacheKeySize) + "B");
-  }
   ClockHandleBasicData proto;
   proto.hashed_key = hashed_key;
   proto.value = value;
-  proto.helper = helper;
   proto.total_charge = charge;
-  return table_.template Insert<Table>(proto, handle, priority);
+  if (!proto.SetKeyAndHelper(key, helper, table_.GetMetadataChargePolicy())) {
+    return Status::MemoryLimit("FIFOCache could not copy the key");
+  }
+  Status s = table_.template Insert<Table>(proto, handle, priority);
+  if (!s.ok()) {
+    // FIFOCache: the table took neither the value nor the key.
+    proto.FreeHeapKey();
+  }
+  return s;
 }
 
 template <class Table>
 typename Table::HandleImpl* ClockCacheShard<Table>::CreateStandalone(
     const Slice& key, const UniqueId64x2& hashed_key, Cache::ObjectPtr obj,
     const Cache::CacheItemHelper* helper, size_t charge, bool allow_uncharged) {
-  if (UNLIKELY(key.size() != kCacheKeySize)) {
-    return nullptr;
-  }
   ClockHandleBasicData proto;
   proto.hashed_key = hashed_key;
   proto.value = obj;
-  proto.helper = helper;
   proto.total_charge = charge;
-  return table_.template CreateStandalone<Table>(proto, allow_uncharged);
+  if (!proto.SetKeyAndHelper(key, helper, table_.GetMetadataChargePolicy())) {
+    return nullptr;
+  }
+  HandleImpl* h =
+      table_.template CreateStandalone<Table>(proto, allow_uncharged);
+  if (h == nullptr) {
+    // FIFOCache: the caller keeps the value, and the key is freed.
+    proto.FreeHeapKey();
+  }
+  return h;
 }
 
 template <class Table>
 typename ClockCacheShard<Table>::HandleImpl* ClockCacheShard<Table>::Lookup(
     const Slice& key, const UniqueId64x2& hashed_key) {
-  if (UNLIKELY(key.size() != kCacheKeySize)) {
-    return nullptr;
-  }
-  return table_.Lookup(hashed_key);
+  return table_.Lookup(hashed_key,
+                       key.size() == kCacheKeySize ? nullptr : &key);
 }
 
 template <class Table>
@@ -859,10 +939,7 @@ bool ClockCacheShard<Table>::Release(HandleImpl* handle,
 template <class Table>
 void ClockCacheShard<Table>::Erase(const Slice& key,
                                    const UniqueId64x2& hashed_key) {
-  if (UNLIKELY(key.size() != kCacheKeySize)) {
-    return;
-  }
-  table_.Erase(hashed_key);
+  table_.Erase(hashed_key, key.size() == kCacheKeySize ? nullptr : &key);
 }
 
 template <class Table>
@@ -950,15 +1027,14 @@ Cache::ObjectPtr BaseHyperClockCache<Table>::Value(Handle* handle) {
 
 template <class Table>
 size_t BaseHyperClockCache<Table>::GetCharge(Handle* handle) const {
-  return static_cast<const typename Table::HandleImpl*>(handle)
-      ->GetTotalCharge();
+  return static_cast<const typename Table::HandleImpl*>(handle)->GetCharge();
 }
 
 template <class Table>
 const Cache::CacheItemHelper* BaseHyperClockCache<Table>::GetCacheItemHelper(
     Handle* handle) const {
   auto h = static_cast<const typename Table::HandleImpl*>(handle);
-  return h->helper;
+  return h->GetHelper();
 }
 
 template <class Table>
@@ -972,9 +1048,8 @@ void BaseHyperClockCache<Table>::ApplyToHandle(
   auto h = static_cast<const typename Table::HandleImpl*>(handle);
   UniqueId64x2 unhashed;
   auto hash_seed = cache_ptr->GetShard(h->GetHash()).GetTable().GetHashSeed();
-  callback(
-      ClockCacheShard<Table>::ReverseHash(h->hashed_key, &unhashed, hash_seed),
-      h->value, h->GetTotalCharge(), h->helper);
+  callback(h->GetKey(&unhashed, hash_seed), h->value, h->GetCharge(),
+           h->GetHelper());
 }
 
 namespace {
@@ -1144,8 +1219,10 @@ inline void GetHomeIndexAndShift(uint64_t length_info, uint64_t hash,
 }
 
 // Helper function for Lookup
-inline bool MatchAndRef(const UniqueId64x2* hashed_key, const ClockHandle& h,
-                        int shift = 0, size_t home = 0,
+// FIFOCache: key as for ClockHandleBasicData::MatchesKey, read only with
+// the reference held.
+inline bool MatchAndRef(const UniqueId64x2* hashed_key, const Slice* key,
+                        const ClockHandle& h, int shift = 0, size_t home = 0,
                         bool* full_match_or_unknown = nullptr) {
   // Must be at least something to match
   assert(hashed_key || shift > 0);
@@ -1167,7 +1244,7 @@ inline bool MatchAndRef(const UniqueId64x2* hashed_key, const ClockHandle& h,
   }
   // Else acquired a read reference
   assert(new_meta.GetRefcount() > 0);
-  if (hashed_key && h.hashed_key == *hashed_key &&
+  if (hashed_key && h.MatchesKey(*hashed_key, key) &&
       LIKELY(old_meta.IsVisible())) {
     // Match on full key, visible
     if (full_match_or_unknown) {
@@ -2566,7 +2643,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
 }
 
 AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
-    const UniqueId64x2& hashed_key) {
+    const UniqueId64x2& hashed_key, const Slice* key) {
   // Lookups are wait-free with low occurrence of retries, back-tracking,
   // and fallback. We do not have the benefit of holding a rewrite lock on
   // the chain so must be prepared for many kinds of mayhem, most notably
@@ -2640,7 +2717,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
       // Check if it's a referencable (sharable) entry
       if (LIKELY(old_meta.IsShareable())) {
         assert(new_meta.GetRefcount() > 0);
-        if (LIKELY(h->hashed_key == hashed_key) &&
+        if (LIKELY(h->MatchesKey(hashed_key, key)) &&
             LIKELY(old_meta.IsVisible())) {
           return h;
         } else {
@@ -2741,7 +2818,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
     // Follow the next and check for full key match, home match, or neither
     h = &arr[next_with_shift.GetNext()];
     bool full_match_or_unknown = false;
-    if (MatchAndRef(&hashed_key, *h, shift, effective_home,
+    if (MatchAndRef(&hashed_key, key, *h, shift, effective_home,
                     &full_match_or_unknown)) {
       // Got a read ref on next (h).
       //
@@ -2901,10 +2978,11 @@ void AutoHyperClockTable::TEST_ReleaseN(HandleImpl* h, uint32_t n) {
 }
 #endif
 
-void AutoHyperClockTable::Erase(const UniqueId64x2& hashed_key) {
+void AutoHyperClockTable::Erase(const UniqueId64x2& hashed_key,
+                                const Slice* key) {
   // Don't need to be efficient.
   // Might be one match masking another, so loop.
-  while (HandleImpl* h = Lookup(hashed_key)) {
+  while (HandleImpl* h = Lookup(hashed_key, key)) {
     bool gone =
         TryEraseHandle(h, /*holding_ref=*/true, /*mark_invisible=*/true);
     if (!gone) {
@@ -3627,7 +3705,7 @@ bool IsHeadNonempty(const AutoHyperClockTable::HandleImpl& h) {
 }
 bool IsEntryAtHome(const AutoHyperClockTable::HandleImpl& h, int shift,
                    size_t home) {
-  if (MatchAndRef(nullptr, h, shift, home)) {
+  if (MatchAndRef(nullptr, nullptr, h, shift, home)) {
     Unref(h);
     return true;
   } else {

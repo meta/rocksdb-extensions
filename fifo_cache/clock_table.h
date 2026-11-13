@@ -32,6 +32,7 @@
 #include "rocksdb/cache.h"
 #include "util/atomic.h"
 #include "util/bit_fields.h"
+#include "util/hash.h"
 #include "util/math.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -66,8 +67,10 @@ namespace fifo_cache {
 // * Insert usually does not (but might) overwrite a previous entry associated
 // with a cache key. This is OK for RocksDB uses of Cache, though it does mess
 // up our REDUNDANT block cache insertion statistics.
-// * Only supports keys of exactly 16 bytes, which is what RocksDB uses for
-// block cache (but not row cache or table cache).
+// * FIFOCache: keys of exactly 16 bytes, which is what RocksDB uses for
+// block cache, are kept as a reversible hash. A key of any other length is
+// copied to the heap, at a malloc and a free per entry, and compared byte
+// by byte when its hash matches.
 // * FIFOCache: Cache::Priority is ignored; every entry starts with the same
 // score.
 // * If pinned entries leave little or nothing eligible for eviction,
@@ -299,18 +302,100 @@ namespace fifo_cache {
 
 // ----------------------------------------------------------------------- //
 
+#ifndef NDEBUG
+// FIFOCache: how many HeapKeys are allocated and not yet freed, across every
+// cache in the process.
+int64_t TEST_LiveHeapKeys();
+#endif  // !NDEBUG
+
 struct ClockHandleBasicData : public Cache::Handle {
+  // FIFOCache: a copy of a key that isn't 16 bytes, which also holds the
+  // entry's helper, since the slot has room for one pointer and not two.
+  // Allocated with malloc, so the low bit of its address is free to mark it.
+  struct HeapKey {
+    const Cache::CacheItemHelper* helper;
+    // What it adds to the entry's total charge: its own size under
+    // kFullChargeCacheMetadata, nothing otherwise or in an uncharged
+    // standalone entry.
+    size_t charge;
+    size_t size;
+    char data[1];
+
+    Slice key() const { return Slice(data, size); }
+  };
+
   Cache::ObjectPtr value = nullptr;
-  const Cache::CacheItemHelper* helper = nullptr;
+  // FIFOCache: the entry's helper or, for a key that isn't 16 bytes, its
+  // HeapKey with the low bit set. Read through GetHelper.
+  uintptr_t helper_or_heap_key = 0;
   // A lossless, reversible hash of the fixed-size (16 byte) cache key. This
   // eliminates the need to store a hash separately.
+  // FIFOCache: for a key of any other length, a 128-bit hash of it, and the
+  // key is in its HeapKey.
   UniqueId64x2 hashed_key = kNullUniqueId64x2;
+  // FIFOCache: with the HeapKey's charge.
   size_t total_charge = 0;
 
   inline size_t GetTotalCharge() const { return total_charge; }
 
+  // FIFOCache: the charge the entry was inserted with, without its
+  // HeapKey's.
+  size_t GetCharge() const {
+    return total_charge - (HasHeapKey() ? GetHeapKey()->charge : 0);
+  }
+
+  bool HasHeapKey() const { return (helper_or_heap_key & 1) != 0; }
+  const HeapKey* GetHeapKey() const {
+    assert(HasHeapKey());
+    return reinterpret_cast<const HeapKey*>(helper_or_heap_key & ~uintptr_t{1});
+  }
+  const Cache::CacheItemHelper* GetHelper() const {
+    return HasHeapKey() ? GetHeapKey()->helper
+                        : reinterpret_cast<const Cache::CacheItemHelper*>(
+                              helper_or_heap_key);
+  }
+
+  // FIFOCache: for an entry about to be inserted with charge already set.
+  // A 16-byte key needs only its hash; any other is copied to a HeapKey,
+  // charged under kFullChargeCacheMetadata. Returns false, leaving the
+  // entry unchanged, if the copy can't be allocated.
+  bool SetKeyAndHelper(const Slice& key, const Cache::CacheItemHelper* helper,
+                       CacheMetadataChargePolicy policy);
+  // FIFOCache: for an uncharged standalone entry, whose HeapKey isn't
+  // charged either.
+  void ClearCharge();
+
+  // FIFOCache: whether this is the entry for the key whose hash is
+  // hashed_key; key is the key itself if it isn't 16 bytes, else nullptr.
+  // A HeapKey is read, so the caller must hold a reference or own the slot.
+  bool MatchesKey(const UniqueId64x2& hashed, const Slice* key) const {
+    if (hashed_key != hashed) {
+      return false;
+    }
+    if (key == nullptr) {
+      return !HasHeapKey();
+    }
+    return HasHeapKey() && GetHeapKey()->key() == *key;
+  }
+  // FIFOCache: whether two entries have the same key.
+  bool SameKeyAs(const ClockHandleBasicData& other) const {
+    if (other.HasHeapKey()) {
+      const Slice key = other.GetHeapKey()->key();
+      return MatchesKey(other.hashed_key, &key);
+    }
+    return MatchesKey(other.hashed_key, nullptr);
+  }
+
+  // FIFOCache: the key, from the HeapKey or for a 16-byte key recovered
+  // from its hash into *unhashed.
+  Slice GetKey(UniqueId64x2* unhashed, uint32_t seed) const;
+
   // Calls deleter (if non-null) on cache key and value
+  // FIFOCache: and frees the HeapKey.
   void FreeData(MemoryAllocator* allocator) const;
+  // FIFOCache: frees only the HeapKey, for an entry whose value the cache
+  // doesn't own (an eviction callback took it, or the insert failed).
+  void FreeHeapKey() const;
 
   // Required by concept HandleImpl
   const UniqueId64x2& GetHash() const { return hashed_key; }
@@ -457,6 +542,11 @@ class BaseClockTable {
   size_t GetStandaloneUsage() const { return standalone_usage_.LoadRelaxed(); }
 
   size_t GetCapacity() const { return capacity_.LoadRelaxed(); }
+
+  // FIFOCache: for charging HeapKeys.
+  CacheMetadataChargePolicy GetMetadataChargePolicy() const {
+    return metadata_charge_policy_;
+  }
 
   void SetCapacity(size_t capacity) { capacity_.StoreRelaxed(capacity); }
 
@@ -870,11 +960,13 @@ class AutoHyperClockTable : public BaseClockTable {
   // if it appears impossible to evict the requested amount without blocking.
   void Evict(size_t requested_charge, InsertState& state, EvictionData* data);
 
-  HandleImpl* Lookup(const UniqueId64x2& hashed_key);
+  // FIFOCache: key is the key itself if it isn't 16 bytes, else nullptr
+  // (see ClockHandleBasicData::MatchesKey).
+  HandleImpl* Lookup(const UniqueId64x2& hashed_key, const Slice* key);
 
   bool Release(HandleImpl* handle, bool useful, bool erase_if_last_ref);
 
-  void Erase(const UniqueId64x2& hashed_key);
+  void Erase(const UniqueId64x2& hashed_key, const Slice* key);
 
   void EraseUnRefEntries();
 
@@ -1037,7 +1129,7 @@ class AutoHyperClockTable : public BaseClockTable {
   // kNoopCacheItemHelper with no charge, as CacheWithSecondaryAdapter
   // inserts to note a recent use. It neither takes nor leaves a ghost.
   static bool IsPlaceholder(const ClockHandleBasicData& entry) {
-    return entry.helper == &kNoopCacheItemHelper && entry.total_charge == 0;
+    return entry.GetHelper() == &kNoopCacheItemHelper && entry.GetCharge() == 0;
   }
   // Moves the entry in slot idx from the probation queue to the resident
   // queue if its probation word's identity is still word's. Returns whether
@@ -1155,13 +1247,14 @@ class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
     return Upper32of64(hash[0]);
   }
   static inline HashVal ComputeHash(const Slice& key, uint32_t seed) {
+    HashVal out;
     if (key.size() != kCacheKeySize) {
-      // FIFOCache: the shard refuses other key lengths; don't read past the
-      // key (upstream asserts the length and reads 16 bytes).
-      return HashVal{};
+      // FIFOCache: a key of any other length gets a seeded 128-bit hash, and
+      // is kept in a HeapKey.
+      Hash2x64(key.data(), key.size(), seed, &out[1], &out[0]);
+      return out;
     }
     HashVal in;
-    HashVal out;
     // NOTE: endian dependence
     // TODO: use GetUnaligned?
     std::memcpy(&in, key.data(), kCacheKeySize);
