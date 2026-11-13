@@ -847,8 +847,11 @@ class AutoHyperClockTable : public BaseClockTable {
     uint64_t saved_length_info = 0;
     size_t likely_empty_slot = 0;
     // FIFOCache: the charge of the entry being inserted that will go into
-    // the probation queue, which Evict counts toward probation's share.
+    // the probation queue, which Evict counts toward probation's share, and
+    // whether the insert took its key's ghost tag (it goes to the resident
+    // queue).
     size_t probation_charge = 0;
+    bool ghost_hit = false;
   };
 
   void StartInsert(InsertState& state);
@@ -891,8 +894,23 @@ class AutoHyperClockTable : public BaseClockTable {
   size_t ProbationTarget() const;
 
   // FIFOCache: what kFullChargeCacheMetadata charges for the table: its
-  // slots, their probation words and the probation queue's rings.
+  // slots, their probation words and ghost tags, and the probation queue's
+  // rings.
   size_t GetMetadataCharge() const;
+
+  // FIFOCache: takes the tag of the key of an entry about to be inserted
+  // out of the ghost, if it is there, before eviction can replace it.
+  // Returns whether it did; the entry then goes to the resident queue. A
+  // placeholder never takes one (see IsPlaceholder), so the real entry gets
+  // the credit. An insert that took the tag and doesn't put the entry in the
+  // table puts the tag back, unless a newer one has taken its place.
+  bool GhostTake(const ClockHandleBasicData& proto);
+  void GhostPutBack(const ClockHandleBasicData& proto,
+                    const InsertState& state);
+  // FIFOCache: whether the key is in the ghost.
+  bool InGhost(const UniqueId64x2& hashed_key) const;
+  // FIFOCache: whether the entry in a table slot is in the probation queue.
+  bool IsInProbation(const HandleImpl* h) const;
 
   // FIFOCache: S3-FIFO's constants, as in FIFOCache before this table. A
   // probation head hit at least kPromoteThreshold times is promoted to the
@@ -906,20 +924,23 @@ class AutoHyperClockTable : public BaseClockTable {
 
   // FIFOCache: each slot has a 32-bit probation word beside it, since
   // HandleImpl has no spare bits. kInProbation is set while the entry is in the
-  // probation queue. kCountsInsertRef is set while a probation entry's counters
-  // still include the reference Insert returned with it, whose Release adds one
-  // to them without being a hit. Promotion resets the counters; an entry that
+  // probation queue. kCountsInsertRef is set while an entry's counters still
+  // include the reference Insert returned with it, whose Release adds one to
+  // them without being a hit. Promotion resets the counters; an entry that
   // leaves probation any other way (when the queue has no room for it) keeps
-  // them, so in the resident queue that Release counts as a hit, as in
-  // HyperClockCache. kSeenPinned is set on a probation entry last seen pinned
-  // by a probation step or the resident sweep, and takes its charge out of
-  // probation's share (see Evict). The bits above count inserts into the slot,
-  // so that a queue cell naming a slot and word can tell a later entry in the
-  // slot from the one it was pushed for; with kInProbation they are the word's
-  // identity, which the other two bits can change under without invalidating
-  // the cell. The slot's owner writes the word before publishing the entry.
-  // Whoever takes the entry out of the probation queue clears kInProbation and
-  // kSeenPinned, and kCountsInsertRef too unless it is removing the entry.
+  // them and loses the bit, so in the resident queue that Release counts as a
+  // hit, as in HyperClockCache. An entry the ghost sends to the resident queue
+  // keeps the bit until the clock takes that count out (DropInsertRefCount),
+  // so it starts at no hits with a handle or without. kSeenPinned is set on a
+  // probation entry last seen pinned by a probation step or the resident sweep,
+  // and takes its charge out of probation's share (see Evict). The bits above
+  // count inserts into the slot, so that a queue cell naming a slot and word
+  // can tell a later entry in the slot from the one it was pushed for; with
+  // kInProbation they are the word's identity, which the other two bits can
+  // change under without invalidating the cell. The slot's owner writes the
+  // word before publishing the entry. Whoever takes the entry out of the
+  // probation queue clears kInProbation and kSeenPinned, and kCountsInsertRef
+  // too unless it is removing the entry.
   static constexpr uint32_t kInProbation = 1;
   static constexpr uint32_t kCountsInsertRef = 2;
   static constexpr uint32_t kSeenPinned = 4;
@@ -1008,6 +1029,16 @@ class AutoHyperClockTable : public BaseClockTable {
   bool ProbationPush(size_t idx, uint32_t word);
   // Whether a queued value no longer names the entry it was pushed for.
   bool IsStaleProbationCell(uint64_t v) const;
+  // The ghost: one tag per slot, at the home a key has when its tag is
+  // written or read, nonzero, from 32 bits of the hash the home doesn't
+  // use. A newer tag overwrites an older one at the same home.
+  RelaxedAtomic<uint32_t>& GhostSlot(const UniqueId64x2& hashed_key) const;
+  static uint32_t GhostTag(const UniqueId64x2& hashed_key);
+  // kNoopCacheItemHelper with no charge, as CacheWithSecondaryAdapter
+  // inserts to note a recent use. It neither takes nor leaves a ghost.
+  static bool IsPlaceholder(const ClockHandleBasicData& entry) {
+    return entry.helper == &kNoopCacheItemHelper && entry.total_charge == 0;
+  }
   // Moves the entry in slot idx from the probation queue to the resident
   // queue if its probation word's identity is still word's. Returns whether
   // this call moved it.
@@ -1024,6 +1055,12 @@ class AutoHyperClockTable : public BaseClockTable {
   // The resident sweep's part for a probation entry it skips, under the
   // chain's lock: keeps kSeenPinned matching whether it is pinned.
   void SweepProbationEntry(HandleImpl& h, uint32_t word, bool pinned);
+  // The resident clock's part for an entry with kCountsInsertRef, under the
+  // chain's lock: once the entry is unpinned, takes the count of the
+  // reference Insert returned with it out of its counters and clears the
+  // bit.
+  void DropInsertRefCount(HandleImpl& h, RelaxedAtomic<uint32_t>& word,
+                          uint32_t w);
   // For whoever took ownership of the entry in slot idx to remove it: takes
   // it out of whichever queue's accounting it is in.
   void TrackRemoval(size_t idx, size_t total_charge);
@@ -1078,6 +1115,11 @@ class AutoHyperClockTable : public BaseClockTable {
   // FIFOCache: one probation word per slot of array_ (see kInProbation),
   // lazily zeroed like array_.
   const TypedMemMapping<RelaxedAtomic<uint32_t>> probation_words_;
+
+  // FIFOCache: the ghost of keys evicted from probation (see GhostSlot),
+  // one tag per slot of array_, lazily zeroed like array_. When the table
+  // grows, the new home gets a copy of the tag at the home it splits from.
+  const TypedMemMapping<RelaxedAtomic<uint32_t>> ghost_;
 
   // FIFOCache: the probation queue's order, as (slot index << 32 | word).
   ProbationQueue probation_;

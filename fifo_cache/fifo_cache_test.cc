@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -48,9 +49,9 @@ std::string K(uint32_t i) {
 }
 
 // Under kFullChargeCacheMetadata each slot the table has grown to is
-// charged 64 bytes for itself and 4 for its probation word, and each cell
-// of the probation queue's rings 16.
-constexpr size_t kSlotCharge = 64 + 4;
+// charged 64 bytes for itself, 4 for its probation word and 4 for its ghost
+// tag, and each cell of the probation queue's rings 16.
+constexpr size_t kSlotCharge = 64 + 4 + 4;
 constexpr size_t kQueueCellCharge = 16;
 
 // A charge unit for tests that need more entries than a small capacity's
@@ -149,6 +150,58 @@ class FIFOCacheTest : public testing::Test {
   // hit).
   static bool Holds(Cache* cache, const std::string& key) {
     return Keys(cache).count(key) != 0;
+  }
+
+  // Nine keys whose homes differ from each other's and from those of K(0) to
+  // K(8) once the table has more than 64 slots (they differ in the low six
+  // bits of the hash the home comes from), so none of their tags replaces
+  // another's.
+  static std::vector<std::string> NineKeysWithOwnHomes(Cache* cache) {
+    using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
+    std::set<uint64_t> taken;
+    for (uint32_t i = 0; i < 9; ++i) {
+      taken.insert(Shard::ComputeHash(K(i), cache->GetHashSeed())[1] & 63);
+    }
+    std::vector<std::string> nine;
+    for (uint64_t low = 0; nine.size() < 9; ++low) {
+      if (taken.count(low) == 0) {
+        UniqueId64x2 unhashed;
+        nine.push_back(Shard::ReverseHash(UniqueId64x2{0x5eed00 + low, low},
+                                          &unhashed, cache->GetHashSeed())
+                           .ToString());
+      }
+    }
+    return nine;
+  }
+
+  // In a cache of 100 * kU, leaves the nine keys in the ghost with an entry
+  // "big" of 79 * kU in the resident queue, hit three times, and 21 entries
+  // of kU in probation, so that reinserting the nine evicts K(0) to K(8) from
+  // probation and leaves it at its share. Reinserting K(8) then goes to the
+  // resident queue, at no charge to probation, so the resident clock pays.
+  static void GhostNineBehindBig(Cache* cache, FIFOCache* fifo,
+                                 const std::vector<std::string>& nine) {
+    ASSERT_EQ(9, nine.size());
+    ASSERT_OK(Insert(cache, K("big"), 79 * kU));
+    HitNTimes(cache, K("big"), 2);
+    for (const std::string& key : nine) {
+      ASSERT_OK(Insert(cache, key, kU));
+    }
+    for (uint32_t i = 0; i < 12; ++i) {
+      ASSERT_OK(Insert(cache, K(i), kU));
+    }
+    ASSERT_EQ(100 * kU, cache->GetUsage());
+    // The first promotes big, and each evicts one of the nine.
+    for (uint32_t i = 100; i < 109; ++i) {
+      ASSERT_OK(Insert(cache, K(i), kU));
+    }
+    for (const std::string& key : nine) {
+      ASSERT_FALSE(Holds(cache, key));
+      ASSERT_TRUE(fifo->TEST_InGhost(key)) << key.c_str();
+    }
+    ASSERT_FALSE(fifo->TEST_InProbation(K("big")));
+    HitNTimes(cache, K("big"), 3);
+    ASSERT_EQ(21 * kU, fifo->TEST_GetProbationUsage());
   }
 
   static void HitNTimes(Cache* cache, const std::string& key, int n) {
@@ -559,8 +612,9 @@ TEST_F(FIFOCacheTest, UsageAndPinnedUsageAreExact) {
 }
 
 // Under kFullChargeCacheMetadata usage counts every slot the table has grown
-// to and the probation queue's rings, besides the entries' charges; under
-// kDontChargeCacheMetadata only the charges.
+// to, with its probation word and ghost tag, and the probation queue's rings,
+// besides the entries' charges; under kDontChargeCacheMetadata only the
+// charges.
 TEST_F(FIFOCacheTest, MetadataChargeCountsTableSlots) {
   for (CacheMetadataChargePolicy policy :
        {kFullChargeCacheMetadata, kDontChargeCacheMetadata}) {
@@ -2255,6 +2309,479 @@ TEST_F(FIFOCacheTest, StaleCellsOfRefilledSlotsDoNotCountAsPins) {
   }
 }
 
+// A probation victim inserted again goes to the resident queue, so the
+// pressure that evicted it once no longer does: with only a resident,
+// probation stays over its share and pays for every insert.
+TEST_F(FIFOCacheTest, GhostReadmitsProbationVictimToResident) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  for (uint32_t i = 0; i < 99; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_OK(Insert(cache.get(), K("x"), kU));
+  ASSERT_EQ(std::vector<std::string>{K("a")}, evicted);
+  EXPECT_TRUE(fifo->TEST_InGhost(K("a")));
+  // Evicts K(0); a goes to the resident queue, taking its ghost.
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  EXPECT_TRUE(Holds(cache.get(), K("a")));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("a")));
+  EXPECT_FALSE(fifo->TEST_InGhost(K("a")));
+  // A full probation's worth of cold inserts, which would take a there.
+  for (uint32_t i = 200; i < 300; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  EXPECT_TRUE(Holds(cache.get(), K("a")));
+  EXPECT_EQ(100 * kU, cache->GetUsage());
+}
+
+// A resident victim leaves no ghost and comes back to probation, while a
+// probation victim from the same run comes back to the resident queue.
+TEST_F(FIFOCacheTest, GhostIgnoresResidentVictims) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), K("big"), 88 * kU));
+  HitNTimes(cache.get(), K("big"), 2);
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  HitNTimes(cache.get(), K("a"), 2);
+  for (uint32_t i = 0; i < 11; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_EQ(100 * kU, cache->GetUsage());
+  // Promotes big and a, and evicts K(0) from probation.
+  ASSERT_OK(Insert(cache.get(), K("t"), kU));
+  ASSERT_FALSE(Holds(cache.get(), K(0)));
+  ASSERT_EQ(11 * kU, fifo->TEST_GetProbationUsage());
+  HitNTimes(cache.get(), K("big"), 1);
+  // u lands probation at its share, so the resident clock pays: big spends
+  // its hit and a goes.
+  ASSERT_OK(Insert(cache.get(), K("u"), kU));
+  EXPECT_FALSE(Holds(cache.get(), K("a")));
+  EXPECT_TRUE(Holds(cache.get(), K("big")));
+  EXPECT_FALSE(fifo->TEST_InGhost(K("a")));
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  EXPECT_TRUE(fifo->TEST_InProbation(K("a")));
+  ASSERT_OK(Insert(cache.get(), K(0), kU));
+  EXPECT_TRUE(Holds(cache.get(), K(0)));
+  EXPECT_FALSE(fifo->TEST_InProbation(K(0)));
+}
+
+// Readmission takes the ghost, and an entry readmitted at no hits doesn't
+// count toward probation's share. After a is readmitted and then evicted
+// from the resident queue, inserting it again puts it in probation.
+TEST_F(FIFOCacheTest, GhostForgetsReadmittedKey) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), K("big"), 87 * kU));
+  HitNTimes(cache.get(), K("big"), 2);
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  for (uint32_t i = 0; i < 12; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_EQ(100 * kU, cache->GetUsage());
+  // Promotes big, evicts a.
+  ASSERT_OK(Insert(cache.get(), K("t"), kU));
+  ASSERT_FALSE(Holds(cache.get(), K("a")));
+  // Evicts K(0); a is readmitted.
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("a")));
+  EXPECT_EQ(12 * kU, fifo->TEST_GetProbationUsage());
+  HitNTimes(cache.get(), K("big"), 1);
+  // K(0) is readmitted, so probation stays at its share and the resident
+  // clock pays: big spends its hit and a, at no hits, goes.
+  ASSERT_OK(Insert(cache.get(), K(0), kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(K(0)));
+  EXPECT_FALSE(Holds(cache.get(), K("a")));
+  EXPECT_TRUE(Holds(cache.get(), K("big")));
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  EXPECT_TRUE(fifo->TEST_InProbation(K("a")));
+}
+
+// After many victims, the newest is remembered.
+TEST_F(FIFOCacheTest, GhostRemembersNewestVictim) {
+  std::shared_ptr<Cache> cache = NewCache(40 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  for (uint32_t i = 0; i < 40; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  // Victims K(0)..K(39), then K(100)..K(159).
+  for (uint32_t i = 100; i < 200; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_FALSE(Holds(cache.get(), K(159)));
+  EXPECT_TRUE(fifo->TEST_InGhost(K(159)));
+  ASSERT_OK(Insert(cache.get(), K(159), kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(K(159)));
+}
+
+// The ghost keeps 32 bits of a key's hash at its home, so another key with
+// the same home and the same 32 bits is readmitted as if it were the victim.
+TEST_F(FIFOCacheTest, GhostTagCollisionAdmitsToResident) {
+  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
+  std::shared_ptr<Cache> cache = NewCache(10 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  UniqueId64x2 hashed = Shard::ComputeHash(K("a"), cache->GetHashSeed());
+  hashed[0] ^= uint64_t{1} << 63;
+  UniqueId64x2 unhashed;
+  const std::string collider =
+      Shard::ReverseHash(hashed, &unhashed, cache->GetHashSeed()).ToString();
+  ASSERT_NE(K("a"), collider);
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  for (uint32_t i = 0; i < 10; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_FALSE(Holds(cache.get(), K("a")));
+  EXPECT_TRUE(fifo->TEST_InGhost(collider));
+  ASSERT_OK(Insert(cache.get(), collider, kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(collider));
+  EXPECT_FALSE(fifo->TEST_InGhost(K("a")));
+}
+
+// An insert takes its key's tag before it evicts, so the victim it evicts
+// can't replace the tag first, even when the victim's key has the same home.
+TEST_F(FIFOCacheTest, GhostTagTakenBeforeTheInsertEvicts) {
+  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
+  std::shared_ptr<Cache> cache = NewCache(10 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  // The same home, from the same hashed_key[1], and another tag.
+  UniqueId64x2 hashed = Shard::ComputeHash(K("a"), cache->GetHashSeed());
+  hashed[0] ^= 0x10;
+  UniqueId64x2 unhashed;
+  const std::string c =
+      Shard::ReverseHash(hashed, &unhashed, cache->GetHashSeed()).ToString();
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  ASSERT_OK(Insert(cache.get(), c, kU));
+  for (uint32_t i = 0; i < 8; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_OK(Insert(cache.get(), K("x"), kU));
+  ASSERT_FALSE(Holds(cache.get(), K("a")));
+  ASSERT_TRUE(fifo->TEST_InGhost(K("a")));
+  // Evicts c, whose tag goes where a's was.
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  EXPECT_FALSE(Holds(cache.get(), c));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("a")));
+  EXPECT_TRUE(fifo->TEST_InGhost(c));
+}
+
+// A strict insert that can't make room puts back the tag it took, unless a
+// victim it evicted before giving up has replaced it.
+TEST_F(FIFOCacheTest, GhostTagPutBackWhenStrictInsertFails) {
+  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
+  std::shared_ptr<Cache> cache = NewCache(10 * kU, /*strict*/ true);
+  FIFOCache* fifo = Fifo(cache.get());
+  UniqueId64x2 hashed = Shard::ComputeHash(K("a"), cache->GetHashSeed());
+  hashed[0] ^= 0x10;
+  UniqueId64x2 unhashed;
+  const std::string c =
+      Shard::ReverseHash(hashed, &unhashed, cache->GetHashSeed()).ToString();
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  std::vector<Cache::Handle*> pins(10, nullptr);
+  ASSERT_OK(Insert(cache.get(), c, kU, &pins[0]));
+  for (uint32_t i = 1; i < 10; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU, &pins[i]));
+  }
+  ASSERT_FALSE(Holds(cache.get(), K("a")));
+  ASSERT_TRUE(fifo->TEST_InGhost(K("a")));
+  Cache::Handle* h = nullptr;
+  EXPECT_TRUE(Insert(cache.get(), K("a"), kU, &h).IsMemoryLimit());
+  EXPECT_TRUE(fifo->TEST_InGhost(K("a")));
+  // Evicts c, whose tag replaces a's, and finds nothing else to evict.
+  cache->Release(pins[0]);
+  EXPECT_TRUE(Insert(cache.get(), K("a"), 2 * kU, &h).IsMemoryLimit());
+  EXPECT_FALSE(Holds(cache.get(), c));
+  EXPECT_TRUE(fifo->TEST_InGhost(c));
+  EXPECT_FALSE(fifo->TEST_InGhost(K("a")));
+  for (uint32_t i = 1; i < 10; ++i) {
+    cache->Release(pins[i]);
+  }
+}
+
+// An insert that finds the table's occupancy full of pinned entries goes
+// standalone, outside the table, and puts back the tag it took.
+TEST_F(FIFOCacheTest, GhostTagPutBackWhenInsertGoesStandalone) {
+  // Too small for the table to grow past 64 slots.
+  std::shared_ptr<Cache> cache = NewCache(4096);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), K("a")));
+  std::vector<Cache::Handle*> pins;
+  for (uint32_t i = 0; i < 1000 && Holds(cache.get(), K("a")); ++i) {
+    pins.push_back(nullptr);
+    ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 1, &pins.back()));
+  }
+  ASSERT_FALSE(Holds(cache.get(), K("a")));
+  ASSERT_TRUE(fifo->TEST_InGhost(K("a")));
+  Cache::Handle* h = nullptr;
+  EXPECT_TRUE(Insert(cache.get(), K("a"), /*charge*/ 1, &h).IsOkOverwritten());
+  EXPECT_TRUE(fifo->TEST_InGhost(K("a")));
+  cache->Release(h);
+  // One whose key wasn't in the ghost leaves no tag, at a home other than
+  // a's.
+  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
+  UniqueId64x2 hashed = Shard::ComputeHash(K("a"), cache->GetHashSeed());
+  hashed[1] ^= 1;
+  UniqueId64x2 unhashed;
+  const std::string b =
+      Shard::ReverseHash(hashed, &unhashed, cache->GetHashSeed()).ToString();
+  ASSERT_FALSE(fifo->TEST_InGhost(b));
+  EXPECT_TRUE(Insert(cache.get(), b, /*charge*/ 1, &h).IsOkOverwritten());
+  EXPECT_FALSE(fifo->TEST_InGhost(b));
+  cache->Release(h);
+  for (Cache::Handle* pin : pins) {
+    cache->Release(pin);
+  }
+  ASSERT_OK(Insert(cache.get(), K("a")));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("a")));
+}
+
+// A key readmitted from the ghost starts at no hits with a handle too: the
+// release of the reference Insert returned isn't a hit. With probation
+// under its share the resident clock pays for the next insert, and takes it
+// before entries hit once, whatever order the clock visits them in.
+TEST_F(FIFOCacheTest, GhostReadmittedWithHandleStartsAtNoHits) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> nine = NineKeysWithOwnHomes(cache.get());
+  const std::string a = nine[8];
+  ASSERT_NO_FATAL_FAILURE(GhostNineBehindBig(cache.get(), fifo, nine));
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_OK(Insert(cache.get(), nine[i], kU));
+    ASSERT_FALSE(fifo->TEST_InProbation(nine[i]));
+    HitNTimes(cache.get(), nine[i], 1);
+  }
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(Insert(cache.get(), a, kU, &h));
+  ASSERT_FALSE(fifo->TEST_InProbation(a));
+  cache->Release(h);
+  ASSERT_EQ(12 * kU, fifo->TEST_GetProbationUsage());
+  ASSERT_OK(Insert(cache.get(), K(8), kU));
+  ASSERT_FALSE(fifo->TEST_InProbation(K(8)));
+  EXPECT_FALSE(Holds(cache.get(), a));
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_TRUE(Holds(cache.get(), nine[i])) << i;
+  }
+  EXPECT_TRUE(Holds(cache.get(), K("big")));
+}
+
+// The clock takes the insert reference's count out once: keys readmitted
+// with a handle and hit twice keep both hits, and outlive one hit once.
+TEST_F(FIFOCacheTest, GhostReadmittedWithHandleKeepsItsHits) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> nine = NineKeysWithOwnHomes(cache.get());
+  const std::string z = nine[8];
+  ASSERT_NO_FATAL_FAILURE(GhostNineBehindBig(cache.get(), fifo, nine));
+  for (int i = 0; i < 8; ++i) {
+    Cache::Handle* h = nullptr;
+    ASSERT_OK(Insert(cache.get(), nine[i], kU, &h));
+    ASSERT_FALSE(fifo->TEST_InProbation(nine[i]));
+    cache->Release(h);
+    HitNTimes(cache.get(), nine[i], 2);
+  }
+  ASSERT_OK(Insert(cache.get(), z, kU));
+  ASSERT_FALSE(fifo->TEST_InProbation(z));
+  HitNTimes(cache.get(), z, 1);
+  ASSERT_EQ(12 * kU, fifo->TEST_GetProbationUsage());
+  ASSERT_OK(Insert(cache.get(), K(8), kU));
+  ASSERT_FALSE(fifo->TEST_InProbation(K(8)));
+  EXPECT_FALSE(Holds(cache.get(), z));
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_TRUE(Holds(cache.get(), nine[i])) << i;
+  }
+  EXPECT_TRUE(Holds(cache.get(), K("big")));
+}
+
+// While the reference Insert returned is held the readmitted entry is
+// pinned, so the clock passes it and leaves its counters alone; once
+// released, the clock takes the reference's count out.
+TEST_F(FIFOCacheTest, GhostReadmittedEntryPinnedThroughTheClock) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> nine = NineKeysWithOwnHomes(cache.get());
+  const std::string a = nine[8];
+  ASSERT_NO_FATAL_FAILURE(GhostNineBehindBig(cache.get(), fifo, nine));
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_OK(Insert(cache.get(), nine[i], kU));
+    HitNTimes(cache.get(), nine[i], 2);
+  }
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(Insert(cache.get(), a, kU, &h));
+  ASSERT_FALSE(fifo->TEST_InProbation(a));
+  // The clock passes a, pinned, and takes others after two laps.
+  ASSERT_EQ(12 * kU, fifo->TEST_GetProbationUsage());
+  ASSERT_OK(Insert(cache.get(), K(8), kU));
+  ASSERT_FALSE(fifo->TEST_InProbation(K(8)));
+  EXPECT_TRUE(Holds(cache.get(), a));
+  EXPECT_EQ(kU, cache->GetPinnedUsage());
+  cache->Release(h);
+  EXPECT_EQ(0, cache->GetPinnedUsage());
+  const size_t usage = cache->GetUsage();
+  cache->Erase(a);
+  EXPECT_EQ(usage - kU, cache->GetUsage());
+  EXPECT_FALSE(Holds(cache.get(), a));
+}
+
+// A placeholder insert (no charge, kNoopCacheItemHelper), which
+// CacheWithSecondaryAdapter uses to note a recent use, neither takes a
+// ghost nor leaves one, so readmission waits for the real entry.
+TEST_F(FIFOCacheTest, GhostIgnoresPlaceholderInserts) {
+  std::shared_ptr<Cache> cache = NewCache(10 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  for (uint32_t i = 0; i < 9; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  // Evicts a.
+  ASSERT_OK(Insert(cache.get(), K("x"), kU));
+  ASSERT_TRUE(fifo->TEST_InGhost(K("a")));
+  ASSERT_OK(Insert(cache.get(), K("a"), /*charge*/ 0));
+  EXPECT_TRUE(fifo->TEST_InProbation(K("a")));
+  EXPECT_TRUE(fifo->TEST_InGhost(K("a")));
+  // An insert of the key finds the placeholder cached and isn't inserted,
+  // so it puts back the tag it took.
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  EXPECT_TRUE(fifo->TEST_InProbation(K("a")));
+  EXPECT_TRUE(fifo->TEST_InGhost(K("a")));
+  cache->Erase(K("a"));
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("a")));
+  // A placeholder evicted from probation isn't remembered.
+  ASSERT_OK(Insert(cache.get(), K("p"), /*charge*/ 0));
+  for (uint32_t i = 100; i < 110; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_FALSE(Holds(cache.get(), K("p")));
+  EXPECT_FALSE(fifo->TEST_InGhost(K("p")));
+}
+
+// End to end through the Cache interface: a key read once per scan longer
+// than the cache misses every time without the ghost. With it, the second
+// miss lands in the resident queue and every later read hits despite the
+// scans.
+TEST_F(FIFOCacheTest, GhostKeepsSlowReuseKeyAcrossScans) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  auto access = [&](const std::string& key) {
+    if (Cache::Handle* h = cache->Lookup(key)) {
+      cache->Release(h);
+      return true;
+    }
+    EXPECT_OK(Insert(cache.get(), key, kU));
+    return false;
+  };
+  uint32_t scanned = 1000;
+  auto scan = [&] {
+    for (int i = 0; i < 150; ++i) {
+      EXPECT_FALSE(access(K(scanned++)));
+    }
+  };
+  EXPECT_FALSE(access(K("hot")));
+  scan();
+  // The scan evicted hot first and 50 more after it. The ghost is
+  // direct-mapped, so one of those whose key has hot's home would have
+  // replaced its tag; with this hash seed none does.
+  ASSERT_TRUE(fifo->TEST_InGhost(K("hot")));
+  EXPECT_FALSE(access(K("hot")));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("hot")));
+  scan();
+  for (int round = 2; round < 5; ++round) {
+    EXPECT_TRUE(access(K("hot"))) << round;
+    scan();
+  }
+}
+
+// A probation victim larger than probation's share is remembered and
+// readmitted, then survives a cold stream of mixed charges.
+TEST_F(FIFOCacheTest, GhostReadmitsOversizedVictim) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), K("a"), 20 * kU));
+  for (uint32_t i = 0; i < 80; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_OK(Insert(cache.get(), K("x"), kU));
+  ASSERT_FALSE(Holds(cache.get(), K("a")));
+  ASSERT_OK(Insert(cache.get(), K("a"), 20 * kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("a")));
+  for (uint32_t i = 0; i < 200; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(1000 + i), (i % 2 ? 15 : 1) * kU));
+    ASSERT_LE(cache->GetUsage(), 100 * kU);
+  }
+  EXPECT_TRUE(Holds(cache.get(), K("a")));
+}
+
+// Ghost tags are found at a key's home after the table grows: each split
+// copies the tag at the home it splits from to the new one.
+TEST_F(FIFOCacheTest, GhostTagsSurviveTableGrowth) {
+  // Reserved for 1 MiB, so the table can grow well past its 64 slots.
+  std::shared_ptr<Cache> cache = NewCache(1 << 20);
+  FIFOCache* fifo = Fifo(cache.get());
+  cache->SetCapacity(10 * kU);
+  for (uint32_t i = 0; i < 20; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  // K(0)..K(9) were evicted; those whose tags another didn't overwrite are
+  // in the ghost.
+  std::vector<std::string> ghosts;
+  for (uint32_t i = 0; i < 10; ++i) {
+    ASSERT_FALSE(Holds(cache.get(), K(i)));
+    if (fifo->TEST_InGhost(K(i))) {
+      ghosts.push_back(K(i));
+    }
+  }
+  ASSERT_GE(ghosts.size(), 5);
+  const size_t slots = cache->GetTableAddressCount();
+  cache->SetCapacity(1 << 20);
+  for (uint32_t i = 1000; i < 2000; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i)));
+  }
+  ASSERT_GE(cache->GetTableAddressCount(), 16 * slots);
+  for (const std::string& key : ghosts) {
+    EXPECT_TRUE(fifo->TEST_InGhost(key));
+  }
+  ASSERT_OK(Insert(cache.get(), ghosts[0], kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(ghosts[0]));
+}
+
+// A ghost tag is never 0, the empty value, so a key whose hash has zeros
+// in the 32 bits the tag comes from isn't found in an empty ghost.
+TEST_F(FIFOCacheTest, KeyWithZeroTagBitsIsNotInEmptyGhost) {
+  using Shard = fifo_cache::ClockCacheShard<fifo_cache::AutoHyperClockTable>;
+  std::shared_ptr<Cache> cache = NewCache(10 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  const UniqueId64x2 hashed{uint64_t{0xabcd} << 32, 0x1234};
+  UniqueId64x2 unhashed;
+  const std::string key =
+      Shard::ReverseHash(hashed, &unhashed, cache->GetHashSeed()).ToString();
+  EXPECT_FALSE(fifo->TEST_InGhost(key));
+  ASSERT_OK(Insert(cache.get(), key, kU));
+  EXPECT_TRUE(fifo->TEST_InProbation(key));
+}
+
+// A fifo_cache:// string builds FIFOCache, not a fallback: a probation
+// victim inserted again is readmitted to the resident queue.
+TEST_F(FIFOCacheTest, CreateFromStringPreservesSelectedBehavior) {
+  std::shared_ptr<Cache> cache;
+  ASSERT_OK(Cache::CreateFromString(
+      ConfigOptions(),
+      "fifo_cache://capacity=" + std::to_string(10 * kU) +
+          ";num_shard_bits=0;hash_seed=12345;"
+          "metadata_charge_policy=kDontChargeCacheMetadata",
+      &cache));
+  EXPECT_STREQ("FIFOCache", cache->Name());
+  FIFOCache* fifo = dynamic_cast<FIFOCache*>(cache.get());
+  ASSERT_NE(nullptr, fifo);
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  for (uint32_t i = 0; i < 10; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_FALSE(Holds(cache.get(), K("a")));
+  ASSERT_OK(Insert(cache.get(), K("a"), kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("a")));
+}
+
 #ifndef NDEBUG
 namespace {
 // Runs op on another thread, parks it the first time it reaches sync point
@@ -2272,9 +2799,27 @@ void RunWhileParked(const std::string& point, const std::function<void()>& op,
     }
   });
   SyncPoint::GetInstance()->EnableProcessing();
-  port::Thread t(op);
-  reached.get_future().wait();
-  meanwhile();
+  std::promise<void> finished;
+  std::future<void> op_finished = finished.get_future();
+  port::Thread t([&] {
+    op();
+    finished.set_value();
+  });
+  // Fails rather than hangs if op finishes without reaching the point.
+  std::future<void> op_reached = reached.get_future();
+  while (op_reached.wait_for(std::chrono::milliseconds(1)) !=
+         std::future_status::ready) {
+    if (op_finished.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready) {
+      break;
+    }
+  }
+  if (op_reached.wait_for(std::chrono::seconds(0)) ==
+      std::future_status::ready) {
+    meanwhile();
+  } else {
+    ADD_FAILURE() << point << " was not reached";
+  }
   resume.set_value();
   t.join();
   SyncPoint::GetInstance()->DisableProcessing();
@@ -2424,6 +2969,54 @@ TEST_F(FIFOCacheTest, EmptyResidentQueueSkipsTheClock) {
   for (Cache::Handle* h : pins) {
     EXPECT_FALSE(cache->Release(h));
   }
+}
+
+// A hit between the clock's read of a readmitted entry's counters and its
+// taking the insert reference's count out makes the clock leave that for a
+// later visit, rather than drop the bit with the count still in: the entry,
+// hit once, goes before entries hit twice.
+TEST_F(FIFOCacheTest, HitWhileClockDropsInsertRefCount) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> nine = NineKeysWithOwnHomes(cache.get());
+  const std::string a = nine[8];
+  ASSERT_NO_FATAL_FAILURE(GhostNineBehindBig(cache.get(), fifo, nine));
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_OK(Insert(cache.get(), nine[i], kU));
+    HitNTimes(cache.get(), nine[i], 2);
+  }
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(Insert(cache.get(), a, kU, &h));
+  ASSERT_FALSE(fifo->TEST_InProbation(a));
+  cache->Release(h);
+  ASSERT_EQ(12 * kU, fifo->TEST_GetProbationUsage());
+  RunWhileParked(
+      "FIFOCache::DropInsertRefCount:Loaded",
+      [&] { ASSERT_OK(Insert(cache.get(), K(8), kU)); },
+      [&] { HitNTimes(cache.get(), a, 1); });
+  EXPECT_FALSE(Holds(cache.get(), a));
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_TRUE(Holds(cache.get(), nine[i])) << i;
+  }
+}
+
+// An entry erased while its insert still holds the reference it links the
+// entry with is left invisible with no references, as in HyperClockCache,
+// until a probation step frees it; being erased, it leaves no ghost.
+TEST_F(FIFOCacheTest, ErasedEntryFreedByEvictionLeavesNoGhost) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 2);
+  FIFOCache* fifo = Fifo(cache.get());
+  RunWhileParked(
+      "FIFOCache::DoInsert:Linked",
+      [&] { ASSERT_OK(Insert(cache.get(), K("k"))); },
+      [&] { cache->Erase(K("k")); });
+  EXPECT_FALSE(Holds(cache.get(), K("k")));
+  EXPECT_EQ(1, cache->GetUsage());
+  ASSERT_OK(Insert(cache.get(), K("a")));
+  ASSERT_OK(Insert(cache.get(), K("b")));
+  EXPECT_EQ(2, cache->GetUsage());
+  EXPECT_TRUE(Holds(cache.get(), K("a")));
+  EXPECT_FALSE(fifo->TEST_InGhost(K("k")));
 }
 
 // An entry erased while a step promotes it (holding a reference, so it can

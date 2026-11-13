@@ -30,11 +30,10 @@ namespace ROCKSDB_NAMESPACE {
 // inserts, erases and eviction take a per-shard mutex. Pinned entries are
 // never evicted; eviction sets long-pinned entries aside instead of
 // rescanning them, and a fully-pinned shard evicts nothing.
-// The memory that remembers recently evicted keys (a few bytes plus one
-// hash-map entry per remembered key, at most one remembered key per
-// cached entry, or more for a while after entries are erased) is not
-// charged against capacity; it stays at its peak size after SetCapacity
-// lowers capacity.
+// Recently evicted keys are remembered by a 4-byte tag per slot of the
+// table, at the slot the key maps to, so a later victim mapping to the same
+// slot replaces the tag. The tags count against capacity with the slots
+// under kFullChargeCacheMetadata.
 // Under kFullChargeCacheMetadata (the default) the slot table also counts
 // against capacity: 64 bytes per slot the table has grown to, 256 bytes
 // per shard at construction, growing with the entries, and shrinking back

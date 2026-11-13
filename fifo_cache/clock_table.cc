@@ -572,8 +572,13 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
 
   typename Table::InsertState state;
   derived.StartInsert(state);
-  // FIFOCache: every table insert goes into the probation queue.
-  state.probation_charge = proto.GetTotalCharge();
+  // FIFOCache: an entry whose key is in the ghost goes to the resident
+  // queue, and any other into the probation queue, where its charge counts
+  // toward probation's share. The tag is taken before eviction, which could
+  // replace it, and put back on each path below that doesn't put the entry
+  // in the table.
+  state.ghost_hit = derived.GhostTake(proto);
+  state.probation_charge = state.ghost_hit ? 0 : proto.GetTotalCharge();
 
   // Do we have the available occupancy? Optimistically assume we do
   // and deal with it if we don't.
@@ -595,6 +600,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
     if (!s.ok()) {
       // Revert occupancy
       occupancy_.FetchSubRelaxed(1);
+      derived.GhostPutBack(proto, state);
       return s;
     }
   } else {
@@ -604,6 +610,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
     if (!success) {
       // Revert occupancy
       occupancy_.FetchSubRelaxed(1);
+      derived.GhostPutBack(proto, state);
       if (handle == nullptr) {
         // Don't insert the entry but still return ok, as if the entry
         // inserted into cache and evicted immediately.
@@ -642,6 +649,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
     // Not inserted
     // Revert occupancy
     occupancy_.FetchSubRelaxed(1);
+    derived.GhostPutBack(proto, state);
     // Maybe fall back on standalone insert
     if (handle == nullptr) {
       // Revert usage
@@ -1351,13 +1359,17 @@ AutoHyperClockTable::AutoHyperClockTable(
       grow_frontier_(GetTableSize()),
       clock_pointer_mask_(
           BottomNBits(UINT64_MAX, LengthInfoToMinShift(length_info_.Load()))),
-      // FIFOCache: the probation words, one per slot, and the queue.
+      // FIFOCache: the probation words and ghost tags, one each per slot,
+      // and the queue.
       probation_words_(MemMapping::AllocateLazyZeroed(
           sizeof(RelaxedAtomic<uint32_t>) * array_.Count())),
+      ghost_(MemMapping::AllocateLazyZeroed(sizeof(RelaxedAtomic<uint32_t>) *
+                                            array_.Count())),
       probation_(ProbationRingCapacity(occupancy_limit_.LoadRelaxed()),
                  ProbationRingCapacity(CalcOccupancyLimit(array_.Count()))) {
-  // FIFOCache: and the probation words' mapping.
-  if (array_.Get() == nullptr || probation_words_.Get() == nullptr) {
+  // FIFOCache: and the probation words' and ghost's mappings.
+  if (array_.Get() == nullptr || probation_words_.Get() == nullptr ||
+      ghost_.Get() == nullptr) {
     fprintf(stderr,
             "Anonymous mmap for RocksDB FIFOCache failed. Aborting.\n");
     std::terminate();
@@ -1365,7 +1377,8 @@ AutoHyperClockTable::AutoHyperClockTable(
   if (metadata_charge_policy ==
       CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
     // NOTE: ignoring page boundaries for simplicity
-    // FIFOCache: with the probation words and the first probation ring.
+    // FIFOCache: with the probation words, ghost tags and the first
+    // probation ring.
     usage_.FetchAddRelaxed(GetMetadataCharge());
   }
 
@@ -1544,7 +1557,7 @@ size_t AutoHyperClockTable::GetTableSize() const {
 
 size_t AutoHyperClockTable::GetMetadataCharge() const {
   return GetTableSize() *
-             (sizeof(HandleImpl) + sizeof(RelaxedAtomic<uint32_t>)) +
+             (sizeof(HandleImpl) + 2 * sizeof(RelaxedAtomic<uint32_t>)) +
          probation_.CellCount() * sizeof(ProbationQueue::Cell);
 }
 
@@ -1647,6 +1660,11 @@ bool AutoHyperClockTable::Grow(InsertState& state) {
     std::this_thread::yield();
   }
 
+  // FIFOCache: keys whose home was old_home now have one of the two, so
+  // both get its ghost tag (which matches only its own key), before
+  // length_info_ lets lookups use grow_home.
+  ghost_[grow_home].StoreRelaxed(ghost_[old_home].LoadRelaxed());
+
   // Do the dirty work of splitting the chain, including updating heads and
   // chain nexts for new shift amounts.
   SplitForGrow(grow_home, old_home, old_shift);
@@ -1712,9 +1730,9 @@ void AutoHyperClockTable::CatchUpLengthInfoNoWait(
       if (metadata_charge_policy_ ==
           CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
         // NOTE: ignoring page boundaries for simplicity
-        // FIFOCache: and the slot's probation word.
+        // FIFOCache: and the slot's probation word and ghost tag.
         usage_.FetchAddRelaxed(sizeof(HandleImpl) +
-                               sizeof(RelaxedAtomic<uint32_t>));
+                               2 * sizeof(RelaxedAtomic<uint32_t>));
       }
     }
     published_usable_size = LengthInfoToUsedLength(current_length_info);
@@ -2132,12 +2150,17 @@ void AutoHyperClockTable::PurgeImplLocked(OpData* op_data,
             SweepProbationEntry(
                 *h, w, meta.GetAcquireCounter() != meta.GetReleaseCounter());
           }
-        } else if (ClockUpdate(*h, data, &purgeable)) {
-          // Remember for finishing eviction
-          op_data->push_back(h);
-          // Entries for eviction become purgeable
-          purgeable = true;
-          assert(h->meta.Load().IsUnderConstruction());
+        } else {
+          if (w & kCountsInsertRef) {
+            DropInsertRefCount(*h, word, w);
+          }
+          if (ClockUpdate(*h, data, &purgeable)) {
+            // Remember for finishing eviction
+            op_data->push_back(h);
+            // Entries for eviction become purgeable
+            purgeable = true;
+            assert(h->meta.Load().IsUnderConstruction());
+          }
         }
       } else {
         (void)op_data;
@@ -2351,10 +2374,11 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
   static_assert(initial_take_ref,
                 "FIFOCache: TryInsertSlot always takes the reference");
 
-  // FIFOCache: the entry goes into the probation queue, and its probation
+  // FIFOCache: the entry goes into the probation queue, unless Insert took
+  // its key's ghost tag, when it goes to the resident queue. Its probation
   // word records whether the caller gets a reference.
-  const uint32_t word_flags =
-      kInProbation | (take_ref ? kCountsInsertRef : uint32_t{0});
+  const uint32_t word_flags = (state.ghost_hit ? uint32_t{0} : kInProbation) |
+                              (take_ref ? kCountsInsertRef : uint32_t{0});
   uint32_t word = 0;
 
   size_t used_length = LengthInfoToUsedLength(state.saved_length_info);
@@ -2523,15 +2547,18 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
     if (arr[home].head_next_with_shift.CasWeak(next_with_shift,
                                                head_next_with_shift)) {
       // Success
+      TEST_SYNC_POINT("FIFOCache::DoInsert:Linked");
       if (!take_ref) {
         Unref(arr[idx]);
       }
       // FIFOCache: queue it once it is linked and our reference is gone, so
       // a probation step sees it whole and not pinned by us. If it was
       // removed meanwhile, the cell is stale and the step skips it.
-      TEST_SYNC_POINT("FIFOCache::DoInsert:BeforeProbationPush");
-      if (!ProbationPush(idx, word)) {
-        LeaveProbation(idx, word, proto.GetTotalCharge());
+      if (word & kInProbation) {
+        TEST_SYNC_POINT("FIFOCache::DoInsert:BeforeProbationPush");
+        if (!ProbationPush(idx, word)) {
+          LeaveProbation(idx, word, proto.GetTotalCharge());
+        }
       }
       return arr + idx;
     }
@@ -3256,8 +3283,11 @@ bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
       ((old_word & ~(kProbationGenerationOne - 1)) + kProbationGenerationOne) |
       word_flags;
   w.StoreRelaxed(*word);
-  assert(word_flags & kInProbation);
-  probation_usage_.FetchAddRelaxed(proto.GetTotalCharge());
+  if (word_flags & kInProbation) {
+    probation_usage_.FetchAddRelaxed(proto.GetTotalCharge());
+  } else {
+    resident_count_.FetchAddRelaxed(1);
+  }
   // Publishes the word with the entry (a release store).
   FinishSlotInsert(proto, h, initial_countdown, /*keep_ref=*/true);
   return true;
@@ -3298,6 +3328,52 @@ bool AutoHyperClockTable::ProbationPush(size_t idx, uint32_t word) {
     }
   }
   return false;
+}
+
+RelaxedAtomic<uint32_t>& AutoHyperClockTable::GhostSlot(
+    const UniqueId64x2& hashed_key) const {
+  size_t home;
+  int shift;
+  GetHomeIndexAndShift(length_info_.LoadRelaxed(), hashed_key[1], &home,
+                       &shift);
+  return ghost_[home];
+}
+
+uint32_t AutoHyperClockTable::GhostTag(const UniqueId64x2& hashed_key) {
+  // The home comes from hashed_key[1], so the tag from the other half.
+  return Lower32of64(hashed_key[0]) | 1U;
+}
+
+bool AutoHyperClockTable::GhostTake(const ClockHandleBasicData& proto) {
+  if (IsPlaceholder(proto)) {
+    return false;
+  }
+  RelaxedAtomic<uint32_t>& slot = GhostSlot(proto.hashed_key);
+  uint32_t tag = GhostTag(proto.hashed_key);
+  // Read first, so a miss doesn't take the line for writing.
+  return slot.LoadRelaxed() == tag && slot.CasStrongRelaxed(tag, 0);
+}
+
+void AutoHyperClockTable::GhostPutBack(const ClockHandleBasicData& proto,
+                                       const InsertState& state) {
+  if (state.ghost_hit) {
+    uint32_t empty = 0;
+    GhostSlot(proto.hashed_key)
+        .CasStrongRelaxed(empty, GhostTag(proto.hashed_key));
+  }
+}
+
+bool AutoHyperClockTable::InGhost(const UniqueId64x2& hashed_key) const {
+  return GhostSlot(hashed_key).LoadRelaxed() == GhostTag(hashed_key);
+}
+
+bool AutoHyperClockTable::IsInProbation(const HandleImpl* h) const {
+  if (h->IsStandalone()) {
+    return false;
+  }
+  return (probation_words_[static_cast<size_t>(h - array_.Get())]
+              .LoadRelaxed() &
+          kInProbation) != 0;
 }
 
 bool AutoHyperClockTable::IsStaleProbationCell(uint64_t v) const {
@@ -3394,6 +3470,31 @@ void AutoHyperClockTable::SweepProbationEntry(HandleImpl& h, uint32_t word,
   }
 }
 
+void AutoHyperClockTable::DropInsertRefCount(HandleImpl& h,
+                                             RelaxedAtomic<uint32_t>& word,
+                                             uint32_t w) {
+  SlotMeta meta = h.meta.Load();
+  const uint32_t acquire_count = meta.GetAcquireCounter();
+  if (acquire_count != meta.GetReleaseCounter()) {
+    // Pinned, perhaps by that reference still.
+    return;
+  }
+  // An entry being removed has no counts, so only the bit is cleared.
+  TEST_SYNC_POINT("FIFOCache::DropInsertRefCount:Loaded");
+  if (acquire_count > 0) {
+    SlotMeta less = meta;
+    less.SetAcquireCounter(acquire_count - 1);
+    less.SetReleaseCounter(acquire_count - 1);
+    if (!h.meta.CasStrong(meta, less)) {
+      // Used meanwhile; a later visit tries again.
+      return;
+    }
+  }
+  // Under the chain's lock the entry cannot leave its slot, so only an
+  // owner removing it can have changed the word.
+  word.CasStrongRelaxed(w, w & ~kCountsInsertRef);
+}
+
 bool AutoHyperClockTable::ProbationStep(EvictionData* data, bool* promoted) {
   uint64_t v;
   if (!probation_.Pop(&v)) {
@@ -3474,6 +3575,10 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, bool* promoted) {
       return true;
     }
     const size_t total_charge = h.total_charge;
+    if (meta.IsVisible() && !IsPlaceholder(h)) {
+      // Evicted rather than erased, and not a placeholder.
+      GhostSlot(h.hashed_key).StoreRelaxed(GhostTag(h.hashed_key));
+    }
     TrackRemoval(idx, total_charge);
     data->freed_charge += total_charge;
     data->freed_count += 1;

@@ -35,8 +35,12 @@ class FIFOCache
   // Probation's share of capacity, summed over shards.
   size_t TEST_GetProbationTarget() const;
   // What kFullChargeCacheMetadata charges for the tables: slots, their
-  // probation words and the probation queues' rings.
+  // probation words and ghost tags, and the probation queues' rings.
   size_t TEST_GetMetadataCharge() const;
+  // Whether the key is cached in a probation queue. Takes no hit.
+  bool TEST_InProbation(const Slice& key);
+  // Whether an insert of the key would find it in the ghost.
+  bool TEST_InGhost(const Slice& key) const;
 };
 
 }  // namespace fifo_cache
