@@ -313,12 +313,19 @@ class FIFOCacheTest : public testing::Test {
   // 13 entries has them, with the 16-cell ring full and nothing popped. Its
   // first `live` cells are of entries still cached, K(12) and then K(200)
   // on, of charge 1; the rest, like every cell of the older rings, are of
-  // entries erased while queued.
-  static void FillNewestRingLiveFirst(Cache* cache, uint32_t live) {
+  // entries erased while queued. K(12) is inserted with a handle, released
+  // at once, if k12_with_handle.
+  static void FillNewestRingLiveFirst(Cache* cache, uint32_t live,
+                                      bool k12_with_handle = false) {
     ASSERT_GE(live, 1);
     ASSERT_LE(live, 16);
-    for (uint32_t i = 0; i < 13; ++i) {
+    for (uint32_t i = 0; i < 12; ++i) {
       ASSERT_OK(Insert(cache, K(i)));
+    }
+    Cache::Handle* h = nullptr;
+    ASSERT_OK(Insert(cache, K(12), 1, k12_with_handle ? &h : nullptr));
+    if (h != nullptr) {
+      EXPECT_FALSE(cache->Release(h));
     }
     for (uint32_t i = 0; i < 12; ++i) {
       cache->Erase(K(i));
@@ -1998,6 +2005,31 @@ TEST_F(FIFOCacheTest, TwoHitsPromoteOneHitEvicts) {
   EXPECT_EQ(9, Fifo(cache.get())->TEST_GetProbationUsage());
 }
 
+// Promotion resets an entry's counters, which takes the reference Insert
+// returned with it out of them too: a, inserted with a handle and hit
+// twice, is promoted with no hits, and a hit after that is its one hit.
+TEST_F(FIFOCacheTest, PromotedEntryInsertedWithAHandleStartsAtNoHits) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10);
+  FIFOCache* fifo = Fifo(cache.get());
+  RecordEvictions(cache.get(), &evicted);
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("a"), 1, &h));
+  EXPECT_FALSE(cache->Release(h));
+  HitNTimes(cache.get(), K("a"), 2);
+  EXPECT_EQ(2, fifo->TEST_GetHits(K("a")));
+  for (uint32_t i = 0; i < 9; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i)));
+  }
+  // Promotes a and evicts K(0).
+  ASSERT_OK(Insert(cache.get(), K("x")));
+  ASSERT_EQ(std::vector<std::string>{K(0)}, evicted);
+  ASSERT_FALSE(fifo->TEST_InProbation(K("a")));
+  EXPECT_EQ(0, fifo->TEST_GetHits(K("a")));
+  HitNTimes(cache.get(), K("a"), 1);
+  EXPECT_EQ(1, fifo->TEST_GetHits(K("a")));
+}
+
 // The oldest entry, hit twice, outlives pressure that evicts newer cold
 // ones. Plain FIFO, or never promoting, would evict it first.
 TEST_F(FIFOCacheTest, PromotedEntrySurvivesColdPressure) {
@@ -2506,10 +2538,10 @@ TEST_F(FIFOCacheTest, MaxCapacityReservesForLaterGrowth) {
 
 // Inserting a cached key replaces the entry and returns OkOverwritten: the
 // new value and charge are what Lookup finds and the old value is freed.
-// The new entry starts in probation with no hits, where HyperClockCache
-// keeps the old entry, counts each duplicate insert as a hit on it and
-// drops the new value, so here a key inserted three times is still evicted
-// from probation.
+// The new entry takes the old one's place with its hits plus one, so a key
+// inserted three times has two and is promoted, as HyperClockCache, which
+// keeps the old entry and drops the new value, counts each duplicate insert
+// as a hit.
 TEST_F(FIFOCacheTest, InsertReplacesUnpinnedEntry) {
   std::shared_ptr<Cache> cache = NewCache(10 * kU);
   ASSERT_OK(
@@ -2527,8 +2559,10 @@ TEST_F(FIFOCacheTest, InsertReplacesUnpinnedEntry) {
   for (uint32_t i = 0; i < 6; ++i) {
     ASSERT_OK(Insert(cache.get(), K(i), kU));
   }
-  EXPECT_FALSE(Holds(cache.get(), K("a")));
-  EXPECT_EQ(0, LiveValues().load());
+  EXPECT_TRUE(Holds(cache.get(), K("a")));
+  EXPECT_FALSE(Fifo(cache.get())->TEST_InProbation(K("a")));
+  EXPECT_FALSE(Holds(cache.get(), K(0)));
+  EXPECT_EQ(1, LiveValues().load());
   ASSERT_OK(cache->Insert(K("b"), new CountedValue(4), CountedHelper(), kU));
   Status s = cache->Insert(K("b"), new CountedValue(5), CountedHelper(), kU);
   EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
@@ -2539,6 +2573,174 @@ TEST_F(FIFOCacheTest, InsertReplacesUnpinnedEntry) {
   cache->Release(h);
   cache.reset();
   EXPECT_EQ(0, LiveValues().load());
+}
+
+// A replacing insert keeps the replaced entry's place, counting itself as a
+// hit on it, as S3-FIFO counts an update: replacing a resident entry puts the
+// new one in the resident queue with the old one's hits plus one. Of five
+// entries promoted together, k0 not hit since and k1, k3 and k4 hit twice,
+// k2, replaced with a handle or without and so at one hit, goes second,
+// wherever the slots are. Starting over in probation would evict it first,
+// and counting the insert's own reference as a hit too would tie it with
+// the three.
+TEST_F(FIFOCacheTest, ReplacingResidentEntryKeepsItResidentWithAHit) {
+  for (bool with_handle : {false, true}) {
+    SCOPED_TRACE(with_handle);
+    std::vector<std::string> evicted;
+    std::vector<Cache::Handle*> pins;
+    std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10);
+    FIFOCache* fifo = Fifo(cache.get());
+    RecordEvictions(cache.get(), &evicted);
+    const std::vector<std::string> k = {K("k0"), K("k1"), K("k2"), K("k3"),
+                                        K("k4")};
+    for (const std::string& key : k) {
+      ASSERT_OK(Insert(cache.get(), key));
+      HitNTimes(cache.get(), key, 2);
+    }
+    for (uint32_t i = 0; i < 5; ++i) {
+      ASSERT_OK(Insert(cache.get(), K(i)));
+    }
+    // Promotes the five, with their hits reset, and evicts K(0).
+    ASSERT_OK(Insert(cache.get(), K("t")));
+    ASSERT_EQ(std::vector<std::string>{K(0)}, evicted);
+    for (uint32_t i = 1; i < 5; ++i) {
+      cache->Erase(K(i));
+    }
+    cache->Erase(K("t"));
+    ASSERT_EQ(0, fifo->TEST_GetProbationUsage());
+    for (uint32_t i : {1, 3, 4}) {
+      HitNTimes(cache.get(), k[i], 2);
+    }
+    Cache::Handle* h = nullptr;
+    Status s = Insert(cache.get(), k[2], 1, with_handle ? &h : nullptr);
+    EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+    if (h != nullptr) {
+      EXPECT_FALSE(cache->Release(h));
+    }
+    EXPECT_FALSE(fifo->TEST_InProbation(k[2]));
+    EXPECT_EQ(0, fifo->TEST_GetProbationUsage());
+    // Five pinned inserts fill the cache, and each of the next five evicts
+    // from the resident queue.
+    for (uint32_t i = 100; i < 110; ++i) {
+      Cache::Handle* p = nullptr;
+      ASSERT_OK(Insert(cache.get(), K(i), 1, &p));
+      pins.push_back(p);
+    }
+    ASSERT_EQ(6, evicted.size());
+    EXPECT_EQ(k[0], evicted[1]);
+    EXPECT_EQ(k[2], evicted[2]);
+    EXPECT_EQ((std::set<std::string>{k[1], k[3], k[4]}),
+              std::set<std::string>(evicted.begin() + 3, evicted.end()));
+    for (Cache::Handle* p : pins) {
+      cache->Release(p);
+    }
+  }
+}
+
+// Replacing a probation entry keeps the new one in probation with the old
+// one's hits plus one: a, hit once and then replaced, with a handle or
+// without, has two and is promoted under the pressure that evicts b, hit
+// once and not replaced, and then c, inserted with a handle and then again,
+// not hit, which has one: the first insert's reference isn't a hit on it.
+// (The capacity starts the table at 64 slots, so probation's ring has
+// room for the replaced entries' cells and stays in insert order.)
+TEST_F(FIFOCacheTest, ReplacingProbationEntryAddsAHit) {
+  for (bool with_handle : {false, true}) {
+    SCOPED_TRACE(with_handle);
+    std::vector<std::string> evicted;
+    std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10 * kU);
+    RecordEvictions(cache.get(), &evicted);
+    ASSERT_OK(Insert(cache.get(), K("a"), kU));
+    HitNTimes(cache.get(), K("a"), 1);
+    Cache::Handle* h = nullptr;
+    Status s = Insert(cache.get(), K("a"), kU, with_handle ? &h : nullptr);
+    EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+    if (h != nullptr) {
+      EXPECT_FALSE(cache->Release(h));
+    }
+    EXPECT_TRUE(Fifo(cache.get())->TEST_InProbation(K("a")));
+    ASSERT_OK(Insert(cache.get(), K("b"), kU));
+    HitNTimes(cache.get(), K("b"), 1);
+    Cache::Handle* hc = nullptr;
+    ASSERT_OK(Insert(cache.get(), K("c"), kU, &hc));
+    EXPECT_FALSE(cache->Release(hc));
+    s = Insert(cache.get(), K("c"), kU);
+    EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+    for (uint32_t i = 0; i < 7; ++i) {
+      ASSERT_OK(Insert(cache.get(), K(i), kU));
+    }
+    ASSERT_OK(Insert(cache.get(), K("x"), kU));
+    EXPECT_EQ(std::vector<std::string>{K("b")}, evicted);
+    ASSERT_OK(Insert(cache.get(), K("y"), kU));
+    EXPECT_EQ((std::vector<std::string>{K("b"), K("c")}), evicted);
+    EXPECT_TRUE(Holds(cache.get(), K("a")));
+    EXPECT_FALSE(Fifo(cache.get())->TEST_InProbation(K("a")));
+  }
+}
+
+// The replaced entry's hits include those it took while the handle its own
+// insert returned was still out: a, inserted with a handle and hit once
+// before that handle's release, then replaced, passes on one hit, so the
+// new a has two and is promoted under the pressure that evicts K(0).
+TEST_F(FIFOCacheTest, ReplacedEntryHitWhileItsInsertHandleIsOutPassesTheHitOn) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("a"), kU, &h));
+  HitNTimes(cache.get(), K("a"), 1);
+  Status s = Insert(cache.get(), K("a"), kU);
+  EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+  // Frees the old a.
+  EXPECT_TRUE(cache->Release(h));
+  EXPECT_EQ(2, Fifo(cache.get())->TEST_GetHits(K("a")));
+  for (uint32_t i = 0; i < 9; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_OK(Insert(cache.get(), K("x"), kU));
+  EXPECT_EQ(std::vector<std::string>{K(0)}, evicted);
+  EXPECT_TRUE(Holds(cache.get(), K("a")));
+  EXPECT_FALSE(Fifo(cache.get())->TEST_InProbation(K("a")));
+}
+
+// An insert the ghost sends to the resident queue that replaces a resident
+// entry only gains the hits: probation never had its charge. k is promoted
+// and then inserted again while the ghost holds the tag of c, a key with
+// k's home and tag.
+TEST_F(FIFOCacheTest, GhostReturnReplacingResidentEntryOnlyGainsTheHits) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> keys = KeysWithOwnHomes(cache.get(), 10);
+  const std::string& k = keys[0];
+  UniqueId64x2 hashed = Shard::ComputeHash(k, cache->GetHashSeed());
+  hashed[0] ^= uint64_t{1} << 63;
+  UniqueId64x2 unhashed;
+  const std::string c =
+      Shard::ReverseHash(hashed, &unhashed, cache->GetHashSeed()).ToString();
+  ASSERT_OK(Insert(cache.get(), k, kU));
+  HitNTimes(cache.get(), k, 2);
+  ASSERT_OK(Insert(cache.get(), c, kU));
+  for (uint32_t i = 1; i < 9; ++i) {
+    ASSERT_OK(Insert(cache.get(), keys[i], kU));
+  }
+  // Promotes k and evicts c.
+  ASSERT_OK(Insert(cache.get(), keys[9], kU));
+  ASSERT_EQ(std::vector<std::string>{c}, evicted);
+  ASSERT_FALSE(fifo->TEST_InProbation(k));
+  ASSERT_TRUE(fifo->TEST_InGhost(k));
+  ASSERT_EQ(9 * kU, fifo->TEST_GetProbationUsage());
+  // Evicts keys[1] for its charge.
+  Status s = Insert(cache.get(), k, kU);
+  EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+  EXPECT_EQ((std::vector<std::string>{c, keys[1]}), evicted);
+  EXPECT_FALSE(fifo->TEST_InProbation(k));
+  EXPECT_FALSE(fifo->TEST_InGhost(k));
+  EXPECT_EQ(8 * kU, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(9 * kU, cache->GetUsage());
+  EXPECT_EQ(1, Stats(cache.get()).ghost_returns);
+  EXPECT_EQ(1, fifo->TEST_GetHits(k));
 }
 
 // A replaced entry that is pinned stays valid, charged and pinned until its
@@ -3923,6 +4125,23 @@ TEST_F(FIFOCacheTest, FullProbationPushTakesAtMostEightCells) {
   }
 }
 
+// An entry inserted with a handle that probation has no room for goes to
+// the resident queue with its counters as they were, so the release of
+// that handle isn't a hit there either, as for an entry the ghost sends.
+TEST_F(FIFOCacheTest, EntryProbationHadNoRoomForDoesNotCountItsInsertRef) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+  FIFOCache* fifo = Fifo(cache.get());
+  FillNewestRingLiveFirst(cache.get(), 8);
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("x"), 1, &h));
+  ASSERT_FALSE(fifo->TEST_InProbation(K("x")));
+  ASSERT_EQ(1, Stats(cache.get()).probation_full);
+  EXPECT_FALSE(cache->Release(h));
+  EXPECT_EQ(0, fifo->TEST_GetHits(K("x")));
+  HitNTimes(cache.get(), K("x"), 1);
+  EXPECT_EQ(1, fifo->TEST_GetHits(K("x")));
+}
+
 // The live cells a full push puts back stay queued. Here x takes K(12) and
 // 7 more live cells, puts them back behind the newest ring's 8 stale ones,
 // and goes to the resident queue; y then takes the first stale cell's
@@ -5026,11 +5245,12 @@ TEST_F(FIFOCacheTest, LiveCellThatLosesItsRoomIsCarried) {
 // A carried cell that finds no stale cell either goes to the resident
 // queue, counted as probation full, and so does the push's own entry. Here
 // y takes the room K(12)'s cell left, and x puts back the other 7 live
-// cells.
+// cells. K(12), inserted with a handle, goes with its counters as they
+// were, so that handle's release isn't a hit.
 TEST_F(FIFOCacheTest, LiveCellThatLosesItsRoomGoesToResident) {
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
   FIFOCache* fifo = Fifo(cache.get());
-  FillNewestRingLiveFirst(cache.get(), 8);
+  FillNewestRingLiveFirst(cache.get(), 8, /*k12_with_handle=*/true);
   RunWhileParked(
       "FIFOCache::ProbationPush:BeforeRequeue",
       [&] { ASSERT_OK(Insert(cache.get(), K("x"))); },
@@ -5043,6 +5263,7 @@ TEST_F(FIFOCacheTest, LiveCellThatLosesItsRoomGoesToResident) {
   EXPECT_FALSE(fifo->TEST_InProbation(K(12)));
   EXPECT_FALSE(fifo->TEST_InProbation(K("x")));
   EXPECT_TRUE(fifo->TEST_InProbation(K("y")));
+  EXPECT_EQ(0, fifo->TEST_GetHits(K(12)));
 }
 
 // Hits that land between an eviction step's read of the head and its claim
@@ -5230,6 +5451,116 @@ TEST_F(FIFOCacheTest, ReplacedInsertLeavesNewerEntry) {
   CheckCountedValue(cache.get(), h, 3);
   cache->Release(h);
   EXPECT_EQ((std::set<std::string>{K("k")}), Keys(cache.get()));
+  cache.reset();
+  EXPECT_EQ(0, LiveValues().load());
+}
+
+// An insert whose new entry is erased after it erased the entry it
+// replaces, and before it takes over that entry's place, leaves it in
+// probation, where it waits, unreferenced and no longer found, for a
+// probation step or EraseUnRefEntries to free it, and the accounting
+// balances. Moving it to the resident queue would leave it to the clock.
+TEST_F(FIFOCacheTest, ReplacingEntryErasedBeforeItTakesThePlace) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), K("k")));
+  HitNTimes(cache.get(), K("k"), 2);
+  for (uint32_t i = 0; i < 9; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i)));
+  }
+  // Promotes k and evicts K(0).
+  ASSERT_OK(Insert(cache.get(), K("t")));
+  ASSERT_FALSE(fifo->TEST_InProbation(K("k")));
+  ASSERT_EQ(9, fifo->TEST_GetProbationUsage());
+  RunWhileParked(
+      "FIFOCache::DoInsert:BeforeInherit",
+      [&] {
+        Status s = Insert(cache.get(), K("k"));
+        EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+      },
+      [&] { cache->Erase(K("k")); });
+  // The insert evicted K(1) for its charge and freed the old k. The new k,
+  // erased before it could take the old one's place, stays in probation.
+  EXPECT_FALSE(Contains(cache.get(), K("k")));
+  EXPECT_EQ(9, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(9, cache->GetUsage());
+  EXPECT_EQ(9, cache->GetOccupancyCount());
+  cache->EraseUnRefEntries();
+  EXPECT_EQ(0, cache->GetUsage());
+  EXPECT_EQ(0, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(0, cache->GetOccupancyCount());
+}
+
+// An insert replacing two entries with its key, as when it races another
+// insert of the key, takes the most hits either had, and the resident queue
+// if either was there. Insert B links its entry and parks; meanwhile two
+// lookups of k find B's entry, the newest, and insert A replaces it and the
+// old k, resident with no hits since its promotion. A's entry then has
+// three hits and outlasts three resident entries hit twice.
+TEST_F(FIFOCacheTest, ReplacingTwoEntriesTakesTheMostHitsAndTheResidentQueue) {
+  std::vector<std::string> evicted;
+  std::vector<Cache::Handle*> pins;
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10);
+  FIFOCache* fifo = Fifo(cache.get());
+  RecordEvictions(cache.get(), &evicted);
+  const std::vector<std::string> k = {K("k"), K("x1"), K("x2"), K("x3")};
+  for (const std::string& key : k) {
+    ASSERT_OK(Insert(cache.get(), key));
+    HitNTimes(cache.get(), key, 2);
+  }
+  for (uint32_t i = 0; i < 6; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i)));
+  }
+  // Promotes the four, with their hits reset, and evicts K(0).
+  ASSERT_OK(Insert(cache.get(), K("t")));
+  ASSERT_EQ(std::vector<std::string>{K(0)}, evicted);
+  for (uint32_t i = 1; i < 6; ++i) {
+    cache->Erase(K(i));
+  }
+  cache->Erase(K("t"));
+  ASSERT_EQ(0, fifo->TEST_GetProbationUsage());
+  for (uint32_t i = 1; i < 4; ++i) {
+    HitNTimes(cache.get(), k[i], 2);
+  }
+  Cache::Handle* hb = nullptr;
+  RunWhileParked(
+      "FIFOCache::DoInsert:Linked",
+      [&] {
+        ASSERT_OK(cache->Insert(k[0], new CountedValue(2), CountedHelper(),
+                                /*charge*/ 1, &hb));
+      },
+      [&] {
+        for (int i = 0; i < 2; ++i) {
+          Cache::Handle* h = cache->Lookup(k[0]);
+          ASSERT_NE(nullptr, h);
+          CheckCountedValue(cache.get(), h, 2);
+          EXPECT_FALSE(cache->Release(h));
+        }
+        Status s = cache->Insert(k[0], new CountedValue(3), CountedHelper(),
+                                 /*charge*/ 1);
+        EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+      });
+  ASSERT_NE(nullptr, hb);
+  // Frees B's entry.
+  EXPECT_TRUE(cache->Release(hb));
+  EXPECT_FALSE(fifo->TEST_InProbation(k[0]));
+  EXPECT_EQ(3, fifo->TEST_GetHits(k[0]));
+  EXPECT_EQ(0, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(4, cache->GetUsage());
+  // Six pinned inserts fill the cache, and each of the next four evicts
+  // from the resident queue.
+  for (uint32_t i = 100; i < 110; ++i) {
+    Cache::Handle* p = nullptr;
+    ASSERT_OK(Insert(cache.get(), K(i), 1, &p));
+    pins.push_back(p);
+  }
+  ASSERT_EQ(5, evicted.size());
+  EXPECT_EQ((std::set<std::string>{k[1], k[2], k[3]}),
+            std::set<std::string>(evicted.begin() + 1, evicted.begin() + 4));
+  EXPECT_EQ(k[0], evicted[4]);
+  for (Cache::Handle* p : pins) {
+    cache->Release(p);
+  }
   cache.reset();
   EXPECT_EQ(0, LiveValues().load());
 }

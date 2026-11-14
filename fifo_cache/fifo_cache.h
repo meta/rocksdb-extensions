@@ -54,6 +54,9 @@ class FIFOCache
   size_t TEST_GetMetadataCharge() const;
   // Whether the key is cached in a probation queue. Takes no hit.
   bool TEST_InProbation(const Slice& key);
+  // The hits on the key's entry, as promotion and the resident clock count
+  // them, or 0 if it isn't cached. Takes no hit.
+  uint32_t TEST_GetHits(const Slice& key);
   // Whether an insert of the key would find it in the ghost.
   bool TEST_InGhost(const Slice& key) const;
   // The start of each shard's table mappings (see

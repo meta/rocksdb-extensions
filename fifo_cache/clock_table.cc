@@ -2673,7 +2673,12 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
       }
       // FIFOCache: replaces any other entry with the key, while our
       // reference keeps this one in the table.
-      state.replaced = EraseReplaced(proto, arr + idx);
+      ReplacedEntries replaced;
+      state.replaced = EraseReplaced(proto, arr + idx, &replaced);
+      if (state.replaced) {
+        TEST_SYNC_POINT("FIFOCache::DoInsert:BeforeInherit");
+        word = TakeReplacedPlace(idx, word, replaced, proto.GetTotalCharge());
+      }
       if (!take_ref) {
         Unref(arr[idx]);
       }
@@ -3086,7 +3091,8 @@ void AutoHyperClockTable::Erase(const UniqueId64x2& hashed_key,
 }
 
 bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
-                                        const HandleImpl* keep) {
+                                        const HandleImpl* keep,
+                                        ReplacedEntries* replaced_entries) {
   Slice heap_key;
   const Slice* key = nullptr;
   if (proto.HasHeapKey()) {
@@ -3102,6 +3108,14 @@ bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
       break;
     }
     replaced = true;
+    if (replaced_entries != nullptr) {
+      // Our reference keeps h's counters from being reset or counted down,
+      // so they only gain hits meanwhile, but a push with no room for h can
+      // still move it to the resident queue after we read its word.
+      replaced_entries->resident |= !IsInProbation(h);
+      replaced_entries->hits =
+          std::max(replaced_entries->hits, HitsUnderRef(h));
+    }
     if (!TryEraseHandle(h, /*holding_ref=*/true, /*mark_invisible=*/true)) {
       Unref(*h);
     }
@@ -3632,6 +3646,17 @@ bool AutoHyperClockTable::IsInProbation(const HandleImpl* h) const {
           kInProbation) != 0;
 }
 
+uint32_t AutoHyperClockTable::HitsUnderRef(const HandleImpl* h) const {
+  assert(!h->IsStandalone());
+  // If the clock took the insert's count out just before the caller's
+  // reference, the bit may still read as set, and this comes up one short.
+  const uint32_t w =
+      probation_words_[static_cast<size_t>(h - array_.Get())].LoadRelaxed();
+  const uint32_t not_hits = (w & kCountsInsertRef) ? 2 : 1;
+  const uint32_t acquires = h->meta.Load().GetAcquireCounter();
+  return acquires > not_hits ? acquires - not_hits : 0;
+}
+
 bool AutoHyperClockTable::IsStaleProbationCell(uint64_t v) const {
   // The word's identity only moves on (kInProbation cleared, or a later
   // entry's generation), so a cell found stale stays stale.
@@ -3641,10 +3666,12 @@ bool AutoHyperClockTable::IsStaleProbationCell(uint64_t v) const {
 }
 
 bool AutoHyperClockTable::LeaveProbation(size_t idx, uint32_t word,
-                                         size_t total_charge) {
+                                         size_t total_charge,
+                                         bool counters_reset) {
   assert(word & kInProbation);
   RelaxedAtomic<uint32_t>& w = probation_words_[idx];
-  const uint32_t clear = kInProbation | kSeenPinned | kCountsInsertRef;
+  const uint32_t clear =
+      kInProbation | kSeenPinned | (counters_reset ? kCountsInsertRef : 0);
   // Counted resident first, so that a removal seeing kInProbation clear
   // never takes the count below what it was.
   resident_count_.FetchAddRelaxed(1);
@@ -3660,6 +3687,29 @@ bool AutoHyperClockTable::LeaveProbation(size_t idx, uint32_t word,
   }
   resident_count_.FetchSubRelaxed(1);
   return false;
+}
+
+uint32_t AutoHyperClockTable::TakeReplacedPlace(size_t idx, uint32_t word,
+                                                const ReplacedEntries& replaced,
+                                                size_t total_charge) {
+  // Erased meanwhile: it stays in probation, where the next step to reach
+  // it frees it, rather than wait for the resident clock. (An erase right
+  // after this check leaves it to the clock, whose first visit frees it.)
+  if (!array_[idx].meta.Load().IsVisible()) {
+    return word;
+  }
+  // As S3-FIFO counts an update of a cached key as a hit on it.
+  const uint32_t hits =
+      std::min(replaced.hits + 1, uint32_t{ClockHandle::kMaxCountdown});
+  array_[idx].meta.Apply(AcquireCounter::PlusTransformPromiseNoOverflow(hits) +
+                         ReleaseCounter::PlusTransformPromiseNoOverflow(hits));
+  // Not queued yet, so nothing else moves it out of probation; an owner
+  // removing it (once our reference is gone) clears kInProbation itself.
+  if (replaced.resident && (word & kInProbation) &&
+      LeaveProbation(idx, word, total_charge)) {
+    return word & ~(kInProbation | kSeenPinned);
+  }
+  return word;
 }
 
 void AutoHyperClockTable::TrackRemoval(size_t idx, size_t total_charge) {
@@ -3807,7 +3857,8 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
       // one with the same meta, in a slot emptied and refilled since the
       // word was read. Then the word no longer matches, LeaveProbation does
       // nothing, and the entry gets back the counts the reset took.
-      *promoted = LeaveProbation(idx, word, h.total_charge);
+      *promoted = LeaveProbation(idx, word, h.total_charge,
+                                 /*counters_reset=*/true);
       if (*promoted) {
         data->promoted_count += 1;
       } else {

@@ -54,7 +54,10 @@ namespace ROCKSDB_NAMESPACE {
 // Inserting a key the cache has replaces the old entry, and Insert returns
 // OkOverwritten; a pinned old entry stays, though lookups no longer find
 // it, until its last reference is released. (HyperClockCache keeps the old
-// entry instead and drops the new value.)
+// entry instead and drops the new value.) The new entry keeps the old one's
+// place: it goes to the resident queue if the old one was there, and
+// otherwise wherever a new entry would go, and it starts with the old one's
+// hits plus one, up to 3, as S3-FIFO counts an update as a hit.
 //
 // Pinned entries are never evicted. Without strict_capacity_limit, an
 // insert's eviction gives up once it has passed 30 pinned entries for each

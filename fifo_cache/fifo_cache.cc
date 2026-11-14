@@ -67,6 +67,17 @@ bool FIFOCache::TEST_InProbation(const Slice& key) {
   return in;
 }
 
+uint32_t FIFOCache::TEST_GetHits(const Slice& key) {
+  Cache::Handle* h = Lookup(key);
+  if (h == nullptr) {
+    return 0;
+  }
+  auto* impl = reinterpret_cast<Shard::HandleImpl*>(h);
+  const uint32_t hits = GetShard(impl->GetHash()).GetTable().HitsUnderRef(impl);
+  Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
+  return hits;
+}
+
 bool FIFOCache::TEST_InGhost(const Slice& key) const {
   const HashVal hash = Shard::ComputeHash(key, GetHashSeed());
   return const_cast<FIFOCache*>(this)->GetShard(hash).GetTable().InGhost(hash);

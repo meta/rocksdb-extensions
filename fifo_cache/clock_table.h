@@ -1020,12 +1020,21 @@ class AutoHyperClockTable : public BaseClockTable {
 
   void Erase(const UniqueId64x2& hashed_key, const Slice* key);
 
+  // FIFOCache: what an insert replacing entries learned about them, for its
+  // own entry to take their place (see TakeReplacedPlace): whether any was
+  // in the resident queue, and the most hits any had.
+  struct ReplacedEntries {
+    bool resident = false;
+    uint32_t hits = 0;
+  };
+
   // FIFOCache: erases the entries with proto's key other than keep, the way
   // Erase does, for an insert of proto replacing them: after keep is linked
   // and while the insert holds its reference, or with keep nullptr when the
   // insert is accepted without a slot. Stops once keep isn't visible.
-  // Returns whether it erased any.
-  bool EraseReplaced(const ClockHandleBasicData& proto, const HandleImpl* keep);
+  // Returns whether it erased any, and records them in *replaced if given.
+  bool EraseReplaced(const ClockHandleBasicData& proto, const HandleImpl* keep,
+                     ReplacedEntries* replaced = nullptr);
 
   void EraseUnRefEntries();
 
@@ -1072,6 +1081,10 @@ class AutoHyperClockTable : public BaseClockTable {
   bool InGhost(const UniqueId64x2& hashed_key) const;
   // FIFOCache: whether the entry in a table slot is in the probation queue.
   bool IsInProbation(const HandleImpl* h) const;
+  // FIFOCache: the hits on the entry in a table slot, for a caller holding a
+  // reference to it: its acquires, less that reference and less the
+  // reference Insert returned with it while that still counts.
+  uint32_t HitsUnderRef(const HandleImpl* h) const;
 
   // FIFOCache: S3-FIFO's constants, as in FIFOCache before this table. A
   // probation head hit at least kPromoteThreshold times is promoted to the
@@ -1088,21 +1101,21 @@ class AutoHyperClockTable : public BaseClockTable {
   // HandleImpl has no spare bits. kInProbation is set while the entry is in the
   // probation queue. kCountsInsertRef is set while an entry's counters still
   // include the reference Insert returned with it, whose Release adds one to
-  // them without being a hit. Promotion resets the counters; an entry that
-  // leaves probation any other way (when the queue has no room for it) keeps
-  // them and loses the bit, so in the resident queue that Release counts as a
-  // hit, as in HyperClockCache. An entry the ghost sends to the resident queue
-  // keeps the bit until the clock takes that count out (DropInsertRefCount),
-  // so it starts at no hits with a handle or without. kSeenPinned is set on a
-  // probation entry last seen pinned by a probation step or the resident sweep,
-  // and takes its charge out of probation's share (see Evict). The bits above
+  // them without being a hit. Promotion resets the counters and clears the
+  // bit. An entry that reaches the resident queue any other way (the ghost
+  // sent it there, or a replaced resident entry did, or probation had no room
+  // for it) keeps the bit until the clock takes that count out
+  // (DropInsertRefCount), so its hits there are the same with a handle or
+  // without. kSeenPinned is set on a probation entry last seen pinned by a
+  // probation step or the resident sweep, and takes its charge out of
+  // probation's share (see Evict). The bits above
   // count inserts into the slot, so that a queue cell naming a slot and word
   // can tell a later entry in the slot from the one it was pushed for; with
   // kInProbation they are the word's identity, which the other two bits can
   // change under without invalidating the cell. The slot's owner writes the
   // word before publishing the entry. Whoever takes the entry out of the
   // probation queue clears kInProbation and kSeenPinned, and kCountsInsertRef
-  // too unless it is removing the entry.
+  // too if it reset the counters.
   static constexpr uint32_t kInProbation = 1;
   static constexpr uint32_t kCountsInsertRef = 2;
   static constexpr uint32_t kSeenPinned = 4;
@@ -1203,8 +1216,19 @@ class AutoHyperClockTable : public BaseClockTable {
   }
   // Moves the entry in slot idx from the probation queue to the resident
   // queue if its probation word's identity is still word's. Returns whether
-  // this call moved it.
-  bool LeaveProbation(size_t idx, uint32_t word, size_t total_charge);
+  // this call moved it. counters_reset clears kCountsInsertRef too, for a
+  // promotion that reset the entry's counters.
+  bool LeaveProbation(size_t idx, uint32_t word, size_t total_charge,
+                      bool counters_reset = false);
+  // For DoInsert, holding a reference to the entry it linked in slot idx,
+  // with probation word word, after erasing the entries it replaces: unless
+  // the entry was erased meanwhile, adds their hits plus one for this insert
+  // to its counters, capped at kMaxCountdown, and moves it to the resident
+  // queue if any of them was there and it isn't queued yet. Returns its word
+  // after.
+  uint32_t TakeReplacedPlace(size_t idx, uint32_t word,
+                             const ReplacedEntries& replaced,
+                             size_t total_charge);
   // LeaveProbation for an entry the probation queue had no room to move to
   // its tail, for a caller holding no reference to it: takes one to read its
   // charge, unless the entry is already leaving the table. Counts it in
