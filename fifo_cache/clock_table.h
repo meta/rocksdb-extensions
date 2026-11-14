@@ -1136,13 +1136,13 @@ class AutoHyperClockTable : public BaseClockTable {
 #endif
 
   // Maximum ratio of number of occupied slots to number of usable slots. The
-  // actual load factor should float pretty close to this number, which should
-  // be a nice space/time trade-off, though large swings in WriteBufferManager
-  // memory could lead to low (but very much safe) load factors (only after
-  // seeing high load factors). Linear hashing along with (modified) linear
-  // probing to find an available slot increases potential risks of high
-  // load factors, so are disallowed.
-  static constexpr double kMaxLoadFactor = 0.60;
+  // actual load factor should float pretty close to this number.
+  // FIFOCache: 0.8, where HyperClockCache has 0.6. A slot with its probation
+  // word and ghost cell takes 72 bytes, so an entry's share of the table is
+  // 90 bytes of capacity instead of 120. Inserts probe for an empty slot
+  // about twice as long (1 / (1 - load factor)), and lookups walk chains a
+  // third longer.
+  static constexpr double kMaxLoadFactor = 0.80;
 
  private:  // functions
   // Returns true iff increased usable length. Due to load factor

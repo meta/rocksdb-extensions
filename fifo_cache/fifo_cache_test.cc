@@ -85,7 +85,7 @@ constexpr size_t kSlotCharge = 64 + 4 + 4;
 constexpr size_t kQueueCellCharge = 16;
 
 // A charge unit for tests that count capacity in entries: 100 units of
-// capacity hold 100 entries of one unit, far below the table's 1229 at its
+// capacity hold 100 entries of one unit, far below the table's 1639 at its
 // smallest, so only capacity evicts them.
 constexpr size_t kU = 512;
 
@@ -835,7 +835,7 @@ TEST_F(FIFOCacheTest, MetadataChargeCountsTableSlots) {
     EXPECT_EQ(1000, cache->GetOccupancyCount());
     // With nothing evicted all 1000 entries are still in probation, so the
     // queue's rings doubled from 64 cells (the first table's occupancy limit
-    // of 39, rounded up to a power of two) until one held the 1000th push.
+    // of 52, rounded up to a power of two) until one held the 1000th push.
     EXPECT_EQ(cache->GetTableAddressCount() * kSlotCharge +
                   (64 + 128 + 256 + 512 + 1024) * kQueueCellCharge,
               Fifo(cache.get())->TEST_GetMetadataCharge());
@@ -956,9 +956,9 @@ TEST_F(FIFOCacheTest, StrictInsertWithoutHandleDropped) {
 }
 
 // Under strict_capacity_limit with the table charged, the table grows only
-// while the growth fits beside the entry. At the occupancy limit (39
+// while the growth fits beside the entry. At the occupancy limit (52
 // entries in the first 64 slots) an insert needs two slots, 65 and 66, to
-// raise the limit to 40. With room for the entry alone it evicts an entry
+// raise the limit to 53. With room for the entry alone it evicts an entry
 // for its slot instead; with room for the two slots but not the entry too,
 // it takes slot 65 (which fits beside the entry) and evicts; and with room
 // for both it grows the table, landing usage on capacity. HyperClockCache
@@ -966,7 +966,7 @@ TEST_F(FIFOCacheTest, StrictInsertWithoutHandleDropped) {
 TEST_F(FIFOCacheTest, StrictInsertGrowsTableOnlyWhenGrowthFits) {
   std::shared_ptr<Cache> cache =
       NewCache(1 << 20, /*strict*/ true, kFullChargeCacheMetadata);
-  for (uint32_t i = 0; i < 39; ++i) {
+  for (uint32_t i = 0; i < 52; ++i) {
     ASSERT_OK(Insert(cache.get(), K(i)));
   }
   ASSERT_EQ(64, cache->GetTableAddressCount());
@@ -974,21 +974,21 @@ TEST_F(FIFOCacheTest, StrictInsertGrowsTableOnlyWhenGrowthFits) {
   cache->SetCapacity(usage + 1);
   ASSERT_OK(Insert(cache.get(), K(100)));
   EXPECT_EQ(64, cache->GetTableAddressCount());
-  EXPECT_EQ(39, cache->GetOccupancyCount());
+  EXPECT_EQ(52, cache->GetOccupancyCount());
   EXPECT_EQ(usage, cache->GetUsage());
   EXPECT_FALSE(Holds(cache.get(), K(0)));
   EXPECT_TRUE(Holds(cache.get(), K(100)));
   cache->SetCapacity(usage + 2 * kSlotCharge);
   ASSERT_OK(Insert(cache.get(), K(101)));
   EXPECT_EQ(65, cache->GetTableAddressCount());
-  EXPECT_EQ(39, cache->GetOccupancyCount());
+  EXPECT_EQ(52, cache->GetOccupancyCount());
   EXPECT_EQ(usage + kSlotCharge, cache->GetUsage());
   EXPECT_FALSE(Holds(cache.get(), K(1)));
   EXPECT_TRUE(Holds(cache.get(), K(101)));
   cache->SetCapacity(usage + 1 + 2 * kSlotCharge);
   ASSERT_OK(Insert(cache.get(), K(102)));
   EXPECT_EQ(66, cache->GetTableAddressCount());
-  EXPECT_EQ(40, cache->GetOccupancyCount());
+  EXPECT_EQ(53, cache->GetOccupancyCount());
   EXPECT_EQ(usage + 1 + 2 * kSlotCharge, cache->GetUsage());
   EXPECT_TRUE(Holds(cache.get(), K(2)));
 }
@@ -2507,13 +2507,13 @@ TEST_F(FIFOCacheTest, ProbationTargetArithmetic) {
 }
 
 // Each shard's table reserves max(2048, capacity / 64) slots, as FIFOCache
-// did before this table, so at its load factor of 0.6 it holds about one
-// entry per 107 bytes of capacity, where HyperClockCache's holds one per
+// did before this table, so at its load factor of 0.8 it holds about one
+// entry per 80 bytes of capacity, where HyperClockCache's holds one per
 // 450. Past that, new keys are evicted by occupancy.
-TEST_F(FIFOCacheTest, TableHoldsOneEntryPer107Bytes) {
+TEST_F(FIFOCacheTest, TableHoldsOneEntryPer80Bytes) {
   for (const auto& [capacity, slots, entries] :
-       {std::tuple<size_t, size_t, size_t>{1 << 20, 16384, 9831},
-        {64 << 10, 2048, 1229}}) {
+       {std::tuple<size_t, size_t, size_t>{1 << 20, 16384, 13108},
+        {64 << 10, 2048, 1639}}) {
     SCOPED_TRACE(capacity);
     std::shared_ptr<Cache> cache = NewCache(capacity);
     for (uint32_t i = 0; i < 2 * entries; ++i) {
@@ -2527,7 +2527,7 @@ TEST_F(FIFOCacheTest, TableHoldsOneEntryPer107Bytes) {
 
 // max_capacity reserves the table for a capacity SetCapacity raises the
 // cache to later, so the table can hold more entries than the construction
-// capacity's reservation (2048 slots, 1229 entries, for 64 KiB), split
+// capacity's reservation (2048 slots, 1639 entries, for 64 KiB), split
 // across shards like capacity. A table at its reservation charges nothing
 // for the growth it can't make.
 TEST_F(FIFOCacheTest, MaxCapacityReservesForLaterGrowth) {
@@ -2547,7 +2547,7 @@ TEST_F(FIFOCacheTest, MaxCapacityReservesForLaterGrowth) {
           ASSERT_OK(Insert(cache.get(), K(i)));
         }
         if (max_capacity == 0) {
-          EXPECT_EQ(cache->GetOccupancyCount(), (1229 << num_shard_bits));
+          EXPECT_EQ(cache->GetOccupancyCount(), (1639 << num_shard_bits));
           EXPECT_EQ(cache->GetTableAddressCount(), (2048 << num_shard_bits));
         } else {
           EXPECT_EQ(kEntries, cache->GetOccupancyCount());
@@ -2802,7 +2802,7 @@ TEST_F(FIFOCacheTest, InsertReplacingPinnedEntryKeepsItUntilRelease) {
   EXPECT_EQ(0, LiveValues().load());
 }
 
-// At the table's occupancy limit (1229 entries in 2048 slots) a replacing
+// At the table's occupancy limit (1639 entries in 2048 slots) a replacing
 // insert still evicts an entry for its slot, since it doesn't look for the
 // old entry first. Where that eviction takes the entry being replaced (the
 // oldest in probation), the insert returns OK; otherwise it then replaces
@@ -2816,17 +2816,17 @@ TEST_F(FIFOCacheTest, InsertReplacingAtOccupancyLimit) {
     if (victim_oldest) {
       ASSERT_OK(cache->Insert(K("v"), new CountedValue(1), CountedHelper(), 1));
     }
-    for (uint32_t i = 0; i < 1228; ++i) {
+    for (uint32_t i = 0; i < 1638; ++i) {
       ASSERT_OK(Insert(cache.get(), K(i)));
     }
     if (!victim_oldest) {
       ASSERT_OK(cache->Insert(K("v"), new CountedValue(1), CountedHelper(), 1));
     }
-    ASSERT_EQ(1229, cache->GetOccupancyCount());
+    ASSERT_EQ(1639, cache->GetOccupancyCount());
     Status s = cache->Insert(K("v"), new CountedValue(2), CountedHelper(), 1);
     ASSERT_OK(s);
     EXPECT_EQ(!victim_oldest, s.IsOkOverwritten()) << s.ToString();
-    EXPECT_EQ(victim_oldest ? 1229 : 1228, cache->GetOccupancyCount());
+    EXPECT_EQ(victim_oldest ? 1639 : 1638, cache->GetOccupancyCount());
     EXPECT_EQ(victim_oldest, Holds(cache.get(), K(0)));
     EXPECT_EQ(1, LiveValues().load());
     Cache::Handle* h = cache->Lookup(K("v"));
@@ -2848,7 +2848,7 @@ TEST_F(FIFOCacheTest, InsertReplacingWithoutFreeSlotHidesOldValue) {
     SCOPED_TRACE(with_handle);
     std::shared_ptr<Cache> cache = NewCache(64 << 10);
     std::vector<Cache::Handle*> pins;
-    for (uint32_t i = 0; i < 1228; ++i) {
+    for (uint32_t i = 0; i < 1638; ++i) {
       Cache::Handle* h = nullptr;
       ASSERT_OK(Insert(cache.get(), K(i), 1, &h));
       pins.push_back(h);
@@ -2856,7 +2856,7 @@ TEST_F(FIFOCacheTest, InsertReplacingWithoutFreeSlotHidesOldValue) {
     Cache::Handle* old = nullptr;
     ASSERT_OK(
         cache->Insert(K("k"), new CountedValue(1), CountedHelper(), 1, &old));
-    ASSERT_EQ(1229, cache->GetOccupancyCount());
+    ASSERT_EQ(1639, cache->GetOccupancyCount());
 
     cache->SetStrictCapacityLimit(true);
     auto* refused = new CountedValue(2);
@@ -2878,7 +2878,7 @@ TEST_F(FIFOCacheTest, InsertReplacingWithoutFreeSlotHidesOldValue) {
                       with_handle ? &outside : nullptr);
     EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
     EXPECT_EQ(nullptr, cache->Lookup(K("k")));
-    EXPECT_EQ(1229, cache->GetOccupancyCount());
+    EXPECT_EQ(1639, cache->GetOccupancyCount());
     EXPECT_EQ(with_handle ? 2 : 1, LiveValues().load());
     if (with_handle) {
       ASSERT_NE(nullptr, outside);
@@ -2888,7 +2888,7 @@ TEST_F(FIFOCacheTest, InsertReplacingWithoutFreeSlotHidesOldValue) {
     CheckCountedValue(cache.get(), old, 1);
     EXPECT_TRUE(cache->Release(old));
     EXPECT_EQ(0, LiveValues().load());
-    EXPECT_EQ(1228, cache->GetOccupancyCount());
+    EXPECT_EQ(1638, cache->GetOccupancyCount());
     for (Cache::Handle* p : pins) {
       EXPECT_FALSE(cache->Release(p));
     }
@@ -2932,7 +2932,7 @@ TEST_F(FIFOCacheTest, InsertReplacesEntryDeepInItsChain) {
 // is left behind.
 TEST_F(FIFOCacheTest, ConcurrentReplacesAtOccupancyLimitKeepLifetimeExact) {
   {
-    // 2048 slots and 1229 entries a shard, and about one byte an entry, so
+    // 2048 slots and 1639 entries a shard, and about one byte an entry, so
     // occupancy, not charge, bounds the table.
     std::shared_ptr<Cache> cache =
         NewCache(256 << 10, /*strict*/ false, kDontChargeCacheMetadata,
@@ -3060,11 +3060,11 @@ TEST_F(FIFOCacheTest, NonStrictGrowthStaysWithinCapacity) {
 // An insert evicts for the slots the table grows by only when they are
 // charged: under kDontChargeCacheMetadata an insert over capacity evicts
 // its charge and HyperClockCache's extra (1 here), not the 144 bytes of
-// its two new slots, which would take the whole overrun of 6.
+// its two new slots, which would take the whole overrun of 11.
 TEST_F(FIFOCacheTest, UnchargedGrowthIsNotEvictedFor) {
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10);
   std::vector<Cache::Handle*> pinned;
-  for (uint32_t i = 0; i < 15; ++i) {
+  for (uint32_t i = 0; i < 20; ++i) {
     Cache::Handle* h = nullptr;
     ASSERT_OK(Insert(cache.get(), K(i), 1, &h));
     pinned.push_back(h);
@@ -3072,12 +3072,12 @@ TEST_F(FIFOCacheTest, UnchargedGrowthIsNotEvictedFor) {
   for (Cache::Handle* h : pinned) {
     EXPECT_FALSE(cache->Release(h));
   }
-  ASSERT_EQ(15, cache->GetUsage());
+  ASSERT_EQ(20, cache->GetUsage());
   ASSERT_EQ(24, cache->GetTableAddressCount());
   ASSERT_OK(Insert(cache.get(), K("y"), 1));
   EXPECT_EQ(26, cache->GetTableAddressCount());
-  EXPECT_EQ(14, cache->GetUsage());
-  EXPECT_EQ(14, Keys(cache.get()).size());
+  EXPECT_EQ(19, cache->GetUsage());
+  EXPECT_EQ(19, Keys(cache.get()).size());
   EXPECT_TRUE(Holds(cache.get(), K("y")));
 }
 
@@ -3119,7 +3119,7 @@ TEST_F(FIFOCacheTest, RingChargedDuringEvictionIsEvictedFor) {
 }
 
 // The table never grows past its reservation (2048 slots here): at its
-// occupancy limit (1229) unpinned entries are evicted by occupancy, and
+// occupancy limit (1639) unpinned entries are evicted by occupancy, and
 // once every entry it can hold is pinned, a non-strict insert with a handle
 // gets an entry outside the table, one without is dropped, and a strict
 // one fails.
@@ -3129,26 +3129,26 @@ TEST_F(FIFOCacheTest, FullTableEvictsByOccupancyOrGoesStandalone) {
     ASSERT_OK(Insert(cache.get(), K(i)));
   }
   EXPECT_EQ(2048, cache->GetTableAddressCount());
-  EXPECT_EQ(1229, cache->GetOccupancyCount());
+  EXPECT_EQ(1639, cache->GetOccupancyCount());
   cache->EraseUnRefEntries();
   std::vector<Cache::Handle*> pins;
-  for (uint32_t i = 0; i < 1229; ++i) {
+  for (uint32_t i = 0; i < 1639; ++i) {
     Cache::Handle* h = nullptr;
     ASSERT_OK(Insert(cache.get(), K(10000 + i), 1, &h));
     pins.push_back(h);
   }
-  EXPECT_EQ(1229, cache->GetOccupancyCount());
+  EXPECT_EQ(1639, cache->GetOccupancyCount());
   Cache::Handle* outside = nullptr;
   Status s = Insert(cache.get(), K("outside"), 1, &outside);
   EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
   ASSERT_NE(nullptr, outside);
-  EXPECT_EQ(1229, cache->GetOccupancyCount());
+  EXPECT_EQ(1639, cache->GetOccupancyCount());
   EXPECT_FALSE(Contains(cache.get(), K("outside")));
-  EXPECT_EQ(1230, cache->GetPinnedUsage());
+  EXPECT_EQ(1640, cache->GetPinnedUsage());
   EXPECT_TRUE(cache->Release(outside));
   ASSERT_OK(Insert(cache.get(), K("dropped")));
   EXPECT_FALSE(Holds(cache.get(), K("dropped")));
-  EXPECT_EQ(1229, cache->GetUsage());
+  EXPECT_EQ(1639, cache->GetUsage());
   cache->SetStrictCapacityLimit(true);
   Cache::Handle* strict = nullptr;
   s = Insert(cache.get(), K("strict"), 1, &strict);
@@ -3191,17 +3191,17 @@ TEST_F(FIFOCacheTest, OccupancyEvictionPromotesUntilItFrees) {
     FIFOCache* fifo = Fifo(cache.get());
     std::vector<std::string> evicted;
     RecordEvictions(cache.get(), &evicted);
-    for (uint32_t i = 0; i < 1229; ++i) {
+    for (uint32_t i = 0; i < 1639; ++i) {
       ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 0));
     }
-    ASSERT_EQ(1229, cache->GetOccupancyCount());
+    ASSERT_EQ(1639, cache->GetOccupancyCount());
     for (uint32_t i = 0; i < 10; ++i) {
       HitNTimes(cache.get(), K(i), 2);
     }
     ASSERT_OK(Insert(cache.get(), K("new"), /*charge*/ 0));
     EXPECT_TRUE(Holds(cache.get(), K("new")));
     EXPECT_EQ(std::vector<std::string>{K(10)}, evicted);
-    EXPECT_EQ(1229, cache->GetOccupancyCount());
+    EXPECT_EQ(1639, cache->GetOccupancyCount());
     for (uint32_t i = 0; i < 10; ++i) {
       EXPECT_FALSE(fifo->TEST_InProbation(K(i))) << i;
     }
@@ -4715,21 +4715,25 @@ TEST_F(FIFOCacheTest, GhostMergeCopiesATagYoungerThanTheCopyThere) {
   const std::string k = Shard::ReverseHash(UniqueId64x2{0x9eed00, 70},
                                            &unhashed, cache->GetHashSeed())
                             .ToString();
-  const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 42);
+  const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 56);
+  size_t i = 0;
+  auto grow_to = [&](size_t slots) {
+    while (cache->GetTableAddressCount() < slots) {
+      ASSERT_LT(i, f.size());
+      ASSERT_OK(Insert(cache.get(), f[i++]));
+    }
+    ASSERT_EQ(slots, cache->GetTableAddressCount());
+  };
   ASSERT_OK(Insert(cache.get(), k));
-  for (uint32_t i = 0; i < 40; ++i) {
-    ASSERT_OK(Insert(cache.get(), f[i]));
-  }
-  ASSERT_EQ(67, cache->GetTableAddressCount());
+  grow_to(67);
   // Evicts k, then grows the table by splitting homes 67 and 68.
   cache->SetCapacity(cache->GetUsage() - 1);
   ASSERT_FALSE(Contains(cache.get(), k));
   cache->SetCapacity(1000);
-  ASSERT_OK(Insert(cache.get(), f[40]));
-  ASSERT_OK(Insert(cache.get(), f[41]));
-  ASSERT_EQ(69, cache->GetTableAddressCount());
-  // 42 more evictions, so the first tag is 44 old when the table next
-  // splits, at 43 entries.
+  grow_to(69);
+  // Evicts the n entries 69 slots hold, so the first tag is n + 2 evictions
+  // old when the table next splits, at n + 1 entries.
+  const size_t n = cache->GetOccupancyCount();
   cache->SetCapacity(0);
   ASSERT_EQ(0, cache->GetOccupancyCount());
   cache->SetCapacity(1000);
@@ -4737,18 +4741,18 @@ TEST_F(FIFOCacheTest, GhostMergeCopiesATagYoungerThanTheCopyThere) {
   ASSERT_OK(Insert(cache.get(), k));
   cache->SetCapacity(0);
   cache->SetCapacity(1000);
-  uint32_t i = 0;
+  uint32_t j = 0;
   while (cache->GetTableAddressCount() < 71) {
-    ASSERT_OK(Insert(cache.get(), K(i++)));
+    ASSERT_OK(Insert(cache.get(), K(j++)));
   }
-  ASSERT_EQ(43, cache->GetOccupancyCount());
+  ASSERT_EQ(n + 1, cache->GetOccupancyCount());
   EXPECT_TRUE(fifo->TEST_InGhost(k));
   EXPECT_EQ(0, Stats(cache.get()).ghost_returns);
 }
 
 // The eviction count in a ghost stamp steps by the power of two that fits
 // the most entries the table can ever hold into 15 bits. Reserved for 16
-// MiB, the table can grow to 262,144 slots holding 157,287 entries, so the
+// MiB, the table can grow to 262,144 slots holding 209,716 entries, so the
 // stamp steps by 8 evictions. With 20 entries a tag counts for 3 steps, 20
 // / 8 rounded up: k, evicted by the insert that takes the count to 1, still
 // counts 22 evictions later (count 23, step 2) and not 23 later (count 24,
@@ -4861,7 +4865,7 @@ TEST_F(FIFOCacheTest, GhostTagPutBackWhenStrictInsertFails) {
 // An insert that finds the table's occupancy full of pinned entries goes
 // standalone, outside the table, and puts back the tag it took.
 TEST_F(FIFOCacheTest, GhostTagPutBackWhenInsertGoesStandalone) {
-  // The table can't grow past its 2048 slots, which hold 1229 entries.
+  // The table can't grow past its 2048 slots, which hold 1639 entries.
   std::shared_ptr<Cache> cache = NewCache(4096);
   FIFOCache* fifo = Fifo(cache.get());
   ASSERT_OK(Insert(cache.get(), K("a")));

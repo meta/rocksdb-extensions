@@ -4063,7 +4063,7 @@ void AutoHyperClockTable::AddStats(FIFOCacheStats* stats) const {
 size_t AutoHyperClockTable::CalcMaxUsableLength(size_t reserved_capacity) {
   // FIFOCache: one slot per 64 bytes, at least 2048, under either metadata
   // policy, as FIFOCache reserved before this table: at the load factor,
-  // about one entry per 107 bytes. Slot indices fit the probation queue's
+  // about one entry per 80 bytes. Slot indices fit the probation queue's
   // 32 bits.
   constexpr size_t kMinSlots = 2048;
   constexpr size_t kBytesPerSlot = 64;

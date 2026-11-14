@@ -77,7 +77,7 @@ namespace ROCKSDB_NAMESPACE {
 // evicted. A key's cell can be any of the eight in the group of slots
 // holding the slot it maps to, and counts for as many probation evictions
 // as the shard has entries, as in S3-FIFO, rounded up to the count's step:
-// one eviction for a shard reserved for up to about 3.5 MB (see
+// one eviction for a shard reserved for up to about 2.6 MB (see
 // max_capacity below), 2^n for one reserved for 2^n times that. A victim
 // whose group has no empty cell replaces the oldest, unless all eight are
 // from its own step, and while a group's eight cells all count, an insert
@@ -101,8 +101,8 @@ namespace ROCKSDB_NAMESPACE {
 // count against the commit limit unless vm.overcommit_memory=2; on Windows
 // it is committed up front. If it cannot be reserved, construction aborts,
 // as for HyperClockCache. The table cannot grow past its reservation, which
-// holds about one entry per 107 bytes of reserved capacity: once
-// SetCapacity raises capacity beyond that (about 38x for 4 KiB entries,
+// holds about one entry per 80 bytes of reserved capacity: once
+// SetCapacity raises capacity beyond that (about 51x for 4 KiB entries,
 // with the default max_capacity), new keys are also evicted by occupancy.
 //
 // This is an opt-in implementation and not the default block cache. Besides
