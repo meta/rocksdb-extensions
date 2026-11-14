@@ -674,7 +674,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   // toward probation's share. The tag is taken before eviction, which could
   // replace it, and put back on each path below that doesn't put the entry
   // in the table.
-  state.ghost_hit = derived.GhostTake(proto);
+  derived.GhostTake(proto, state);
   state.probation_charge = state.ghost_hit ? 0 : proto.GetTotalCharge();
 
   // Do we have the available occupancy? Optimistically assume we do
@@ -1364,6 +1364,18 @@ size_t CalcOccupancyLimit(size_t used_length) {
                              0.999);
 }
 
+// FIFOCache: see AutoHyperClockTable::ghost_stamp_shift_. Leaves the stamp's
+// top bit spare, so a tag that stopped counting doesn't read as counting
+// again until its age is within kGhostStampSlack steps of wrapping, unless
+// the shard's entry count grows past its age first.
+int GhostStampShift(size_t max_occupancy) {
+  int shift = 0;
+  while ((max_occupancy >> shift) >= (size_t{1} << 15)) {
+    ++shift;
+  }
+  return shift;
+}
+
 }  // namespace
 
 // An RAII wrapper for locking a chain of entries (flag bit on the head)
@@ -1493,6 +1505,7 @@ AutoHyperClockTable::AutoHyperClockTable(
       // and the queue.
       probation_words_(sizeof(RelaxedAtomic<uint32_t>) * array_.Count()),
       ghost_(sizeof(RelaxedAtomic<uint32_t>) * array_.Count()),
+      ghost_stamp_shift_(GhostStampShift(CalcOccupancyLimit(array_.Count()))),
       probation_(ProbationRingCapacity(occupancy_limit_.LoadRelaxed()),
                  ProbationRingCapacity(CalcOccupancyLimit(array_.Count()))) {
   // FIFOCache: and the probation words' and ghost's mappings.
@@ -1807,10 +1820,14 @@ bool AutoHyperClockTable::Grow(InsertState& state, size_t entry_charge) {
     std::this_thread::yield();
   }
 
-  // FIFOCache: keys whose home was old_home now have one of the two, so
-  // both get its ghost tag (which matches only its own key), before
-  // length_info_ lets lookups use grow_home.
-  ghost_[grow_home].StoreRelaxed(ghost_[old_home].LoadRelaxed());
+  // FIFOCache: keys whose home was old_home now have one of the two. Their
+  // tags are in old_home's group of the ghost, so grow_home's group, which
+  // is another once the table has more than one, gets the live ones it
+  // lacks (tags match only their own keys), before length_info_ lets
+  // lookups use grow_home.
+  if (grow_home >= kGhostWays) {
+    GhostMerge(old_home & ~(kGhostWays - 1), grow_home & ~(kGhostWays - 1));
+  }
 
   // Do the dirty work of splitting the chain, including updating heads and
   // chain nexts for new shift amounts.
@@ -3600,41 +3617,149 @@ bool AutoHyperClockTable::ProbationPush(size_t idx, uint32_t word,
   return false;
 }
 
-RelaxedAtomic<uint32_t>& AutoHyperClockTable::GhostSlot(
-    const UniqueId64x2& hashed_key) const {
+size_t AutoHyperClockTable::GhostGroup(const UniqueId64x2& hashed_key) const {
   size_t home;
   int shift;
   GetHomeIndexAndShift(length_info_.LoadRelaxed(), hashed_key[1], &home,
                        &shift);
-  return ghost_[home];
+  // Inside the mappings, whose slot count is a multiple of 64.
+  return home & ~(kGhostWays - 1);
 }
 
 uint32_t AutoHyperClockTable::GhostTag(const UniqueId64x2& hashed_key) {
   // The home comes from hashed_key[1], so the tag from the other half.
-  return Lower32of64(hashed_key[0]) | 1U;
+  const uint32_t tag = static_cast<uint32_t>(hashed_key[0] & 0xffff);
+  return tag == 0 ? 1 : tag;
 }
 
-bool AutoHyperClockTable::GhostTake(const ClockHandleBasicData& proto) {
-  if (IsPlaceholder(proto)) {
-    return false;
+uint32_t AutoHyperClockTable::GhostNow() const {
+  return static_cast<uint32_t>(probation_evictions_.LoadRelaxed() >>
+                               ghost_stamp_shift_) &
+         0xffff;
+}
+
+uint32_t AutoHyperClockTable::GhostReach() const {
+  const size_t step = size_t{1} << ghost_stamp_shift_;
+  const size_t steps =
+      (occupancy_.LoadRelaxed() + step - 1) >> ghost_stamp_shift_;
+  // Racing inserts can take occupancy a little past its limit.
+  return static_cast<uint32_t>(std::min(steps, size_t{1} << 15));
+}
+
+uint32_t AutoHyperClockTable::GhostAge(uint32_t cell, uint32_t now) {
+  const uint32_t age = (now - cell) & 0xffff;
+  // A stamp a little ahead of now was written by a pass that read the
+  // count after the caller did.
+  return age > 0xffff - kGhostStampSlack ? 0 : age;
+}
+
+size_t AutoHyperClockTable::GhostFind(size_t group, uint32_t tag, size_t from,
+                                      uint32_t* cell) const {
+  uint32_t now = 0;
+  uint32_t reach = 0;
+  bool loaded = false;
+  for (size_t i = from; i < kGhostWays; ++i) {
+    const uint32_t c = ghost_[group + i].LoadRelaxed();
+    if ((c >> 16) != tag) {
+      continue;
+    }
+    // Only for a matching tag, which most lookups don't find.
+    if (!loaded) {
+      now = GhostNow();
+      reach = GhostReach();
+      loaded = true;
+    }
+    if (GhostAge(c, now) < reach) {
+      *cell = c;
+      return i;
+    }
   }
-  RelaxedAtomic<uint32_t>& slot = GhostSlot(proto.hashed_key);
-  uint32_t tag = GhostTag(proto.hashed_key);
-  // Read first, so a miss doesn't take the line for writing.
-  return slot.LoadRelaxed() == tag && slot.CasStrongRelaxed(tag, 0);
+  return kGhostWays;
+}
+
+bool AutoHyperClockTable::GhostPlace(size_t group, uint32_t value,
+                                     uint32_t now) {
+  // Over a cell older than value, the oldest, if there is no empty one.
+  size_t oldest = kGhostWays;
+  uint32_t oldest_cell = 0;
+  uint32_t oldest_age = GhostAge(value, now);
+  for (size_t i = 0; i < kGhostWays; ++i) {
+    uint32_t c = ghost_[group + i].LoadRelaxed();
+    if (c == 0) {
+      if (ghost_[group + i].CasStrongRelaxed(c, value)) {
+        return true;
+      }
+      // Taken meanwhile; c is what took it.
+    }
+    const uint32_t age = GhostAge(c, now);
+    if (age > oldest_age) {
+      oldest = i;
+      oldest_cell = c;
+      oldest_age = age;
+    }
+  }
+  // A racing write to that cell wins.
+  return oldest < kGhostWays &&
+         ghost_[group + oldest].CasStrongRelaxed(oldest_cell, value);
+}
+
+void AutoHyperClockTable::GhostTake(const ClockHandleBasicData& proto,
+                                    InsertState& state) {
+  state.ghost_hit = false;
+  if (IsPlaceholder(proto)) {
+    return;
+  }
+  const uint32_t tag = GhostTag(proto.hashed_key);
+  const size_t group = GhostGroup(proto.hashed_key);
+  uint32_t cell;
+  for (size_t i = 0; (i = GhostFind(group, tag, i, &cell)) < kGhostWays; ++i) {
+    if (ghost_[group + i].CasStrongRelaxed(cell, 0)) {
+      state.ghost_hit = true;
+      state.ghost_value = cell;
+      return;
+    }
+  }
 }
 
 void AutoHyperClockTable::GhostPutBack(const ClockHandleBasicData& proto,
                                        const InsertState& state) {
   if (state.ghost_hit) {
-    uint32_t empty = 0;
-    GhostSlot(proto.hashed_key)
-        .CasStrongRelaxed(empty, GhostTag(proto.hashed_key));
+    // In the key's group now, which growth may have changed, with the stamp
+    // it had.
+    GhostPlace(GhostGroup(proto.hashed_key), state.ghost_value, GhostNow());
+  }
+}
+
+void AutoHyperClockTable::GhostPut(const UniqueId64x2& hashed_key) {
+  const uint32_t now = GhostNow();
+  TEST_SYNC_POINT("FIFOCache::GhostPut:Loaded");
+  GhostPlace(GhostGroup(hashed_key), (GhostTag(hashed_key) << 16) | now, now);
+}
+
+void AutoHyperClockTable::GhostMerge(size_t from, size_t to) {
+  const uint32_t now = GhostNow();
+  const uint32_t reach = GhostReach();
+  for (size_t i = 0; i < kGhostWays; ++i) {
+    const uint32_t c = ghost_[from + i].LoadRelaxed();
+    const uint32_t age = GhostAge(c, now);
+    if (c == 0 || age >= reach) {
+      continue;
+    }
+    bool there = false;
+    for (size_t j = 0; j < kGhostWays && !there; ++j) {
+      const uint32_t d = ghost_[to + j].LoadRelaxed();
+      there = (d >> 16) == (c >> 16) && GhostAge(d, now) <= age;
+    }
+    if (!there) {
+      GhostPlace(to, c, now);
+    }
   }
 }
 
 bool AutoHyperClockTable::InGhost(const UniqueId64x2& hashed_key) const {
-  return GhostSlot(hashed_key).LoadRelaxed() == GhostTag(hashed_key);
+  uint32_t cell;
+  return GhostFind(GhostGroup(hashed_key), GhostTag(hashed_key), 0, &cell) <
+         kGhostWays;
 }
 
 bool AutoHyperClockTable::IsInProbation(const HandleImpl* h) const {
@@ -3887,7 +4012,7 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
     const size_t total_charge = h.total_charge;
     if (meta.IsVisible() && !IsPlaceholder(h)) {
       // Evicted rather than erased, and not a placeholder.
-      GhostSlot(h.hashed_key).StoreRelaxed(GhostTag(h.hashed_key));
+      GhostPut(h.hashed_key);
     }
     TrackRemoval(idx, total_charge);
     data->freed_charge += total_charge;

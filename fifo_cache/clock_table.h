@@ -971,9 +971,11 @@ class AutoHyperClockTable : public BaseClockTable {
     // FIFOCache: the charge of the entry being inserted that will go into
     // the probation queue, which Evict counts toward probation's share, and
     // whether the insert took its key's ghost tag (it goes to the resident
-    // queue).
+    // queue), with the ghost cell's value, to put back if the entry doesn't
+    // go in the table.
     size_t probation_charge = 0;
     bool ghost_hit = false;
+    uint32_t ghost_value = 0;
     // FIFOCache: whether DoInsert replaced an entry with the key, and the
     // bytes of table slots (see ChargeUsageMaybeEvictNonStrict) and of
     // probation rings (see EvictForChargedRing) the insert charged to usage.
@@ -1069,12 +1071,13 @@ class AutoHyperClockTable : public BaseClockTable {
   }
 
   // FIFOCache: takes the tag of the key of an entry about to be inserted
-  // out of the ghost, if it is there, before eviction can replace it.
-  // Returns whether it did; the entry then goes to the resident queue. A
-  // placeholder never takes one (see IsPlaceholder), so the real entry gets
-  // the credit. An insert that took the tag and doesn't put the entry in the
-  // table puts the tag back, unless a newer one has taken its place.
-  bool GhostTake(const ClockHandleBasicData& proto);
+  // out of the ghost, if it is there and still counts, before eviction can
+  // replace it, and sets state.ghost_hit if it did; the entry then goes to
+  // the resident queue. A placeholder never takes one (see IsPlaceholder),
+  // so the real entry gets the credit. An insert that took the tag and
+  // doesn't put the entry in the table puts it back in the key's group, with
+  // the stamp it had, in an empty cell or over an older tag.
+  void GhostTake(const ClockHandleBasicData& proto, InsertState& state);
   void GhostPutBack(const ClockHandleBasicData& proto,
                     const InsertState& state);
   // FIFOCache: whether the key is in the ghost.
@@ -1204,11 +1207,34 @@ class AutoHyperClockTable : public BaseClockTable {
   bool ProbationPush(size_t idx, uint32_t word, InsertState& state);
   // Whether a queued value no longer names the entry it was pushed for.
   bool IsStaleProbationCell(uint64_t v) const;
-  // The ghost: one tag per slot, at the home a key has when its tag is
-  // written or read, nonzero, from 32 bits of the hash the home doesn't
-  // use. A newer tag overwrites an older one at the same home.
-  RelaxedAtomic<uint32_t>& GhostSlot(const UniqueId64x2& hashed_key) const;
+  // The ghost (see ghost_): a key's tag can be in any of the kGhostWays
+  // cells of the aligned group holding the home the key has when the tag is
+  // written or read. A cell holds the tag, 16 bits of the hash the home
+  // doesn't use and never 0 (an empty cell), above a 16-bit stamp: the
+  // count of probation evictions when the key was evicted, in steps of
+  // 2^ghost_stamp_shift_. A tag counts while its age, the steps since its
+  // stamp, is under the shard's entry count rounded up to steps, the bound
+  // S3-FIFO's ghost has. A stamp up to kGhostStampSlack steps ahead of the
+  // count a reader loaded is age 0.
+  static constexpr size_t kGhostWays = 8;
+  static constexpr uint32_t kGhostStampSlack = 256;
+  size_t GhostGroup(const UniqueId64x2& hashed_key) const;
   static uint32_t GhostTag(const UniqueId64x2& hashed_key);
+  uint32_t GhostNow() const;
+  uint32_t GhostReach() const;
+  static uint32_t GhostAge(uint32_t cell, uint32_t now);
+  // The index in group, from `from` on, of the first cell with tag that
+  // still counts, setting *cell to it, or kGhostWays.
+  size_t GhostFind(size_t group, uint32_t tag, size_t from,
+                   uint32_t* cell) const;
+  // Writes value in an empty cell of group, or else over its oldest cell if
+  // that is older than value. Returns whether it wrote it.
+  bool GhostPlace(size_t group, uint32_t value, uint32_t now);
+  // Writes the tag of an entry evicted from probation in its group.
+  void GhostPut(const UniqueId64x2& hashed_key);
+  // Copies to group `to` the tags in group `from` that count and that `to`
+  // doesn't have as young, keeping their stamps, for a table split.
+  void GhostMerge(size_t from, size_t to);
   // kNoopCacheItemHelper with no charge, as CacheWithSecondaryAdapter
   // inserts to note a recent use. It neither takes nor leaves a ghost.
   static bool IsPlaceholder(const ClockHandleBasicData& entry) {
@@ -1307,10 +1333,13 @@ class AutoHyperClockTable : public BaseClockTable {
   // lazily zeroed like array_.
   const NoReserveTypedMemMapping<RelaxedAtomic<uint32_t>> probation_words_;
 
-  // FIFOCache: the ghost of keys evicted from probation (see GhostSlot),
-  // one tag per slot of array_, lazily zeroed like array_. When the table
-  // grows, the new home gets a copy of the tag at the home it splits from.
+  // FIFOCache: the ghost of keys evicted from probation (see GhostGroup),
+  // one cell per slot of array_, lazily zeroed like array_. Each split of
+  // the table into another group merges the group it splits from into it.
   const NoReserveTypedMemMapping<RelaxedAtomic<uint32_t>> ghost_;
+  // FIFOCache: the smallest shift that fits the largest occupancy limit the
+  // table can reach into 15 bits of ghost stamp steps.
+  const int ghost_stamp_shift_;
 
   // FIFOCache: the probation queue's order, as (slot index << 32 | word).
   ProbationQueue probation_;

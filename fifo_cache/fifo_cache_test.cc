@@ -215,6 +215,33 @@ class FIFOCacheTest : public testing::Test {
     return keys;
   }
 
+  // n keys with home 0 while the table has under 2^40 slots, and distinct
+  // ghost tags, so all of their tags share one group of the ghost.
+  static std::vector<std::string> KeysWithHomeZero(Cache* cache, uint64_t n) {
+    std::vector<std::string> keys;
+    for (uint64_t i = 0; i < n; ++i) {
+      UniqueId64x2 unhashed;
+      keys.push_back(Shard::ReverseHash(UniqueId64x2{0x5eed00 + i, i << 40},
+                                        &unhashed, cache->GetHashSeed())
+                         .ToString());
+    }
+    return keys;
+  }
+
+  // n keys with homes 8 on, one each, so none of their tags shares a group
+  // with a key whose home is 0, and none of their groups gets more than 8.
+  static std::vector<std::string> FillersOffGroupZero(Cache* cache,
+                                                      uint64_t n) {
+    std::vector<std::string> keys;
+    for (uint64_t i = 0; i < n; ++i) {
+      UniqueId64x2 unhashed;
+      keys.push_back(Shard::ReverseHash(UniqueId64x2{0x6eed00 + i, 8 + i},
+                                        &unhashed, cache->GetHashSeed())
+                         .ToString());
+    }
+    return keys;
+  }
+
   static FIFOCacheStats Stats(Cache* cache) {
     FIFOCacheStats stats;
     EXPECT_TRUE(GetFIFOCacheStats(*cache, &stats));
@@ -4451,8 +4478,305 @@ TEST_F(FIFOCacheTest, GhostRemembersNewestVictim) {
   EXPECT_FALSE(fifo->TEST_InProbation(K(159)));
 }
 
-// The ghost keeps 32 bits of a key's hash at its home, so another key with
-// the same home and the same 32 bits is readmitted as if it were the victim.
+// A key's tag can go in any of the eight cells of the group holding its
+// home, so eight victims with one home all stay in the ghost. A ghost with
+// one cell per home would keep only the last.
+TEST_F(FIFOCacheTest, GhostKeepsEightVictimsWithOneHome) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(10 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> s = KeysWithHomeZero(cache.get(), 8);
+  const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 10);
+  for (const std::string& key : s) {
+    ASSERT_OK(Insert(cache.get(), key, kU));
+  }
+  for (const std::string& key : f) {
+    ASSERT_OK(Insert(cache.get(), key, kU));
+  }
+  ASSERT_EQ(s, evicted);
+  for (const std::string& key : s) {
+    EXPECT_TRUE(fifo->TEST_InGhost(key));
+  }
+  ASSERT_OK(Insert(cache.get(), s[0], kU));
+  EXPECT_FALSE(fifo->TEST_InProbation(s[0]));
+}
+
+// A tag counts for as many probation evictions as the shard has entries, as
+// in S3-FIFO's ghost. k is evicted by the insert that fills a cache of ten
+// entries past full; after 8 more evictions it comes back to the resident
+// queue, and after 9, the tenth since its own, to probation.
+TEST_F(FIFOCacheTest, GhostTagCountsForTheEntryCountOfEvictions) {
+  for (uint32_t more : {8u, 9u}) {
+    SCOPED_TRACE(more);
+    std::vector<std::string> evicted;
+    std::shared_ptr<Cache> cache = NewCache(10 * kU);
+    RecordEvictions(cache.get(), &evicted);
+    FIFOCache* fifo = Fifo(cache.get());
+    const std::string k = KeysWithHomeZero(cache.get(), 1)[0];
+    const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 19);
+    ASSERT_OK(Insert(cache.get(), k, kU));
+    for (uint32_t i = 0; i < 10 + more; ++i) {
+      ASSERT_OK(Insert(cache.get(), f[i], kU));
+    }
+    ASSERT_EQ(1 + more, evicted.size());
+    ASSERT_EQ(k, evicted[0]);
+    EXPECT_EQ(more == 8, fifo->TEST_InGhost(k));
+    ASSERT_OK(Insert(cache.get(), k, kU));
+    EXPECT_EQ(more == 9, fifo->TEST_InProbation(k));
+  }
+}
+
+// A victim whose group's eight tags all still count replaces the oldest,
+// wherever it is: s[0] comes back and frees the first cell, s[8] takes it,
+// and s[9] replaces s[1], the oldest, rather than s[8] in the first cell.
+TEST_F(FIFOCacheTest, GhostVictimInAFullGroupReplacesTheOldestTag) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(11 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> s = KeysWithHomeZero(cache.get(), 10);
+  const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 11);
+  for (uint32_t i = 0; i < 8; ++i) {
+    ASSERT_OK(Insert(cache.get(), s[i], kU));
+  }
+  ASSERT_OK(Insert(cache.get(), f[0], kU));
+  ASSERT_OK(Insert(cache.get(), s[8], kU));
+  ASSERT_OK(Insert(cache.get(), s[9], kU));
+  // f[1] to f[8] evict s[0] to s[7], filling the group.
+  for (uint32_t i = 1; i < 9; ++i) {
+    ASSERT_OK(Insert(cache.get(), f[i], kU));
+  }
+  ASSERT_OK(Insert(cache.get(), s[0], kU));
+  ASSERT_EQ(1, Stats(cache.get()).ghost_returns);
+  ASSERT_OK(Insert(cache.get(), f[9], kU));
+  ASSERT_OK(Insert(cache.get(), f[10], kU));
+  std::vector<std::string> expected(s.begin(), s.begin() + 8);
+  expected.insert(expected.end(), {f[0], s[8], s[9]});
+  ASSERT_EQ(expected, evicted);
+  // s[1], 9 evictions old in a cache of 11 entries, would still count.
+  EXPECT_FALSE(fifo->TEST_InGhost(s[1]));
+  for (uint32_t i = 2; i < 10; ++i) {
+    EXPECT_TRUE(fifo->TEST_InGhost(s[i])) << i;
+  }
+}
+
+// A tag put back into a group whose tags are all younger is dropped, as a
+// victim would have replaced it first. a's strict insert takes its tag, the
+// oldest of the group's eight, evicts c into its cell, and fails.
+TEST_F(FIFOCacheTest, GhostTagPutBackDropsItInAGroupOfYoungerTags) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(11 * kU, /*strict*/ true);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> s = KeysWithHomeZero(cache.get(), 9);
+  const std::string& a = s[0];
+  const std::string& c = s[8];
+  const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 10);
+  for (const std::string& key : s) {
+    ASSERT_OK(Insert(cache.get(), key, kU));
+  }
+  std::vector<Cache::Handle*> pins(10, nullptr);
+  for (uint32_t i = 0; i < 10; ++i) {
+    ASSERT_OK(Insert(cache.get(), f[i], kU, &pins[i]));
+  }
+  ASSERT_EQ(std::vector<std::string>(s.begin(), s.begin() + 8), evicted);
+  Cache::Handle* h = nullptr;
+  EXPECT_TRUE(Insert(cache.get(), a, 2 * kU, &h).IsMemoryLimit());
+  ASSERT_FALSE(Holds(cache.get(), c));
+  // 9 evictions old in a cache of 10 entries, a would still count.
+  EXPECT_FALSE(fifo->TEST_InGhost(a));
+  for (uint32_t i = 1; i < 9; ++i) {
+    EXPECT_TRUE(fifo->TEST_InGhost(s[i])) << i;
+  }
+  for (Cache::Handle* pin : pins) {
+    cache->Release(pin);
+  }
+}
+
+// A failed insert puts its key's tag back with the stamp it had, so the tag
+// stops counting when it would have: a, evicted by the insert that fills a
+// strict cache with ten pinned entries, comes back in vain, and once the
+// pins are gone it is still in the ghost after 8 more evictions and not
+// after 9.
+TEST_F(FIFOCacheTest, GhostTagPutBackKeepsItsStamp) {
+  for (uint32_t more : {8u, 9u}) {
+    SCOPED_TRACE(more);
+    std::vector<std::string> evicted;
+    std::shared_ptr<Cache> cache = NewCache(10 * kU, /*strict*/ true);
+    RecordEvictions(cache.get(), &evicted);
+    FIFOCache* fifo = Fifo(cache.get());
+    const std::string a = KeysWithHomeZero(cache.get(), 1)[0];
+    const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 19);
+    ASSERT_OK(Insert(cache.get(), a, kU));
+    std::vector<Cache::Handle*> pins(10, nullptr);
+    for (uint32_t i = 0; i < 10; ++i) {
+      ASSERT_OK(Insert(cache.get(), f[i], kU, &pins[i]));
+    }
+    ASSERT_EQ(std::vector<std::string>{a}, evicted);
+    Cache::Handle* h = nullptr;
+    EXPECT_TRUE(Insert(cache.get(), a, kU, &h).IsMemoryLimit());
+    ASSERT_TRUE(fifo->TEST_InGhost(a));
+    for (Cache::Handle* pin : pins) {
+      cache->Release(pin);
+    }
+    for (uint32_t i = 10; i < 10 + more; ++i) {
+      ASSERT_OK(Insert(cache.get(), f[i], kU));
+    }
+    ASSERT_EQ(1 + more, evicted.size());
+    EXPECT_EQ(more == 8, fifo->TEST_InGhost(a));
+  }
+}
+
+// A tag written to a group after the table has grown into the group a key's
+// home will split to is merged there when that home splits. k's hash puts
+// it at home 3 until the table has 68 slots, and at 67 from then on. The
+// table grows from 64 slots to 66 and then 67 (each step the one that next
+// raises the occupancy limit), so k is evicted with group 64 already started
+// but home 3 not yet split, and found once the table is past 68.
+TEST_F(FIFOCacheTest, GhostTagFollowsAKeyWhoseHomeSplitsAfterItsGroup) {
+  std::shared_ptr<Cache> cache =
+      NewCache(1000, /*strict*/ false, kDontChargeCacheMetadata,
+               /*num_shard_bits*/ 0, /*max_capacity*/ 1 << 20);
+  FIFOCache* fifo = Fifo(cache.get());
+  UniqueId64x2 unhashed;
+  const std::string k = Shard::ReverseHash(UniqueId64x2{0x7eed00, 67},
+                                           &unhashed, cache->GetHashSeed())
+                            .ToString();
+  ASSERT_OK(Insert(cache.get(), k));
+  uint32_t i = 0;
+  while (cache->GetTableAddressCount() < 67) {
+    ASSERT_OK(Insert(cache.get(), K(i++)));
+  }
+  ASSERT_EQ(67, cache->GetTableAddressCount());
+  // Evicts k, the oldest.
+  cache->SetCapacity(cache->GetUsage() - 1);
+  ASSERT_FALSE(Contains(cache.get(), k));
+  ASSERT_TRUE(fifo->TEST_InGhost(k));
+  ASSERT_EQ(67, cache->GetTableAddressCount());
+  cache->SetCapacity(1000);
+  while (cache->GetTableAddressCount() < 68) {
+    ASSERT_OK(Insert(cache.get(), K(i++)));
+  }
+  EXPECT_TRUE(fifo->TEST_InGhost(k));
+}
+
+// Each split of a group's homes merges it into the new group once more, and
+// a tag the new group already has isn't copied again. u's tag is written to
+// group 64 and a's and b's to group 0, one eviction pass each, and the six
+// splits that follow would fill group 64 with copies and then replace u's,
+// the oldest.
+TEST_F(FIFOCacheTest, GhostMergeCopiesATagOnce) {
+  std::shared_ptr<Cache> cache =
+      NewCache(1000, /*strict*/ false, kDontChargeCacheMetadata,
+               /*num_shard_bits*/ 0, /*max_capacity*/ 1 << 20);
+  FIFOCache* fifo = Fifo(cache.get());
+  std::vector<std::string> keys;
+  // Homes 64 (0 under 65 slots), 1 and 2.
+  for (uint64_t home : {64, 1, 2}) {
+    UniqueId64x2 unhashed;
+    keys.push_back(Shard::ReverseHash(UniqueId64x2{0x8eed00 + home, home},
+                                      &unhashed, cache->GetHashSeed())
+                       .ToString());
+  }
+  for (const std::string& key : keys) {
+    ASSERT_OK(Insert(cache.get(), key));
+  }
+  uint32_t i = 0;
+  while (cache->GetTableAddressCount() < 65) {
+    ASSERT_OK(Insert(cache.get(), K(i++)));
+  }
+  ASSERT_EQ(66, cache->GetTableAddressCount());
+  // Evicts the three, the oldest, in turn.
+  for (const std::string& key : keys) {
+    cache->SetCapacity(cache->GetUsage() - 1);
+    ASSERT_FALSE(Contains(cache.get(), key));
+  }
+  cache->SetCapacity(1000);
+  while (cache->GetTableAddressCount() < 72) {
+    ASSERT_OK(Insert(cache.get(), K(i++)));
+  }
+  for (const std::string& key : keys) {
+    EXPECT_TRUE(fifo->TEST_InGhost(key));
+  }
+}
+
+// A merge copies a tag that the new group holds only an older copy of. k's
+// home is 6 until the table has 71 slots, and 70 from then on. Its first
+// tag, written to group 0, is copied to group 64 by the splits of homes 3
+// and 4, and has stopped counting by the time k, back in the cache, is
+// evicted again, so only the second tag's copy finds k at home 70.
+TEST_F(FIFOCacheTest, GhostMergeCopiesATagYoungerThanTheCopyThere) {
+  std::shared_ptr<Cache> cache =
+      NewCache(1000, /*strict*/ false, kDontChargeCacheMetadata,
+               /*num_shard_bits*/ 0, /*max_capacity*/ 1 << 20);
+  FIFOCache* fifo = Fifo(cache.get());
+  UniqueId64x2 unhashed;
+  const std::string k = Shard::ReverseHash(UniqueId64x2{0x9eed00, 70},
+                                           &unhashed, cache->GetHashSeed())
+                            .ToString();
+  const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 42);
+  ASSERT_OK(Insert(cache.get(), k));
+  for (uint32_t i = 0; i < 40; ++i) {
+    ASSERT_OK(Insert(cache.get(), f[i]));
+  }
+  ASSERT_EQ(67, cache->GetTableAddressCount());
+  // Evicts k, then grows the table by splitting homes 67 and 68.
+  cache->SetCapacity(cache->GetUsage() - 1);
+  ASSERT_FALSE(Contains(cache.get(), k));
+  cache->SetCapacity(1000);
+  ASSERT_OK(Insert(cache.get(), f[40]));
+  ASSERT_OK(Insert(cache.get(), f[41]));
+  ASSERT_EQ(69, cache->GetTableAddressCount());
+  // 42 more evictions, so the first tag is 44 old when the table next
+  // splits, at 43 entries.
+  cache->SetCapacity(0);
+  ASSERT_EQ(0, cache->GetOccupancyCount());
+  cache->SetCapacity(1000);
+  ASSERT_FALSE(fifo->TEST_InGhost(k));
+  ASSERT_OK(Insert(cache.get(), k));
+  cache->SetCapacity(0);
+  cache->SetCapacity(1000);
+  uint32_t i = 0;
+  while (cache->GetTableAddressCount() < 71) {
+    ASSERT_OK(Insert(cache.get(), K(i++)));
+  }
+  ASSERT_EQ(43, cache->GetOccupancyCount());
+  EXPECT_TRUE(fifo->TEST_InGhost(k));
+  EXPECT_EQ(0, Stats(cache.get()).ghost_returns);
+}
+
+// The eviction count in a ghost stamp steps by the power of two that fits
+// the most entries the table can ever hold into 15 bits. Reserved for 16
+// MiB, the table can grow to 262,144 slots holding 157,287 entries, so the
+// stamp steps by 8 evictions. With 20 entries a tag counts for 3 steps, 20
+// / 8 rounded up: k, evicted by the insert that takes the count to 1, still
+// counts 22 evictions later (count 23, step 2) and not 23 later (count 24,
+// step 3).
+TEST_F(FIFOCacheTest, GhostStampsStepWithTheLargestTable) {
+  for (uint32_t more : {22u, 23u}) {
+    SCOPED_TRACE(more);
+    std::vector<std::string> evicted;
+    std::shared_ptr<Cache> cache =
+        NewCache(20 * kU, /*strict*/ false, kDontChargeCacheMetadata,
+                 /*num_shard_bits*/ 0, /*max_capacity*/ 16 << 20);
+    RecordEvictions(cache.get(), &evicted);
+    FIFOCache* fifo = Fifo(cache.get());
+    const std::string k = KeysWithHomeZero(cache.get(), 1)[0];
+    const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 43);
+    ASSERT_OK(Insert(cache.get(), k, kU));
+    for (uint32_t i = 0; i < 20 + more; ++i) {
+      ASSERT_OK(Insert(cache.get(), f[i], kU));
+    }
+    ASSERT_EQ(1 + more, evicted.size());
+    ASSERT_EQ(k, evicted[0]);
+    EXPECT_EQ(more == 22, fifo->TEST_InGhost(k));
+  }
+}
+
+// The ghost keeps 16 bits of a key's hash in the group of its home, so
+// another key with the same home and the same 16 bits is readmitted as if it
+// were the victim.
 TEST_F(FIFOCacheTest, GhostTagCollisionAdmitsToResident) {
   std::shared_ptr<Cache> cache = NewCache(10 * kU);
   FIFOCache* fifo = Fifo(cache.get());
@@ -4499,8 +4823,9 @@ TEST_F(FIFOCacheTest, GhostTagTakenBeforeTheInsertEvicts) {
   EXPECT_TRUE(fifo->TEST_InGhost(c));
 }
 
-// A strict insert that can't make room puts back the tag it took, unless a
-// victim it evicted before giving up has replaced it.
+// A strict insert that can't make room puts back the tag it took, in
+// another cell of its group if a victim it evicted before giving up took
+// the one it came from.
 TEST_F(FIFOCacheTest, GhostTagPutBackWhenStrictInsertFails) {
   std::shared_ptr<Cache> cache = NewCache(10 * kU, /*strict*/ true);
   FIFOCache* fifo = Fifo(cache.get());
@@ -4521,12 +4846,13 @@ TEST_F(FIFOCacheTest, GhostTagPutBackWhenStrictInsertFails) {
   EXPECT_TRUE(Insert(cache.get(), K("a"), kU, &h).IsMemoryLimit());
   EXPECT_TRUE(fifo->TEST_InGhost(K("a")));
   EXPECT_EQ(0, Stats(cache.get()).ghost_returns);
-  // Evicts c, whose tag replaces a's, and finds nothing else to evict.
+  // Evicts c, whose tag takes the cell a's came from, and finds nothing else
+  // to evict.
   cache->Release(pins[0]);
   EXPECT_TRUE(Insert(cache.get(), K("a"), 2 * kU, &h).IsMemoryLimit());
   EXPECT_FALSE(Holds(cache.get(), c));
   EXPECT_TRUE(fifo->TEST_InGhost(c));
-  EXPECT_FALSE(fifo->TEST_InGhost(K("a")));
+  EXPECT_TRUE(fifo->TEST_InGhost(K("a")));
   for (uint32_t i = 1; i < 10; ++i) {
     cache->Release(pins[i]);
   }
@@ -4551,10 +4877,10 @@ TEST_F(FIFOCacheTest, GhostTagPutBackWhenInsertGoesStandalone) {
   EXPECT_TRUE(fifo->TEST_InGhost(K("a")));
   EXPECT_EQ(0, Stats(cache.get()).ghost_returns);
   cache->Release(h);
-  // One whose key wasn't in the ghost leaves no tag, at a home other than
-  // a's.
+  // One whose key wasn't in the ghost leaves no tag, in a group of the
+  // ghost other than a's.
   UniqueId64x2 hashed = Shard::ComputeHash(K("a"), cache->GetHashSeed());
-  hashed[1] ^= 1;
+  hashed[1] ^= 8;
   UniqueId64x2 unhashed;
   const std::string b =
       Shard::ReverseHash(hashed, &unhashed, cache->GetHashSeed()).ToString();
@@ -4715,9 +5041,9 @@ TEST_F(FIFOCacheTest, GhostKeepsSlowReuseKeyAcrossScans) {
   };
   EXPECT_FALSE(access(K("hot")));
   scan();
-  // The scan evicted hot first and 50 more after it. The ghost is
-  // direct-mapped, so one of those whose key has hot's home would have
-  // replaced its tag; with this hash seed none does.
+  // The scan evicted hot first and 50 more after it, fewer than the cache's
+  // 100 entries, so hot's tag still counts. Eight tags of hot's group among
+  // those could have replaced it; with this hash seed there are fewer.
   ASSERT_TRUE(fifo->TEST_InGhost(K("hot")));
   EXPECT_FALSE(access(K("hot")));
   EXPECT_FALSE(fifo->TEST_InProbation(K("hot")));
@@ -4748,8 +5074,8 @@ TEST_F(FIFOCacheTest, GhostReadmitsOversizedVictim) {
   EXPECT_TRUE(Holds(cache.get(), K("a")));
 }
 
-// Ghost tags are found at a key's home after the table grows: each split
-// copies the tag at the home it splits from to the new one.
+// Ghost tags are found in the group of a key's home after the table grows:
+// a split into a new group copies the group its homes split from.
 TEST_F(FIFOCacheTest, GhostTagsSurviveTableGrowth) {
   // Reserved for 1 MiB, so the table can grow well past its 64 slots.
   std::shared_ptr<Cache> cache = NewCache(1 << 20);
@@ -4758,8 +5084,9 @@ TEST_F(FIFOCacheTest, GhostTagsSurviveTableGrowth) {
   for (uint32_t i = 0; i < 20; ++i) {
     ASSERT_OK(Insert(cache.get(), K(i), kU));
   }
-  // K(0)..K(9) were evicted; those whose tags another didn't overwrite are
-  // in the ghost.
+  // K(0)..K(9) were evicted; K(0)'s tag stopped counting at the tenth
+  // eviction, and the others whose tags another didn't replace are in the
+  // ghost.
   std::vector<std::string> ghosts;
   for (uint32_t i = 0; i < 10; ++i) {
     ASSERT_FALSE(Holds(cache.get(), K(i)));
@@ -4781,11 +5108,17 @@ TEST_F(FIFOCacheTest, GhostTagsSurviveTableGrowth) {
   EXPECT_FALSE(fifo->TEST_InProbation(ghosts[0]));
 }
 
-// A ghost tag is never 0, the empty value, so a key whose hash has zeros
-// in the 32 bits the tag comes from isn't found in an empty ghost.
-TEST_F(FIFOCacheTest, KeyWithZeroTagBitsIsNotInEmptyGhost) {
+// A ghost tag is never 0, an empty cell's, so a key whose hash has zeros
+// in the 16 bits the tag comes from isn't found in an empty cell, which
+// would read as its tag stamped at the first eviction, counting once the
+// shard holds entries.
+TEST_F(FIFOCacheTest, KeyWithZeroTagBitsIsNotInAnEmptyCell) {
   std::shared_ptr<Cache> cache = NewCache(10 * kU);
   FIFOCache* fifo = Fifo(cache.get());
+  for (const std::string& key : FillersOffGroupZero(cache.get(), 5)) {
+    ASSERT_OK(Insert(cache.get(), key, kU));
+  }
+  // Home 52, in a group none of the fillers' homes is in.
   const UniqueId64x2 hashed{uint64_t{0xabcd} << 32, 0x1234};
   UniqueId64x2 unhashed;
   const std::string key =
@@ -4798,9 +5131,10 @@ TEST_F(FIFOCacheTest, KeyWithZeroTagBitsIsNotInEmptyGhost) {
 // The counts follow S3-FIFO's rules through a sequence worked by hand, in a
 // cache of ten entries of 10 * kU where probation's share is 12 * kU: k[1],
 // hit twice, is promoted when k[11] arrives, which then evicts k[2]; k[12]
-// to k[20] evict k[3] to k[11]; k[2] comes back from the ghost to the
-// resident queue and evicts k[12]; and an entry as large as the cache
-// evicts k[13] to k[20] from probation, then k[1] and k[2] from the
+// to k[20] evict k[3] to k[11]; k[11] comes back from the ghost to the
+// resident queue and evicts k[12], while k[2], ten evictions back in a
+// cache of ten entries, has left the ghost; and an entry as large as the
+// cache evicts k[13] to k[20] from probation, then k[1] and k[11] from the
 // resident queue.
 TEST_F(FIFOCacheTest, StatsFollowAHandWorkedSequence) {
   std::vector<std::string> evicted;
@@ -4833,8 +5167,9 @@ TEST_F(FIFOCacheTest, StatsFollowAHandWorkedSequence) {
   EXPECT_EQ(10, stats.probation_evictions);
   EXPECT_EQ(0, stats.resident_evictions);
 
-  ASSERT_TRUE(fifo->TEST_InGhost(k[2]));
-  ASSERT_OK(Insert(cache.get(), k[2], 10 * kU));
+  EXPECT_FALSE(fifo->TEST_InGhost(k[2]));
+  ASSERT_TRUE(fifo->TEST_InGhost(k[11]));
+  ASSERT_OK(Insert(cache.get(), k[11], 10 * kU));
   expected.push_back(k[12]);
   ASSERT_EQ(expected, evicted);
   stats = Stats(cache.get());
@@ -4848,7 +5183,7 @@ TEST_F(FIFOCacheTest, StatsFollowAHandWorkedSequence) {
   ASSERT_EQ(expected.size() + 2, evicted.size());
   EXPECT_EQ(expected,
             std::vector<std::string>(evicted.begin(), evicted.end() - 2));
-  EXPECT_EQ((std::set<std::string>{k[1], k[2]}),
+  EXPECT_EQ((std::set<std::string>{k[1], k[11]}),
             std::set<std::string>(evicted.end() - 2, evicted.end()));
   EXPECT_EQ(std::set<std::string>{K("big")}, Keys(cache.get()));
   stats = Stats(cache.get());
@@ -5079,6 +5414,12 @@ TEST_F(FIFOCacheTest, CreateFromStringPreservesSelectedBehavior) {
 
 #ifndef NDEBUG
 namespace {
+#ifdef __SANITIZE_THREAD__
+constexpr bool kLookupMaySkipNewest = true;
+#else
+constexpr bool kLookupMaySkipNewest = false;
+#endif
+
 // Runs op on another thread, parks it the first time it reaches sync point
 // `point`, runs `meanwhile` here, then lets op finish.
 void RunWhileParked(const std::string& point, const std::function<void()>& op,
@@ -5530,10 +5871,16 @@ TEST_F(FIFOCacheTest, ReplacingTwoEntriesTakesTheMostHitsAndTheResidentQueue) {
                                 /*charge*/ 1, &hb));
       },
       [&] {
-        for (int i = 0; i < 2; ++i) {
+        for (int found = 0; found < 2;) {
           Cache::Handle* h = cache->Lookup(k[0]);
           ASSERT_NE(nullptr, h);
-          CheckCountedValue(cache.get(), h, 2);
+          // Under TSan a lookup passes over matching entries at random (see
+          // AutoHyperClockTable::Lookup), so it can find the old k, whose
+          // hit then doesn't change the outcome.
+          if (!kLookupMaySkipNewest || cache->Value(h) != nullptr) {
+            CheckCountedValue(cache.get(), h, 2);
+            ++found;
+          }
           EXPECT_FALSE(cache->Release(h));
         }
         Status s = cache->Insert(k[0], new CountedValue(3), CountedHelper(),
@@ -5563,6 +5910,45 @@ TEST_F(FIFOCacheTest, ReplacingTwoEntriesTakesTheMostHitsAndTheResidentQueue) {
   }
   cache.reset();
   EXPECT_EQ(0, LiveValues().load());
+}
+
+// A put that loaded the eviction count before another pass advanced it
+// takes a tag that pass stamped for a new one, not one 2^16 steps old.
+// s[7]'s put parks after loading the count while one insert evicts a filler
+// and another evicts s[8] into the last empty cell of their group; s[7]'s
+// put then replaces the oldest tag, s[0]'s, and s[8]'s stays.
+TEST_F(FIFOCacheTest, GhostTagStampedAheadOfAPutIsKept) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(10 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> s = KeysWithHomeZero(cache.get(), 9);
+  const std::vector<std::string> f = FillersOffGroupZero(cache.get(), 11);
+  for (uint32_t i = 0; i < 8; ++i) {
+    ASSERT_OK(Insert(cache.get(), s[i], kU));
+  }
+  ASSERT_OK(Insert(cache.get(), f[0], kU));
+  ASSERT_OK(Insert(cache.get(), s[8], kU));
+  // f[1] to f[7] evict s[0] to s[6].
+  for (uint32_t i = 1; i < 8; ++i) {
+    ASSERT_OK(Insert(cache.get(), f[i], kU));
+  }
+  ASSERT_EQ(std::vector<std::string>(s.begin(), s.begin() + 7), evicted);
+  RunWhileParked(
+      "FIFOCache::GhostPut:Loaded",
+      // Evicts s[7].
+      [&] { ASSERT_OK(Insert(cache.get(), f[8], kU)); },
+      [&] {
+        ASSERT_OK(Insert(cache.get(), f[9], kU));
+        ASSERT_OK(Insert(cache.get(), f[10], kU));
+      });
+  std::vector<std::string> expected(s.begin(), s.begin() + 7);
+  expected.insert(expected.end(), {f[0], s[8], s[7]});
+  ASSERT_EQ(expected, evicted);
+  EXPECT_TRUE(fifo->TEST_InGhost(s[8]));
+  for (uint32_t i = 1; i < 8; ++i) {
+    EXPECT_TRUE(fifo->TEST_InGhost(s[i])) << i;
+  }
 }
 
 // An insert that charges a ring and then finds another insert added it

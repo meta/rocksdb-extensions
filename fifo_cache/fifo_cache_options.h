@@ -72,19 +72,28 @@ namespace ROCKSDB_NAMESPACE {
 // usage past half of size_t is refused the same way, and one whose key
 // can't be copied (see below) fails with MemoryLimit.
 //
-// Remembered keys take a 4-byte tag per slot of the table, at the slot the
-// key maps to, so a later victim mapping to the same slot replaces the tag.
+// Remembered keys take a 4-byte cell per slot of the table, holding 16 bits
+// of the key's hash and the count of probation evictions when it was
+// evicted. A key's cell can be any of the eight in the group of slots
+// holding the slot it maps to, and counts for as many probation evictions
+// as the shard has entries, as in S3-FIFO, rounded up to the count's step:
+// one eviction for a shard reserved for up to about 3.5 MB (see
+// max_capacity below), 2^n for one reserved for 2^n times that. A victim
+// whose group has no empty cell replaces the oldest, unless all eight are
+// from its own step, and while a group's eight cells all count, an insert
+// of a key that isn't remembered matches one of them 1 time in 8,192. A
+// cell that stopped counting counts again if the shard later holds more
+// entries than the evictions since its key's, or 65,280 steps on.
 // Under kFullChargeCacheMetadata (the default) the table counts against
 // capacity: 72 bytes per slot the table has grown to (the 64-byte slot, its
-// probation word and its tag), starting at 64 slots per shard, or 4 for a
-// shard of 4 KiB or less, and growing with the entries; 16 bytes per cell
-// of the probation queue, which grows with the table; and for a key that
-// isn't 16 bytes long, 24 bytes plus the key, which is copied to the heap.
-// The table never shrinks. With strict_capacity_limit, the table grows only
-// if the slot fits within capacity beside the entry being inserted, and the
-// probation queue grows only if it fits within capacity, so after a
-// capacity cut below what the table already takes, the shard holds no
-// entries.
+// probation word and its ghost cell), starting at 64 slots per shard, or 4 for
+// a shard of 4 KiB or less, and growing with the entries; 16 bytes per cell of
+// the probation queue, which grows with the table; and for a key that isn't 16
+// bytes long, 24 bytes plus the key, which is copied to the heap. The table
+// never shrinks. With strict_capacity_limit, the table grows only if the slot
+// fits within capacity beside the entry being inserted, and the probation queue
+// grows only if it fits within capacity, so after a capacity cut below what the
+// table already takes, the shard holds no entries.
 //
 // Each shard reserves address space for max(2048, shard capacity / 64)
 // slots up front, using max_capacity instead of capacity when it is larger,
