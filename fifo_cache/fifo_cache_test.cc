@@ -308,6 +308,31 @@ class FIFOCacheTest : public testing::Test {
           return false;
         });
   }
+
+  // Leaves probation's rings at 4, 8 and 16 cells, as a table grown to hold
+  // 13 entries has them, with the 16-cell ring full and nothing popped. Its
+  // first `live` cells are of entries still cached, K(12) and then K(200)
+  // on, of charge 1; the rest, like every cell of the older rings, are of
+  // entries erased while queued.
+  static void FillNewestRingLiveFirst(Cache* cache, uint32_t live) {
+    ASSERT_GE(live, 1);
+    ASSERT_LE(live, 16);
+    for (uint32_t i = 0; i < 13; ++i) {
+      ASSERT_OK(Insert(cache, K(i)));
+    }
+    for (uint32_t i = 0; i < 12; ++i) {
+      cache->Erase(K(i));
+    }
+    for (uint32_t i = 200; i < 200 + live - 1; ++i) {
+      ASSERT_OK(Insert(cache, K(i)));
+    }
+    for (uint32_t i = 100; i < 100 + 16 - live; ++i) {
+      ASSERT_OK(Insert(cache, K(i)));
+      cache->Erase(K(i));
+    }
+    ASSERT_EQ(live, cache->GetUsage());
+    ASSERT_EQ(0, Stats(cache).probation_full);
+  }
 };
 
 TEST_F(FIFOCacheTest, MakeSharedCacheBasic) {
@@ -3880,72 +3905,195 @@ TEST_F(FIFOCacheTest, ConcurrentProbationAccountingStaysExact) {
   EXPECT_EQ(0, fifo->TEST_GetProbationPinnedUsage());
 }
 
-// An insert into a full probation queue drops at most
-// kMaxStaleDropsPerPush stale cells to make room. Here the head is in older
-// rings, all stale, which free no room in the full newest ring, so the
-// first insert gives up after 8 of their 12 and goes to the resident queue,
-// and the next drops the other 4 and one in the newest ring, and is queued.
-TEST_F(FIFOCacheTest, StaleCellDropsPerInsertAreBounded) {
-  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+// A push into a full probation queue makes room in the newest ring, the
+// only one with room to make: it takes up to 8 cells from that ring's
+// oldest end, puts live ones back at its newest end, and takes the place of
+// the first stale one. Behind 7 live cells the insert finds a stale one and
+// is queued; behind 8 it gives up and goes to the resident queue.
+TEST_F(FIFOCacheTest, FullProbationPushTakesAtMostEightCells) {
+  for (uint32_t live : {7u, 8u}) {
+    SCOPED_TRACE(live);
+    std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+    FIFOCache* fifo = Fifo(cache.get());
+    FillNewestRingLiveFirst(cache.get(), live);
+    ASSERT_OK(Insert(cache.get(), K("x")));
+    EXPECT_EQ(live == 7, fifo->TEST_InProbation(K("x")));
+    EXPECT_EQ(live == 7 ? 0 : 1, Stats(cache.get()).probation_full);
+    EXPECT_EQ(live + 1, cache->GetUsage());
+  }
+}
+
+// The live cells a full push puts back stay queued. Here x takes K(12) and
+// 7 more live cells, puts them back behind the newest ring's 8 stale ones,
+// and goes to the resident queue; y then takes the first stale cell's
+// place. Eviction passes the older rings' stale cells and the 7 left in the
+// newest, and evicts the five oldest live entries in the order they came.
+TEST_F(FIFOCacheTest, FullProbationPushKeepsLiveCellsQueued) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 14);
+  RecordEvictions(cache.get(), &evicted);
   FIFOCache* fifo = Fifo(cache.get());
-  // Rings of 4, 8 and 16 cells: the table starts with 4 slots and grows to
-  // hold 13 entries, adding a ring each time the newest is full.
-  for (uint32_t i = 0; i < 13; ++i) {
-    ASSERT_OK(Insert(cache.get(), K(i)));
+  FillNewestRingLiveFirst(cache.get(), 8);
+  ASSERT_OK(Insert(cache.get(), K("x")));
+  ASSERT_OK(Insert(cache.get(), K("y")));
+  EXPECT_EQ(1, Stats(cache.get()).probation_full);
+  EXPECT_EQ(9, fifo->TEST_GetProbationUsage());
+  ASSERT_EQ(10, cache->GetUsage());
+  // With z, probation is over its share, so it goes first.
+  ASSERT_OK(Insert(cache.get(), K("z"), /*charge*/ 9));
+  EXPECT_EQ((std::vector<std::string>{K(12), K(200), K(201), K(202), K(203)}),
+            evicted);
+  EXPECT_EQ(14, cache->GetUsage());
+  for (const std::string& key : {K(204), K(205), K(206), K("y"), K("z")}) {
+    EXPECT_TRUE(fifo->TEST_InProbation(key));
   }
-  for (uint32_t i = 0; i < 13; ++i) {
-    cache->Erase(K(i));
+  EXPECT_TRUE(Holds(cache.get(), K("x")));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("x")));
+}
+
+// With one ring, its oldest end is probation's head, and a full push
+// makes room there the same way. Here the ring is a, then three stale
+// cells: x puts a back and takes the first stale cell's place, and a is
+// still evicted before x.
+TEST_F(FIFOCacheTest, FullPushMakesRoomInTheOnlyRing) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 3);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  ASSERT_OK(Insert(cache.get(), K("a")));
+  for (const char* key : {"b", "c", "d"}) {
+    ASSERT_OK(Insert(cache.get(), K(key)));
+    cache->Erase(K(key));
   }
-  // The newest ring's other 15 cells, stale too.
-  for (uint32_t i = 100; i < 115; ++i) {
-    ASSERT_OK(Insert(cache.get(), K(i)));
-    cache->Erase(K(i));
+  ASSERT_OK(Insert(cache.get(), K("x")));
+  EXPECT_EQ(0, Stats(cache.get()).probation_full);
+  EXPECT_EQ(2, fifo->TEST_GetProbationUsage());
+  ASSERT_OK(Insert(cache.get(), K("z")));
+  ASSERT_OK(Insert(cache.get(), K("w")));
+  EXPECT_EQ(std::vector<std::string>{K("a")}, evicted);
+  EXPECT_EQ(0, Stats(cache.get()).probation_full);
+}
+
+// A push that finds the newest ring full after the table has outgrown it,
+// with the strict limit turning the new ring down, sends its entry to the
+// resident queue without taking cells out of the ring, which then holds
+// only live ones: eviction still finds them in their order.
+TEST_F(FIFOCacheTest, FullPushLeavesARingTheTableOutgrewInOrder) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache =
+      NewCache(1 << 20, /*strict*/ true, kFullChargeCacheMetadata);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  // Charged enough that probation is over its share.
+  for (uint32_t i = 0; i < 64; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 100));
   }
-  ASSERT_EQ(0, cache->GetUsage());
-  ASSERT_EQ(0, fifo->TEST_GetProbationUsage());
+  // Room for the entry and for growing the table, not for the ring, as in
+  // StrictProbationRingOnlyWhenItFits.
+  cache->SetCapacity(cache->GetUsage() + 100 + 4 * kSlotCharge);
+  ASSERT_OK(Insert(cache.get(), K(64), /*charge*/ 100));
+  ASSERT_FALSE(fifo->TEST_InProbation(K(64)));
+  ASSERT_EQ(1, Stats(cache.get()).probation_full);
+  ASSERT_TRUE(evicted.empty());
+  cache->SetCapacity(cache->GetUsage());
+  ASSERT_OK(Insert(cache.get(), K(65), /*charge*/ 100));
+  ASSERT_FALSE(evicted.empty());
+  EXPECT_EQ(K(0), evicted.front());
+}
+
+// RocksDB's reads that don't fill the cache (compaction's, by default)
+// insert a dummy entry for each block and erase it on release. While the
+// cache fills nothing pops probation, so at three of them per entry their
+// stale cells fill the newest ring before the table outgrows it,
+// behind the older rings' live cells. A push that finds the ring full
+// takes the place of one, so the entries inserted meanwhile all stay in
+// probation. The 65 entries inserted first take the table past its first
+// ring, which holds every entry the starting table does and so can fill
+// with live cells alone.
+TEST_F(FIFOCacheTest, CellsOfEntriesErasedOnReleaseDoNotFillProbation) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 20);
+  FIFOCache* fifo = Fifo(cache.get());
+  for (uint32_t i = 0; i < 65; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(5000 + i)));
+  }
   ASSERT_EQ(0, Stats(cache.get()).probation_full);
-  ASSERT_OK(Insert(cache.get(), K("g")));
-  EXPECT_EQ(0, fifo->TEST_GetProbationUsage());
-  EXPECT_EQ(1, Stats(cache.get()).probation_full);
-  ASSERT_OK(Insert(cache.get(), K("h")));
-  EXPECT_EQ(1, fifo->TEST_GetProbationUsage());
-  EXPECT_EQ(1, Stats(cache.get()).probation_full);
-  EXPECT_TRUE(Holds(cache.get(), K("g")));
-  EXPECT_TRUE(Holds(cache.get(), K("h")));
+  for (uint32_t i = 0; i < 300; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i)));
+    for (uint32_t j = 0; j < 3; ++j) {
+      Cache::Handle* h = nullptr;
+      ASSERT_OK(Insert(cache.get(), K(10000 + 3 * i + j), /*charge*/ 1, &h));
+      EXPECT_TRUE(cache->Release(h, /*erase_if_last_ref*/ true));
+    }
+  }
+  EXPECT_EQ(0, Stats(cache.get()).probation_full);
+  EXPECT_EQ(365, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(365, cache->GetUsage());
 }
 
 // The limit on probation steps per eviction is a lap of the queue, which
-// can hold more cells than the table has slots: here 51 stale cells (of
-// entries erased while queued) lie ahead of q, more than the table's 47 or
-// so slots, and probation still gets to q rather than handing the eviction
-// to the resident clock.
+// can hold more cells than the table has slots: here 59 stale cells (of
+// entries erased while queued) lie ahead of q, more than the table's slots,
+// and probation still gets to q, its last cell, rather than handing the
+// eviction to the resident clock, which would take r.
 TEST_F(FIFOCacheTest, ProbationStepLimitCoversTheWholeQueue) {
   std::vector<std::string> evicted;
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10);
   RecordEvictions(cache.get(), &evicted);
   FIFOCache* fifo = Fifo(cache.get());
+  // r is promoted by t's eviction, which then evicts s.
+  ASSERT_OK(Insert(cache.get(), K("r"), /*charge*/ 9));
+  HitNTimes(cache.get(), K("r"), 2);
+  ASSERT_OK(Insert(cache.get(), K("s")));
+  ASSERT_OK(Insert(cache.get(), K("t")));
+  ASSERT_EQ(std::vector<std::string>{K("s")}, evicted);
+  cache->Erase(K("t"));
+  ASSERT_EQ(0, fifo->TEST_GetProbationUsage());
   // Rings of 4, 8, 16 and 32 cells, for a table grown to hold 29 entries
-  // (of no charge, so nothing is evicted).
-  for (uint32_t i = 0; i < 29; ++i) {
+  // (these of no charge, so nothing is evicted). t's cell and the others'
+  // are stale.
+  for (uint32_t i = 0; i < 28; ++i) {
     ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 0));
   }
-  for (uint32_t i = 0; i < 29; ++i) {
+  for (uint32_t i = 0; i < 28; ++i) {
     cache->Erase(K(i));
   }
-  ASSERT_LT(cache->GetTableAddressCount(), 51);
+  ASSERT_LT(cache->GetTableAddressCount(), 59);
   for (uint32_t i = 100; i < 130; ++i) {
     ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 0));
     cache->Erase(K(i));
   }
-  // q fills the newest ring. r finds it full, drops 8 stale cells, and goes
-  // to the resident queue.
+  // q takes the newest ring's last cell.
   ASSERT_OK(Insert(cache.get(), K("q")));
-  ASSERT_OK(Insert(cache.get(), K("r"), /*charge*/ 9));
   ASSERT_EQ(1, fifo->TEST_GetProbationUsage());
   ASSERT_EQ(10, cache->GetUsage());
+  ASSERT_EQ(0, Stats(cache.get()).probation_full);
   ASSERT_OK(Insert(cache.get(), K("x")));
-  EXPECT_EQ(std::vector<std::string>{K("q")}, evicted);
+  EXPECT_EQ((std::vector<std::string>{K("s"), K("q")}), evicted);
   EXPECT_TRUE(Holds(cache.get(), K("r")));
+}
+
+// PopNewest takes the oldest value of the newest ring while older rings
+// still hold theirs, which Pop then takes first.
+TEST_F(FIFOCacheTest, ProbationQueuePopNewestTakesFromTheNewestRing) {
+  fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 2,
+                               /*max_ring_capacity*/ 4);
+  uint64_t v = 0;
+  EXPECT_FALSE(q.PopNewest(&v));
+  ASSERT_TRUE(q.Push(10));
+  ASSERT_TRUE(q.Push(11));
+  ASSERT_FALSE(q.Push(20));
+  ASSERT_TRUE(q.TryAddRing(4));
+  EXPECT_FALSE(q.PopNewest(&v));
+  ASSERT_TRUE(q.Push(20));
+  ASSERT_TRUE(q.Push(21));
+  ASSERT_TRUE(q.PopNewest(&v));
+  EXPECT_EQ(20, v);
+  for (uint64_t want : {10, 11, 21}) {
+    ASSERT_TRUE(q.Pop(&v));
+    EXPECT_EQ(want, v);
+  }
+  EXPECT_FALSE(q.Pop(&v));
+  EXPECT_FALSE(q.PopNewest(&v));
 }
 
 // A stale cell is skipped whatever its slot holds now. Here every key was
@@ -4546,35 +4694,46 @@ TEST_F(FIFOCacheTest, StatsCountEffortCapStops) {
   }
 }
 
-// A pinned head that the probation queue has no room to move to its tail,
-// the queue being full of the cells of erased entries, goes to the resident
-// queue and counts as probation full. The insert behind it then finds room,
-// as its eviction popped the stale cells.
+// A pinned head that the probation queue has no room to move to its tail
+// goes to the resident queue and counts as probation full. Here p is the
+// head and the newest ring is full, its first 8 cells live, so p's push
+// puts those back and gives up. The eviction then finds probation under its
+// share and the resident queue holding only p, pinned, and once the clock
+// has given up, probation passes the stale cells and evicts K(11); x then
+// finds room.
 TEST_F(FIFOCacheTest, StatsCountPinnedHeadsProbationHadNoRoomFor) {
+  std::vector<std::string> evicted;
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+  RecordEvictions(cache.get(), &evicted);
   FIFOCache* fifo = Fifo(cache.get());
   Cache::Handle* p = nullptr;
-  ASSERT_OK(Insert(cache.get(), K("p"), /*charge*/ 999, &p));
-  // Rings of 4, 8 and 16 cells, as in StaleCellDropsPerInsertAreBounded,
-  // every cell stale but p's.
+  ASSERT_OK(Insert(cache.get(), K("p"), /*charge*/ 990, &p));
+  // Rings of 4, 8 and 16 cells, as in FillNewestRingLiveFirst: p and
+  // K(0) to K(10) take the older two, and K(11) is the newest's first cell.
   for (uint32_t i = 0; i < 12; ++i) {
-    ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 0));
+    ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ i < 11 ? 0 : 1));
   }
-  for (uint32_t i = 0; i < 12; ++i) {
+  for (uint32_t i = 0; i < 11; ++i) {
     cache->Erase(K(i));
   }
-  for (uint32_t i = 100; i < 115; ++i) {
+  for (uint32_t i = 200; i < 207; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i)));
+  }
+  for (uint32_t i = 100; i < 108; ++i) {
     ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 0));
     cache->Erase(K(i));
   }
-  ASSERT_EQ(999, fifo->TEST_GetProbationUsage());
-  ASSERT_OK(Insert(cache.get(), K("x"), /*charge*/ 2));
+  ASSERT_EQ(998, fifo->TEST_GetProbationUsage());
+  ASSERT_OK(Insert(cache.get(), K("x"), /*charge*/ 3));
   FIFOCacheStats stats = Stats(cache.get());
   EXPECT_EQ(1, stats.probation_full);
-  EXPECT_EQ(0, stats.probation_evictions);
+  EXPECT_EQ(1, stats.probation_evictions);
+  EXPECT_EQ(0, stats.resident_evictions);
+  EXPECT_EQ(std::vector<std::string>{K(11)}, evicted);
+  EXPECT_EQ(10, stats.probation_usage);
+  EXPECT_EQ(1000, cache->GetUsage());
   EXPECT_FALSE(fifo->TEST_InProbation(K("p")));
   EXPECT_TRUE(fifo->TEST_InProbation(K("x")));
-  EXPECT_EQ(2, stats.probation_usage);
   cache->Release(p);
 }
 
@@ -4811,25 +4970,79 @@ TEST_F(FIFOCacheTest, StrictInsertCountsStopWhenLimitClearedMidEviction) {
 TEST_F(FIFOCacheTest, EntryErasedBeforeAFullProbationPushIsNotCounted) {
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
   FIFOCache* fifo = Fifo(cache.get());
-  // The stale rings of StaleCellDropsPerInsertAreBounded, where the next
-  // insert finds no room.
-  for (uint32_t i = 0; i < 13; ++i) {
-    ASSERT_OK(Insert(cache.get(), K(i)));
-  }
-  for (uint32_t i = 0; i < 13; ++i) {
-    cache->Erase(K(i));
-  }
-  for (uint32_t i = 100; i < 115; ++i) {
-    ASSERT_OK(Insert(cache.get(), K(i)));
-    cache->Erase(K(i));
-  }
+  // Where the next insert finds no room, as in
+  // FullProbationPushTakesAtMostEightCells.
+  FillNewestRingLiveFirst(cache.get(), 8);
   RunWhileParked(
       "FIFOCache::DoInsert:BeforeProbationPush",
       [&] { ASSERT_OK(Insert(cache.get(), K("g"))); },
       [&] { cache->Erase(K("g")); });
   EXPECT_EQ(0, Stats(cache.get()).probation_full);
-  EXPECT_EQ(0, fifo->TEST_GetProbationUsage());
-  EXPECT_EQ(0, cache->GetUsage());
+  EXPECT_EQ(8, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(8, cache->GetUsage());
+}
+
+// A full push that drops a stale cell can lose the room it made to another
+// push, and then looks on for another stale cell. Here x puts back K(12),
+// drops the first stale cell, loses its room to y, and takes the next
+// one's place.
+TEST_F(FIFOCacheTest, FullPushThatLosesItsRoomLooksOn) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+  FIFOCache* fifo = Fifo(cache.get());
+  FillNewestRingLiveFirst(cache.get(), 1);
+  RunWhileParked(
+      "FIFOCache::ProbationPush:BeforeReplace",
+      [&] { ASSERT_OK(Insert(cache.get(), K("x"))); },
+      [&] { ASSERT_OK(Insert(cache.get(), K("y"))); });
+  EXPECT_EQ(0, Stats(cache.get()).probation_full);
+  EXPECT_EQ(3, fifo->TEST_GetProbationUsage());
+  for (const std::string& key : {K(12), K("x"), K("y")}) {
+    EXPECT_TRUE(fifo->TEST_InProbation(key));
+  }
+}
+
+// A live cell that a full push takes out to put back can lose its room to
+// another push. The push carries it and puts it in place of the next stale
+// cell, ahead of its own entry. Here y takes the room K(12)'s cell left, x
+// puts back K(200), then puts K(12) and its own entry in place of the two
+// stale cells after it.
+TEST_F(FIFOCacheTest, LiveCellThatLosesItsRoomIsCarried) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  FillNewestRingLiveFirst(cache.get(), 2);
+  RunWhileParked(
+      "FIFOCache::ProbationPush:BeforeRequeue",
+      [&] { ASSERT_OK(Insert(cache.get(), K("x"))); },
+      [&] { ASSERT_OK(Insert(cache.get(), K("y"))); });
+  EXPECT_EQ(0, Stats(cache.get()).probation_full);
+  EXPECT_EQ(4, fifo->TEST_GetProbationUsage());
+  // Evicts the four, in their order in the newest ring.
+  cache->SetCapacity(0);
+  EXPECT_EQ((std::vector<std::string>{K("y"), K(200), K(12), K("x")}), evicted);
+}
+
+// A carried cell that finds no stale cell either goes to the resident
+// queue, counted as probation full, and so does the push's own entry. Here
+// y takes the room K(12)'s cell left, and x puts back the other 7 live
+// cells.
+TEST_F(FIFOCacheTest, LiveCellThatLosesItsRoomGoesToResident) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+  FIFOCache* fifo = Fifo(cache.get());
+  FillNewestRingLiveFirst(cache.get(), 8);
+  RunWhileParked(
+      "FIFOCache::ProbationPush:BeforeRequeue",
+      [&] { ASSERT_OK(Insert(cache.get(), K("x"))); },
+      [&] { ASSERT_OK(Insert(cache.get(), K("y"))); });
+  EXPECT_EQ(2, Stats(cache.get()).probation_full);
+  EXPECT_EQ(8, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(10, cache->GetUsage());
+  EXPECT_TRUE(Holds(cache.get(), K(12)));
+  EXPECT_TRUE(Holds(cache.get(), K("x")));
+  EXPECT_FALSE(fifo->TEST_InProbation(K(12)));
+  EXPECT_FALSE(fifo->TEST_InProbation(K("x")));
+  EXPECT_TRUE(fifo->TEST_InProbation(K("y")));
 }
 
 // Hits that land between an eviction step's read of the head and its claim

@@ -724,10 +724,11 @@ class ProbationQueue {
   // Takes the oldest value. Returns false if there is none, or the oldest
   // was claimed by a push that has not filled it yet.
   bool Pop(uint64_t* v);
-  // Takes the oldest value only if pred(value) holds. Returns false if it
-  // doesn't, or for the reasons Pop does.
-  template <typename Pred>
-  bool PopIf(uint64_t* v, const Pred& pred);
+  // Takes the oldest value in the newest ring, even while older rings still
+  // hold values. Returns false if that ring holds none, or its oldest was
+  // claimed by a push that has not filled it yet. A ring added meanwhile
+  // can make the ring it takes from an older one.
+  bool PopNewest(uint64_t* v);
 
   // Cells in the newest ring.
   size_t RingCapacity() const;
@@ -758,6 +759,10 @@ class ProbationQueue {
   };
   // Set on a ring's enqueue position once a newer ring takes its pushes.
   static constexpr uint64_t kClosed = uint64_t{1} << 63;
+
+  // Takes r's oldest value. Returns false if r holds none, or its oldest
+  // was claimed by a push that has not filled it yet.
+  static bool PopFromRing(Ring& r, uint64_t* v);
 
   const NoReserveTypedMemMapping<Cell> cells_;
   const size_t max_ring_capacity_;
@@ -1074,9 +1079,10 @@ class AutoHyperClockTable : public BaseClockTable {
   // by charge. The resident clock caps counts at kMaxCountdown, the same 3.
   static constexpr uint32_t kPromoteThreshold = 2;
   static constexpr size_t kProbationPercent = 12;
-  // FIFOCache: how many stale cells an insert into a full probation queue
-  // drops to make room before sending its entry to the resident queue.
-  static constexpr size_t kMaxStaleDropsPerPush = 8;
+  // FIFOCache: how many cells a push into a full probation queue takes from
+  // the newest ring looking for a stale one to drop, before sending its entry
+  // to the resident queue.
+  static constexpr size_t kMaxRingPopsPerPush = 8;
 
   // FIFOCache: each slot has a 32-bit probation word beside it, since
   // HandleImpl has no spare bits. kInProbation is set while the entry is in the

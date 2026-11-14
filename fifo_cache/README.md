@@ -186,10 +186,13 @@ remembered; with a secondary cache, the placeholders its adapter inserts
 are among the victims but never remembered, which lowers the share. A
 rising `effort_cap_stops` means inserts and capacity cuts are finding mostly
 pinned entries and leaving usage over capacity, so look at what holds
-handles (`rocksdb.block-cache-pinned-usage`). A rising `probation_full` means
-entries are skipping probation, either because entries erased while queued
-have filled its queue or, with `strict_capacity_limit`, because the queue
-can't grow within capacity.
+handles (`rocksdb.block-cache-pinned-usage`). `probation_full` counts
+entries that skipped probation because its queue had no room. A shard sends
+some there as it first fills if entries are erased meanwhile, as RocksDB
+erases the dummy entry it inserts for each block a compaction reads; one
+that keeps rising after the cache has filled means the queue is full of
+entries still queued or, with `strict_capacity_limit`, that the queue can't
+grow within capacity.
 
 ## Limitations
 

@@ -3373,41 +3373,39 @@ bool ProbationQueue::Push(uint64_t v) {
   }
 }
 
-bool ProbationQueue::Pop(uint64_t* v) {
-  return PopIf(v, [](uint64_t) { return true; });
+bool ProbationQueue::PopFromRing(Ring& r, uint64_t* v) {
+  uint64_t pos = r.dequeue.load(std::memory_order_relaxed);
+  for (;;) {
+    const uint64_t idx = pos & r.mask;
+    Cell& c = r.cells[idx];
+    const uint64_t seq = c.seq.load(std::memory_order_acquire) + idx;
+    const int64_t dif = static_cast<int64_t>(seq - (pos + 1));
+    if (dif == 0) {
+      // Filled, and stays so until popped, so the value read here is the
+      // one a successful claim below takes.
+      const uint64_t value = c.value.LoadRelaxed();
+      if (r.dequeue.compare_exchange_weak(pos, pos + 1,
+                                          std::memory_order_relaxed)) {
+        *v = value;
+        c.seq.store(pos + r.mask + 1 - idx, std::memory_order_release);
+        return true;
+      }
+      // pos now holds the current dequeue position.
+    } else if (dif < 0) {
+      // Nothing pushed at pos yet, or the push hasn't filled the cell.
+      return false;
+    } else {
+      pos = r.dequeue.load(std::memory_order_relaxed);
+    }
+  }
 }
 
-template <typename Pred>
-bool ProbationQueue::PopIf(uint64_t* v, const Pred& pred) {
+bool ProbationQueue::Pop(uint64_t* v) {
   for (;;) {
     uint32_t h = head_.load(std::memory_order_acquire);
     Ring& r = rings_[h];
-    uint64_t pos = r.dequeue.load(std::memory_order_relaxed);
-    for (;;) {
-      const uint64_t idx = pos & r.mask;
-      Cell& c = r.cells[idx];
-      const uint64_t seq = c.seq.load(std::memory_order_acquire) + idx;
-      const int64_t dif = static_cast<int64_t>(seq - (pos + 1));
-      if (dif == 0) {
-        // Filled, and stays so until popped, so the value read here is the
-        // one a successful claim below takes.
-        const uint64_t value = c.value.LoadRelaxed();
-        if (!pred(value)) {
-          return false;
-        }
-        if (r.dequeue.compare_exchange_weak(pos, pos + 1,
-                                            std::memory_order_relaxed)) {
-          *v = value;
-          c.seq.store(pos + r.mask + 1 - idx, std::memory_order_release);
-          return true;
-        }
-        // pos now holds the current dequeue position.
-      } else if (dif < 0) {
-        // Nothing pushed at pos yet, or the push hasn't filled the cell.
-        break;
-      } else {
-        pos = r.dequeue.load(std::memory_order_relaxed);
-      }
+    if (PopFromRing(r, v)) {
+      return true;
     }
     if (tail_.load(std::memory_order_acquire) == h) {
       return false;
@@ -3426,6 +3424,12 @@ bool ProbationQueue::PopIf(uint64_t* v, const Pred& pred) {
     // another thread did).
     head_.compare_exchange_strong(h, h + 1, std::memory_order_acq_rel);
   }
+}
+
+bool ProbationQueue::PopNewest(uint64_t* v) {
+  // Acquire, pairing with TryAddRing's release, so the ring's cells and mask
+  // are visible.
+  return PopFromRing(rings_[tail_.load(std::memory_order_acquire)], v);
 }
 
 size_t ProbationQueue::RingCapacity() const {
@@ -3524,23 +3528,60 @@ bool AutoHyperClockTable::ProbationPush(size_t idx, uint32_t word,
     if (probation_.Push(v)) {
       return true;
     }
+    // The table has outgrown the newest ring, which can then hold only live
+    // cells, so this entry goes to the resident queue.
+    return false;
   }
-  // Full. The cells of entries removed while queued stay until popped, so
-  // drop some at the head to make room. Behind a live head they wait for
-  // eviction to reach them, and this entry goes to the resident queue. So do
-  // entries pushed while the head is in an older ring, whose cells free no
-  // room in the newest, once this insert has dropped kMaxStaleDropsPerPush
-  // of them; later inserts drop the rest.
-  uint64_t stale;
-  for (size_t drops = 0;
-       drops < kMaxStaleDropsPerPush &&
-       probation_.PopIf(
-           &stale,
-           [this](uint64_t cell) { return IsStaleProbationCell(cell); });
-       ++drops) {
-    if (probation_.Push(v)) {
+  // Full, though the table hasn't outgrown the newest ring. The cells of
+  // entries removed while queued stay until popped, and pops reach the
+  // newest ring only once the older rings are empty, which they never are
+  // while the cache fills and nothing is evicted. So make room in the
+  // newest ring itself: take up to kMaxRingPopsPerPush cells from its
+  // oldest end, put live ones back at its newest end, and push this entry
+  // in place of the first stale one. A live entry put back moves behind the
+  // live entries that were behind it in that ring, or behind all of a ring
+  // added meanwhile. If no stale cell turns up, this entry goes to the
+  // resident queue.
+  //
+  // A live cell whose room another push took first is carried, and goes in
+  // place of the next stale cell, ahead of this entry, rather than leaving
+  // probation for the newer entry's sake. A second one, or a carried one
+  // that finds no stale cell, goes to the resident queue.
+  auto leave = [this](uint64_t cell) {
+    LeaveProbationUnowned(static_cast<size_t>(cell >> 32),
+                          static_cast<uint32_t>(cell));
+  };
+  bool carrying = false;
+  uint64_t carried = 0;
+  for (size_t pops = 0; pops < kMaxRingPopsPerPush; ++pops) {
+    uint64_t cell;
+    if (!probation_.PopNewest(&cell)) {
+      break;
+    }
+    if (!IsStaleProbationCell(cell)) {
+      TEST_SYNC_POINT("FIFOCache::ProbationPush:BeforeRequeue");
+      // The pop freed the cell this push takes, unless another push took
+      // it first.
+      if (!probation_.Push(cell)) {
+        if (carrying) {
+          leave(cell);
+        } else {
+          carrying = true;
+          carried = cell;
+        }
+      }
+      continue;
+    }
+    TEST_SYNC_POINT("FIFOCache::ProbationPush:BeforeReplace");
+    // Another push can take the room first; then look on.
+    if (carrying) {
+      carrying = !probation_.Push(carried);
+    } else if (probation_.Push(v)) {
       return true;
     }
+  }
+  if (carrying) {
+    leave(carried);
   }
   return false;
 }

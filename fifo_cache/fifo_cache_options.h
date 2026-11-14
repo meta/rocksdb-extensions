@@ -163,9 +163,17 @@ struct FIFOCacheStats {
   uint64_t effort_cap_stops = 0;
   // Entries that went to the resident queue, on insert or on being moved
   // to the tail of probation (as a pinned head is), because the probation
-  // queue was full: of the cells of entries erased while queued, which stay
-  // until eviction reaches them, or, under strict_capacity_limit, because
-  // growing the queue with the table didn't fit within capacity.
+  // queue had no room for them. A push into a full queue takes up to eight
+  // cells from the oldest end of its newest ring, putting back those of
+  // entries still queued, and takes the place of the first one left by an
+  // entry erased while queued. If there is none, its entry goes to the
+  // resident queue, and so does an entry it took out whose room another
+  // push took. That happens in a shard's first ring as the shard first
+  // fills while entries are erased (RocksDB erases the dummy entry it
+  // inserts for each block read without filling the cache). A push also
+  // sends its entry there when the table has outgrown the newest ring and
+  // a new one couldn't be added: under strict_capacity_limit, when it
+  // didn't fit within capacity.
   uint64_t probation_full = 0;
 };
 
