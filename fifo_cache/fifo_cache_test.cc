@@ -5204,15 +5204,6 @@ TEST_F(FIFOCacheTest, ProbationQueuePopWaitsForPushInFlight) {
   EXPECT_EQ(10, v);
 }
 
-// In a shard whose entries are all pinned, or all but one percent, an
-// insert's eviction stops at the effort cap (eviction_effort_cap, 30 pinned
-// entries seen per entry freed plus 30, so 60 for an insert that frees the
-// one entry it needs) instead of passing every pinned entry, and the insert
-// goes over capacity, as in HyperClockCache. A probation step sees one
-// entry and a resident step the entries of 4 homes, some with none pinned,
-// so kBound steps leaves room for those while staying far below a lap of
-// either queue at 16000 entries (16000 probation cells, about 6700
-// resident steps).
 // An insert that charges a probation ring evicts for the ring only, not
 // for usage something else took over capacity: here a standalone entry
 // larger than everything cached (so it evicts nothing for itself) takes
@@ -5258,6 +5249,15 @@ TEST_F(FIFOCacheTest, ChargedRingEvictsOnlyForTheRing) {
   EXPECT_TRUE(cache->Release(big));
 }
 
+// In a shard whose entries are all pinned, or all but one percent, an
+// insert's eviction stops at the effort cap (eviction_effort_cap, 30 pinned
+// entries seen per entry freed plus 30, so 60 for an insert that frees the
+// one entry it needs) instead of passing every pinned entry, and the insert
+// goes over capacity, as in HyperClockCache. A probation step sees one
+// entry and a resident step the entries of 4 homes, some with none pinned,
+// so kBound steps leaves room for those while staying far below a lap of
+// either queue at 16000 entries (16000 probation cells, about 6700
+// resident steps).
 TEST_F(FIFOCacheTest, MostlyPinnedEvictionVisitsBounded) {
   constexpr size_t kBound = 256;
   // Large enough that 16000 entries fit the table's reservation.
