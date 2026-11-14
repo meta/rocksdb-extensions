@@ -10,13 +10,15 @@ Eviction*](https://jasony.me/publication/sosp23-s3fifo.pdf) (SOSP '23):
   which evicts with a second-chance clock.
 - Keys recently evicted from probation are remembered (keys only, no
   values); re-inserting one goes straight to resident.
-- Hits take no lock: a lookup bumps a per-entry counter and moves nothing.
-  Inserts, erases and eviction take a per-shard mutex.
+- There is no shard mutex. Each shard is HyperClockCache's hash table: a
+  lookup takes no lock, bumps a per-entry counter and moves nothing, an
+  insert links its entry without a lock, and erasing, evicting (for an
+  insert too) and growing the table lock only the hash chains they change.
 
 `Cache::Priority` is ignored: placement follows access frequency.
 [`fifo_cache_options.h`](fifo_cache_options.h) documents the options, memory
-accounting and how to choose `num_shard_bits`. The API is experimental and
-may change.
+accounting and how it differs from HyperClockCache. The API is experimental
+and may change.
 
 This directory is a [RocksDB
 plugin](https://github.com/meta/rocksdb/blob/main/plugin/README.md): it is
@@ -124,8 +126,8 @@ a string:
 The string options are `capacity` (required, non-zero), `num_shard_bits`
 (below 20; by default chosen from the capacity), `strict_capacity_limit`,
 `metadata_charge_policy` (`kFullChargeCacheMetadata` or
-`kDontChargeCacheMetadata`), `hash_seed`, `use_adaptive_mutex` and
-`max_capacity`. A bad or unknown option fails with `InvalidArgument`.
+`kDontChargeCacheMetadata`), `hash_seed`, `use_adaptive_mutex` (accepted and
+ignored) and `max_capacity`. A bad or unknown option fails with `InvalidArgument`.
 
 ### From C++
 
@@ -183,9 +185,9 @@ and `secondary_cache` can be set here as well.
 
 ## Tests
 
-[`fifo_cache_test.cc`](fifo_cache_test.cc) covers the eviction policy, the
-lock-free lookup path and its memory reclamation, capacity and table
-accounting, pinning, the option strings and thread exit. Tests that steer
+[`fifo_cache_test.cc`](fifo_cache_test.cc) covers the eviction policy and the
+ghost, replacing inserts, keys of any length, capacity and table
+accounting, pinning, concurrent use of the table and the option strings. Tests that steer
 interleavings with sync points run only in builds without `NDEBUG`. From the
 RocksDB tree with the plugin in place:
 

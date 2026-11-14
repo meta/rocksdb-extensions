@@ -25,9 +25,11 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cache/cache_key.h"
 #include "cache/sharded_cache.h"
+#include "plugin/fifo_cache/no_reserve_mapping.h"
 #include "port/mmap.h"
 #include "rocksdb/cache.h"
 #include "util/atomic.h"
@@ -377,15 +379,6 @@ struct ClockHandleBasicData : public Cache::Handle {
     }
     return HasHeapKey() && GetHeapKey()->key() == *key;
   }
-  // FIFOCache: whether two entries have the same key.
-  bool SameKeyAs(const ClockHandleBasicData& other) const {
-    if (other.HasHeapKey()) {
-      const Slice key = other.GetHeapKey()->key();
-      return MatchesKey(other.hashed_key, &key);
-    }
-    return MatchesKey(other.hashed_key, nullptr);
-  }
-
   // FIFOCache: the key, from the HeapKey or for a 16-byte key recovered
   // from its hash into *unhashed.
   Slice GetKey(UniqueId64x2* unhashed, uint32_t seed) const;
@@ -575,6 +568,28 @@ class BaseClockTable {
   void TrackAndReleaseEvictedEntry(ClockHandle* h);
 
   bool IsEvictionEffortExceeded(const BaseClockTable::EvictionData& data) const;
+
+  // FIFOCache: whether usage can take charge without passing half of
+  // size_t, which HyperClockCache's accounting assumes it stays under. An
+  // insert that can't is refused under either limit (MemoryLimit with a
+  // handle, dropped with OK without one), and a standalone entry is refused,
+  // or made uncharged with allow_uncharged, as FIFOCache did before this
+  // table. It checks usage as loaded and reserves nothing, so inserts
+  // racing with charges of over a quarter of size_t each could pass it
+  // together.
+  bool UsageCanTake(size_t charge) const {
+    constexpr size_t kMaxUsage = SIZE_MAX / 2;
+    return charge <= kMaxUsage - std::min(usage_.LoadRelaxed(), kMaxUsage);
+  }
+  // FIFOCache: adds bytes of table metadata (a slot the table grows by, or
+  // a probation ring) to usage under kFullChargeCacheMetadata. Under
+  // strict_capacity_limit only if usage stays within capacity less keep,
+  // the charge of the entry being inserted, so metadata never takes usage
+  // past capacity, as FIFOCache did before this table, where
+  // HyperClockCache charges its growth past it. Returns whether it added
+  // them; UnchargeMetadata takes them back.
+  bool ChargeMetadata(size_t bytes, size_t keep);
+  void UnchargeMetadata(size_t bytes);
 #ifndef NDEBUG
   // Acquire N references
   void TEST_RefN(ClockHandle& handle, uint32_t n);
@@ -714,6 +729,9 @@ class ProbationQueue {
   // Cells in every ring added so far.
   size_t CellCount() const;
 
+  // The start of the rings' mapping.
+  const void* TEST_GetMapping() const { return cells_.Get(); }
+
   struct Cell {
     // The Vyukov sequence number minus the cell's index in its ring, so
     // that zeroed memory is a ring with nothing pushed.
@@ -731,7 +749,7 @@ class ProbationQueue {
   // Set on a ring's enqueue position once a newer ring takes its pushes.
   static constexpr uint64_t kClosed = uint64_t{1} << 63;
 
-  const TypedMemMapping<Cell> cells_;
+  const NoReserveTypedMemMapping<Cell> cells_;
   const size_t max_ring_capacity_;
   const uint32_t max_rings_;
   const std::unique_ptr<Ring[]> rings_;
@@ -912,17 +930,16 @@ class AutoHyperClockTable : public BaseClockTable {
     }
   };  // struct HandleImpl
 
+  // FIFOCache: the table is reserved for reserved_capacity, or the shard's
+  // capacity if that's larger, at one slot per 64 bytes, as FIFOCache was
+  // before this table, where HyperClockCache's min_avg_entry_charge sets
+  // the reservation.
   struct Opts : public BaseOpts {
-    explicit Opts(size_t _min_avg_value_size, int _eviction_effort_cap)
-        : BaseOpts(_eviction_effort_cap),
-          min_avg_value_size(_min_avg_value_size) {}
-
     explicit Opts(const HyperClockCacheOptions& opts)
         : BaseOpts(opts.eviction_effort_cap) {
       assert(opts.estimated_entry_charge == 0);
-      min_avg_value_size = opts.min_avg_entry_charge;
     }
-    size_t min_avg_value_size;
+    size_t reserved_capacity = 0;
   };
 
   AutoHyperClockTable(size_t capacity, bool strict_capacity_limit,
@@ -942,6 +959,12 @@ class AutoHyperClockTable : public BaseClockTable {
     // queue).
     size_t probation_charge = 0;
     bool ghost_hit = false;
+    // FIFOCache: whether DoInsert replaced an entry with the key, and the
+    // bytes of table slots (see ChargeUsageMaybeEvictNonStrict) and of
+    // probation rings (see EvictForChargedRing) the insert charged to usage.
+    bool replaced = false;
+    size_t slot_charge = 0;
+    size_t ring_charge = 0;
   };
 
   void StartInsert(InsertState& state);
@@ -949,7 +972,10 @@ class AutoHyperClockTable : public BaseClockTable {
   // Does initial check for whether there's hash table room for another
   // inserted entry, possibly growing if needed. Returns true iff (after
   // the call) there is room for the proposed number of entries.
-  bool GrowIfNeeded(size_t new_occupancy, InsertState& state);
+  // FIFOCache: entry_charge is the charge of the entry being inserted (see
+  // ChargeMetadata).
+  bool GrowIfNeeded(size_t new_occupancy, size_t entry_charge,
+                    InsertState& state);
 
   HandleImpl* DoInsert(const ClockHandleBasicData& proto,
                        uint32_t initial_countdown, bool take_ref,
@@ -958,15 +984,33 @@ class AutoHyperClockTable : public BaseClockTable {
   // Runs the clock eviction algorithm trying to reclaim at least
   // requested_charge. Returns how much is evicted, which could be less
   // if it appears impossible to evict the requested amount without blocking.
-  void Evict(size_t requested_charge, InsertState& state, EvictionData* data);
+  // FIFOCache: and at least one entry if need_entry, for an insert that
+  // needs a slot, so entries of no charge (such as placeholders) don't make
+  // one insert evict every entry it meets.
+  void Evict(size_t requested_charge, bool need_entry, InsertState& state,
+             EvictionData* data);
+
+  // FIFOCache: evicts until usage is within capacity, or has come down by
+  // up_to, or nothing more can be evicted. For SetCapacity, which evicts at
+  // once where HyperClockCache leaves it to the next insert, and for an
+  // insert that charged a probation ring, which evicts only for the ring.
+  void EvictOverCapacity(size_t up_to = SIZE_MAX);
 
   // FIFOCache: key is the key itself if it isn't 16 bytes, else nullptr
-  // (see ClockHandleBasicData::MatchesKey).
-  HandleImpl* Lookup(const UniqueId64x2& hashed_key, const Slice* key);
+  // (see ClockHandleBasicData::MatchesKey). A match at skip isn't returned.
+  HandleImpl* Lookup(const UniqueId64x2& hashed_key, const Slice* key,
+                     const HandleImpl* skip = nullptr);
 
   bool Release(HandleImpl* handle, bool useful, bool erase_if_last_ref);
 
   void Erase(const UniqueId64x2& hashed_key, const Slice* key);
+
+  // FIFOCache: erases the entries with proto's key other than keep, the way
+  // Erase does, for an insert of proto replacing them: after keep is linked
+  // and while the insert holds its reference, or with keep nullptr when the
+  // insert is accepted without a slot. Stops once keep isn't visible.
+  // Returns whether it erased any.
+  bool EraseReplaced(const ClockHandleBasicData& proto, const HandleImpl* keep);
 
   void EraseUnRefEntries();
 
@@ -989,6 +1033,13 @@ class AutoHyperClockTable : public BaseClockTable {
   // slots, their probation words and ghost tags, and the probation queue's
   // rings.
   size_t GetMetadataCharge() const;
+
+  // FIFOCache: the start of each of the table's mappings: its slots, their
+  // probation words and ghost tags, and the probation queue's rings.
+  std::vector<const void*> TEST_GetMappings() const {
+    return {array_.Get(), probation_words_.Get(), ghost_.Get(),
+            probation_.TEST_GetMapping()};
+  }
 
   // FIFOCache: takes the tag of the key of an entry about to be inserted
   // out of the ghost, if it is there, before eviction can replace it.
@@ -1062,7 +1113,7 @@ class AutoHyperClockTable : public BaseClockTable {
   // Returns true iff increased usable length. Due to load factor
   // considerations, GrowIfNeeded might call this more than once to make room
   // for one more entry.
-  bool Grow(InsertState& state);
+  bool Grow(InsertState& state, size_t entry_charge);
 
   // Operational details of splitting a chain into two for Grow().
   void SplitForGrow(size_t grow_home, size_t old_home, int old_shift);
@@ -1081,9 +1132,8 @@ class AutoHyperClockTable : public BaseClockTable {
 
   // Calculates the appropriate maximum table size, for creating the memory
   // mapping.
-  static size_t CalcMaxUsableLength(
-      size_t capacity, size_t min_avg_value_size,
-      CacheMetadataChargePolicy metadata_charge_policy);
+  // FIFOCache: from the capacity reserved for (see Opts).
+  static size_t CalcMaxUsableLength(size_t reserved_capacity);
 
   // Shared helper function that implements removing entries from a chain
   // with proper handling to ensure all existing data is seen even in the
@@ -1115,10 +1165,11 @@ class AutoHyperClockTable : public BaseClockTable {
   // published with it. Sets *word to the word written.
   bool TryInsertSlot(const ClockHandleBasicData& proto, size_t idx,
                      uint32_t initial_countdown, uint32_t word_flags,
-                     uint32_t* word, bool* already_matches);
+                     uint32_t* word);
   // Pushes (slot idx, word) onto the probation queue, adding a larger ring
-  // first if the newest is full and the table has outgrown it.
-  bool ProbationPush(size_t idx, uint32_t word);
+  // first if the newest is full and the table has outgrown it, adding the
+  // ring's bytes to state.ring_charge if they are charged to usage.
+  bool ProbationPush(size_t idx, uint32_t word, InsertState& state);
   // Whether a queued value no longer names the entry it was pushed for.
   bool IsStaleProbationCell(uint64_t v) const;
   // The ghost: one tag per slot, at the home a key has when its tag is
@@ -1160,7 +1211,7 @@ class AutoHyperClockTable : public BaseClockTable {
   // if pinned, promotes it if hit kPromoteThreshold times (setting
   // *promoted), else evicts it. Returns false if the queue had nothing to
   // pop.
-  bool ProbationStep(EvictionData* data, bool* promoted);
+  bool ProbationStep(EvictionData* data, InsertState& state, bool* promoted);
   // Marks the probation entry in slot idx seen pinned, if its word's
   // identity is still word's, taking a reference to read its charge.
   void MarkSeenPinned(size_t idx, uint32_t word);
@@ -1169,7 +1220,7 @@ class AutoHyperClockTable : public BaseClockTable {
 
  private:  // data
   // mmaped area holding handles
-  const TypedMemMapping<HandleImpl> array_;
+  const NoReserveTypedMemMapping<HandleImpl> array_;
 
   // Metadata for table size under linear hashing.
   //
@@ -1206,12 +1257,12 @@ class AutoHyperClockTable : public BaseClockTable {
 
   // FIFOCache: one probation word per slot of array_ (see kInProbation),
   // lazily zeroed like array_.
-  const TypedMemMapping<RelaxedAtomic<uint32_t>> probation_words_;
+  const NoReserveTypedMemMapping<RelaxedAtomic<uint32_t>> probation_words_;
 
   // FIFOCache: the ghost of keys evicted from probation (see GhostSlot),
   // one tag per slot of array_, lazily zeroed like array_. When the table
   // grows, the new home gets a copy of the tag at the home it splits from.
-  const TypedMemMapping<RelaxedAtomic<uint32_t>> ghost_;
+  const NoReserveTypedMemMapping<RelaxedAtomic<uint32_t>> ghost_;
 
   // FIFOCache: the probation queue's order, as (slot index << 32 | word).
   ProbationQueue probation_;
@@ -1352,7 +1403,10 @@ class BaseHyperClockCache : public ShardedCache<ClockCacheShard<Table>> {
   using Handle = Cache::Handle;
   using CacheItemHelper = Cache::CacheItemHelper;
 
-  explicit BaseHyperClockCache(const HyperClockCacheOptions& opts);
+  // FIFOCache: with the capacity to reserve each shard's table for (see
+  // AutoHyperClockTable::Opts), split across the shards.
+  explicit BaseHyperClockCache(const HyperClockCacheOptions& opts,
+                               size_t max_capacity = 0);
 
   Cache::ObjectPtr Value(Handle* handle) override;
 

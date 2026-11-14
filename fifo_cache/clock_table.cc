@@ -220,56 +220,19 @@ inline void CorrectNearOverflow(SlotMeta old_meta,
   }
 }
 
-inline bool BeginSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
-                            uint32_t initial_countdown, bool* already_matches) {
-  assert(*already_matches == false);
+// FIFOCache: an occupied slot isn't checked for the key. The insert links
+// its entry and then erases any other with the key (EraseReplaced), where
+// HyperClockCache keeps a visible match it finds here, counting a hit on it,
+// and drops the new value.
+inline bool BeginSlotInsert(ClockHandle& h) {
   // Optimistically transition the slot from "empty" to
   // "under construction" (no effect on other states)
   auto set_occupied = SlotMeta::OccupiedFlag::SetTransform();
   SlotMeta old_meta;
   h.meta.Apply(set_occupied, &old_meta);
-
-  if (old_meta.IsEmpty()) {
-    // We've started inserting into an available slot, and taken
-    // ownership.
-    return true;
-  } else if (!old_meta.IsVisible()) {
-    // Slot not usable / touchable now
-    return false;
-  }
-  // Existing, visible entry, which might be a match.
-  // But first, we need to acquire a ref to read it. In fact, number of
-  // refs for initial countdown, so that we boost the clock state if
-  // this is a match.
-  auto add_acquire =
-      AcquireCounter::PlusTransformPromiseNoOverflow(initial_countdown);
-  h.meta.Apply(add_acquire, &old_meta);
-  // Like Lookup
-  if (old_meta.IsVisible()) {
-    // Acquired a read reference
-    if (h.SameKeyAs(proto)) {
-      // Match. Release in a way that boosts the clock state
-      auto add_release =
-          ReleaseCounter::PlusTransformPromiseNoOverflow(initial_countdown);
-      h.meta.Apply(add_release, &old_meta);
-      // Correct for possible (but rare) overflow
-      CorrectNearOverflow(old_meta, h.meta);
-      // Insert detached instead (only if return handle needed)
-      *already_matches = true;
-      return false;
-    } else {
-      // Mismatch.
-      Unref(h, initial_countdown);
-    }
-  } else if (UNLIKELY(old_meta.IsInvisible())) {
-    // Pretend we never took the reference
-    Unref(h, initial_countdown);
-  } else {
-    // For other states, incrementing the acquire counter has no effect
-    // so we don't need to undo it.
-    // Slot not usable / touchable now.
-  }
-  return false;
+  // Whether we've started inserting into an available slot, and taken
+  // ownership.
+  return old_meta.IsEmpty();
 }
 
 inline void FinishSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
@@ -451,18 +414,52 @@ HandleImpl* BaseClockTable::StandaloneInsert(
   return h;
 }
 
+namespace {
+// FIFOCache: a probation ring is charged when an insert's push finds the
+// newest ring full, in DoInsert or in a rotation during the insert's own
+// eviction, so after the insert evicted for its own charge. Without the
+// strict limit, the insert (or CreateStandalone) evicts for the ring's bytes
+// on the way out, however it ends, leaving anything else over capacity to
+// later inserts as before. Under the strict limit a ring is charged only if
+// it fits, and this finds nothing to evict.
+template <class Table>
+class EvictForChargedRing {
+ public:
+  EvictForChargedRing(Table& table, const typename Table::InsertState& state)
+      : table_(table), state_(state) {}
+  ~EvictForChargedRing() {
+    if (UNLIKELY(state_.ring_charge > 0)) {
+      table_.EvictOverCapacity(state_.ring_charge);
+    }
+  }
+  EvictForChargedRing(const EvictForChargedRing&) = delete;
+  EvictForChargedRing& operator=(const EvictForChargedRing&) = delete;
+
+ private:
+  Table& table_;
+  const typename Table::InsertState& state_;
+};
+}  // namespace
+
 template <class Table>
 typename Table::HandleImpl* BaseClockTable::CreateStandalone(
     ClockHandleBasicData& proto, bool allow_uncharged) {
   Table& derived = static_cast<Table&>(*this);
   typename Table::InsertState state;
   derived.StartInsert(state);
+  EvictForChargedRing<Table> evict_for_ring(derived, state);
 
   const size_t total_charge = proto.GetTotalCharge();
   // NOTE: we can use eec_and_scl as eviction_effort_cap below because
   // strict_capacity_limit=true is supposed to disable the limit on eviction
   // effort, and a large value effectively does that.
-  if (eec_and_scl_.LoadRelaxed().Get<StrictCapacityLimit>()) {
+  if (UNLIKELY(!UsageCanTake(total_charge))) {
+    // FIFOCache
+    if (!allow_uncharged) {
+      return nullptr;
+    }
+    proto.ClearCharge();
+  } else if (eec_and_scl_.LoadRelaxed().Get<StrictCapacityLimit>()) {
     Status s = ChargeUsageMaybeEvictStrict<Table>(
         total_charge,
         /*need_evict_for_occupancy=*/false, state);
@@ -509,14 +506,12 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
   } while (!usage_.CasWeakRelaxed(old_usage, new_usage));
   // How much do we need to evict then?
   size_t need_evict_charge = old_usage + total_charge - new_usage;
-  size_t request_evict_charge = need_evict_charge;
-  if (UNLIKELY(need_evict_for_occupancy) && request_evict_charge == 0) {
-    // Require at least 1 eviction.
-    request_evict_charge = 1;
-  }
-  if (request_evict_charge > 0) {
+  // FIFOCache: an eviction for occupancy alone asks Evict for an entry and
+  // no charge, where HyperClockCache asks for a charge of 1.
+  if (need_evict_charge > 0 || UNLIKELY(need_evict_for_occupancy)) {
     EvictionData data;
-    static_cast<Table*>(this)->Evict(request_evict_charge, state, &data);
+    static_cast<Table*>(this)->Evict(need_evict_charge,
+                                     need_evict_for_occupancy, state, &data);
     occupancy_.FetchSub(data.freed_count);
     if (LIKELY(data.freed_charge > need_evict_charge)) {
       assert(data.freed_count > 0);
@@ -575,21 +570,21 @@ inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
       // capacity limit.
       need_evict_charge += std::min(capacity / 1024, total_charge) + 1;
     }
-    // FIFOCache: but no more than the insert overruns capacity by, as
-    // FIFOCache did before this table, so an insert evicts only what it
+    // FIFOCache: and for the slots the table grew by for this insert, which
+    // are in old_usage, as FIFOCache did before this table; but no more than
+    // the insert overruns capacity by, so an insert evicts only what it
     // needs. Over capacity from racing inserts, that is the overrun plus the
     // charge, still capped as above.
+    need_evict_charge += state.slot_charge;
     need_evict_charge =
         std::min(need_evict_charge, old_usage + total_charge - capacity);
   }
-  if (UNLIKELY(need_evict_for_occupancy) && need_evict_charge == 0) {
-    // Special case: require at least 1 eviction if we only have to
-    // deal with occupancy
-    need_evict_charge = 1;
-  }
+  // FIFOCache: an eviction for occupancy alone asks Evict for an entry and
+  // no charge, as in the strict case.
   EvictionData data;
-  if (need_evict_charge > 0) {
-    static_cast<Table*>(this)->Evict(need_evict_charge, state, &data);
+  if (need_evict_charge > 0 || UNLIKELY(need_evict_for_occupancy)) {
+    static_cast<Table*>(this)->Evict(need_evict_charge,
+                                     need_evict_for_occupancy, state, &data);
     // Deal with potential occupancy deficit
     if (UNLIKELY(need_evict_for_occupancy) && data.freed_count == 0) {
       assert(data.freed_charge == 0);
@@ -644,8 +639,29 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   using HandleImpl = typename Table::HandleImpl;
   Table& derived = static_cast<Table&>(*this);
 
+  // FIFOCache: refused, without a handle as if inserted and evicted at
+  // once.
+  if (UNLIKELY(!UsageCanTake(proto.GetTotalCharge()))) {
+    if (handle == nullptr) {
+      proto.FreeData(allocator_);
+      return Status::OK();
+    }
+    return Status::MemoryLimit("Cache entry too large to account for: " +
+                               std::to_string(proto.GetTotalCharge()));
+  }
+
   typename Table::InsertState state;
   derived.StartInsert(state);
+  EvictForChargedRing<Table> evict_for_ring(derived, state);
+  // FIFOCache: for an insert accepted without a slot (dropped, or standalone
+  // with a handle): reverts occupancy, puts the ghost tag back, and erases
+  // any entry with the key, so the old value doesn't stay visible. Returns
+  // whether there was one.
+  auto accept_without_slot = [&]() {
+    occupancy_.FetchSubRelaxed(1);
+    derived.GhostPutBack(proto, state);
+    return derived.EraseReplaced(proto, nullptr);
+  };
   // FIFOCache: an entry whose key is in the ghost goes to the resident
   // queue, and any other into the probation queue, where its charge counts
   // toward probation's share. The tag is taken before eviction, which could
@@ -659,7 +675,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   size_t old_occupancy = occupancy_.FetchAdd(1);
   // Whether we over-committed and need an eviction to make up for it
   bool need_evict_for_occupancy =
-      !derived.GrowIfNeeded(old_occupancy + 1, state);
+      !derived.GrowIfNeeded(old_occupancy + 1, proto.GetTotalCharge(), state);
 
   // Usage/capacity handling is somewhat different depending on
   // strict_capacity_limit, but mostly pessimistic.
@@ -675,6 +691,14 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
       // Revert occupancy
       occupancy_.FetchSubRelaxed(1);
       derived.GhostPutBack(proto, state);
+      // FIFOCache: without a handle, dropped as if inserted and evicted at
+      // once, as FIFOCache and LRUCache do, where HyperClockCache returns
+      // MemoryLimit. Either way the cache is as it was, an entry with the
+      // key included, as in both of them.
+      if (handle == nullptr) {
+        proto.FreeData(allocator_);
+        return Status::OK();
+      }
       return s;
     }
   } else {
@@ -682,14 +706,12 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
     bool success = ChargeUsageMaybeEvictNonStrict<Table>(
         total_charge, need_evict_for_occupancy, state);
     if (!success) {
-      // Revert occupancy
-      occupancy_.FetchSubRelaxed(1);
-      derived.GhostPutBack(proto, state);
+      const bool replaced = accept_without_slot();
       if (handle == nullptr) {
         // Don't insert the entry but still return ok, as if the entry
         // inserted into cache and evicted immediately.
         proto.FreeData(allocator_);
-        return Status::OK();
+        return replaced ? Status::OkOverwritten() : Status::OK();
       } else {
         // Need to track usage of fallback standalone insert
         usage_.FetchAddRelaxed(total_charge);
@@ -699,13 +721,8 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   }
 
   if (!use_standalone_insert) {
-    // Attempt a table insert, but abort if we find an existing entry for the
-    // key. If we were to overwrite old entries, we would either
-    // * Have to gain ownership over an existing entry to overwrite it, which
-    // would only work if there are no outstanding (read) references and would
-    // create a small gap in availability of the entry (old or new) to lookups.
-    // * Have to insert into a suboptimal location (more probes) so that the
-    // old entry can be kept around as well.
+    // FIFOCache: attempt a table insert, which replaces any entry with the
+    // key (see DoInsert), where HyperClockCache aborts if it finds one.
 
     uint32_t initial_countdown = GetInitialCountdown(priority);
     assert(initial_countdown > 0);
@@ -718,12 +735,11 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
       if (handle) {
         *handle = e;
       }
-      return Status::OK();
+      // FIFOCache: OkOverwritten if it replaced an entry.
+      return state.replaced ? Status::OkOverwritten() : Status::OK();
     }
     // Not inserted
-    // Revert occupancy
-    occupancy_.FetchSubRelaxed(1);
-    derived.GhostPutBack(proto, state);
+    const bool replaced = accept_without_slot();
     // Maybe fall back on standalone insert
     if (handle == nullptr) {
       // Revert usage
@@ -732,7 +748,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
       assert(usage_.LoadRelaxed() < SIZE_MAX / 2);
       // As if unrefed entry immdiately evicted
       proto.FreeData(allocator_);
-      return Status::OK();
+      return replaced ? Status::OkOverwritten() : Status::OK();
     }
 
     use_standalone_insert = true;
@@ -748,7 +764,35 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   // insertions, but we instead are probably interested in how many insertions
   // didn't go into the table (instead "standalone"), which could be redundant
   // Insert or some other reason (use_standalone_insert reasons above).
+  // FIFOCache: inserts that replace an entry return it too.
   return Status::OkOverwritten();
+}
+
+bool BaseClockTable::ChargeMetadata(size_t bytes, size_t keep) {
+  if (metadata_charge_policy_ !=
+      CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
+    return true;
+  }
+  if (!eec_and_scl_.LoadRelaxed().Get<StrictCapacityLimit>()) {
+    usage_.FetchAddRelaxed(bytes);
+    return true;
+  }
+  const size_t capacity = capacity_.LoadRelaxed();
+  size_t old_usage = usage_.LoadRelaxed();
+  do {
+    if (old_usage > capacity || capacity - old_usage < bytes ||
+        capacity - old_usage - bytes < keep) {
+      return false;
+    }
+  } while (!usage_.CasWeakRelaxed(old_usage, old_usage + bytes));
+  return true;
+}
+
+void BaseClockTable::UnchargeMetadata(size_t bytes) {
+  if (metadata_charge_policy_ ==
+      CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
+    usage_.FetchSubRelaxed(bytes);
+  }
 }
 
 void BaseClockTable::Ref(ClockHandle& h) {
@@ -841,7 +885,8 @@ void ClockCacheShard<Table>::ApplyToSomeEntries(
 template <class Table>
 void ClockCacheShard<Table>::SetCapacity(size_t capacity) {
   table_.SetCapacity(capacity);
-  // next Insert will take care of any necessary evictions
+  // FIFOCache: and evicts now, rather than at the next Insert.
+  table_.EvictOverCapacity();
 }
 
 template <class Table>
@@ -965,20 +1010,17 @@ size_t ClockCacheShard<Table>::GetPinnedUsage() const {
   // Why avoid this counter? Because Lookup removes elements from the clock
   // list, so it would need to update the pinned usage every time,
   // which creates additional synchronization costs.
+  // FIFOCache: without the pinned entries' slots, which are part of the
+  // table's charge, as FIFOCache did before this table.
   size_t table_pinned_usage = 0;
-  const bool charge_metadata =
-      metadata_charge_policy_ == kFullChargeCacheMetadata;
   ConstApplyToEntriesRange(
-      [&table_pinned_usage, charge_metadata](const HandleImpl& h) {
+      [&table_pinned_usage](const HandleImpl& h) {
         SlotMeta meta = h.meta.LoadRelaxed();
         uint32_t refcount = meta.GetRefcount();
         // Holding one ref for ConstApplyToEntriesRange
         assert(refcount > 0);
         if (refcount > 1) {
           table_pinned_usage += h.GetTotalCharge();
-          if (charge_metadata) {
-            table_pinned_usage += sizeof(HandleImpl);
-          }
         }
       },
       table_.HandlePtr(0), table_.HandlePtr(table_.GetTableSize()), true);
@@ -1006,14 +1048,20 @@ template class ClockCacheShard<AutoHyperClockTable>;
 
 template <class Table>
 BaseHyperClockCache<Table>::BaseHyperClockCache(
-    const HyperClockCacheOptions& opts)
+    const HyperClockCacheOptions& opts, size_t max_capacity)
     : ShardedCache<ClockCacheShard<Table>>(opts) {
   // TODO: should not need to go through two levels of pointer indirection to
   // get to table entries
   size_t per_shard = this->GetPerShardCapacity();
+  // FIFOCache: max_capacity split across shards as capacity is, rounding
+  // up.
+  const size_t num_shards = this->GetNumShards();
+  const size_t per_shard_max =
+      max_capacity / num_shards + (max_capacity % num_shards != 0 ? 1 : 0);
   MemoryAllocator* alloc = this->memory_allocator();
   this->InitShards([&](Shard* cs) {
     typename Table::Opts table_opts{opts};
+    table_opts.reserved_capacity = per_shard_max;
     new (cs) Shard(per_shard, opts.strict_capacity_limit,
                    opts.metadata_charge_policy, alloc,
                    &this->eviction_callback_, &this->hash_seed_, table_opts);
@@ -1426,10 +1474,8 @@ AutoHyperClockTable::AutoHyperClockTable(
     : BaseClockTable(capacity, strict_capacity_limit, opts.eviction_effort_cap,
                      metadata_charge_policy, allocator, eviction_callback,
                      hash_seed),
-      array_(MemMapping::AllocateLazyZeroed(
-          sizeof(HandleImpl) * CalcMaxUsableLength(capacity,
-                                                   opts.min_avg_value_size,
-                                                   metadata_charge_policy))),
+      array_(sizeof(HandleImpl) *
+             CalcMaxUsableLength(std::max(capacity, opts.reserved_capacity))),
       length_info_(UsedLengthToLengthInfo(GetStartingLength(capacity))),
       occupancy_limit_(
           CalcOccupancyLimit(LengthInfoToUsedLength(length_info_.Load()))),
@@ -1438,10 +1484,8 @@ AutoHyperClockTable::AutoHyperClockTable(
           BottomNBits(UINT64_MAX, LengthInfoToMinShift(length_info_.Load()))),
       // FIFOCache: the probation words and ghost tags, one each per slot,
       // and the queue.
-      probation_words_(MemMapping::AllocateLazyZeroed(
-          sizeof(RelaxedAtomic<uint32_t>) * array_.Count())),
-      ghost_(MemMapping::AllocateLazyZeroed(sizeof(RelaxedAtomic<uint32_t>) *
-                                            array_.Count())),
+      probation_words_(sizeof(RelaxedAtomic<uint32_t>) * array_.Count()),
+      ghost_(sizeof(RelaxedAtomic<uint32_t>) * array_.Count()),
       probation_(ProbationRingCapacity(occupancy_limit_.LoadRelaxed()),
                  ProbationRingCapacity(CalcOccupancyLimit(array_.Count()))) {
   // FIFOCache: and the probation words' and ghost's mappings.
@@ -1665,6 +1709,7 @@ void AutoHyperClockTable::StartInsert(InsertState& state) {
   }
 
 bool AutoHyperClockTable::GrowIfNeeded(size_t new_occupancy,
+                                       size_t entry_charge,
                                        InsertState& state) {
   // new_occupancy has taken into account other threads that are also trying
   // to insert, so as soon as we see sufficient *published* usable size, we
@@ -1686,7 +1731,7 @@ bool AutoHyperClockTable::GrowIfNeeded(size_t new_occupancy,
   while (UNLIKELY(new_occupancy > occupancy_limit_.LoadRelaxed())) {
     // At this point we commit the thread to growing unless we've reached the
     // limit (returns false).
-    if (!Grow(state)) {
+    if (!Grow(state, entry_charge)) {
       return false;
     }
   }
@@ -1694,7 +1739,20 @@ bool AutoHyperClockTable::GrowIfNeeded(size_t new_occupancy,
   return true;
 }
 
-bool AutoHyperClockTable::Grow(InsertState& state) {
+bool AutoHyperClockTable::Grow(InsertState& state, size_t entry_charge) {
+  // FIFOCache: the slot, its probation word and ghost tag, charged here,
+  // where HyperClockCache charges a slot once length_info_ includes it, so
+  // the strict limit can turn the growth down.
+  constexpr size_t kSlotMetadata =
+      sizeof(HandleImpl) + 2 * sizeof(RelaxedAtomic<uint32_t>);
+  // A table at its reservation stays there, so it isn't charged and
+  // refunded on every insert.
+  if (grow_frontier_.LoadRelaxed() >= array_.Count()) {
+    return false;
+  }
+  if (!ChargeMetadata(kSlotMetadata, entry_charge)) {
+    return false;
+  }
   // Allocate the next grow slot
   size_t grow_home = grow_frontier_.FetchAddRelaxed(1);
   if (grow_home >= array_.Count()) {
@@ -1702,7 +1760,12 @@ bool AutoHyperClockTable::Grow(InsertState& state) {
     // (Tested by unit test ClockCacheTest/Limits)
     // Make sure we don't overflow grow_frontier_ by reaching here repeatedly
     grow_frontier_.StoreRelaxed(array_.Count());
+    UnchargeMetadata(kSlotMetadata);  // FIFOCache
     return false;
+  }
+  // FIFOCache
+  if (metadata_charge_policy_ == kFullChargeCacheMetadata) {
+    state.slot_charge += kSlotMetadata;
   }
 #ifdef COERCE_CONTEXT_SWITCH
   // This is useful in reproducing concurrency issues in Grow()
@@ -1803,14 +1866,7 @@ void AutoHyperClockTable::CatchUpLengthInfoNoWait(
     // pick up the new value and keep going as appropriate.
     if (length_info_.CasStrong(current_length_info, next_length_info)) {
       current_length_info = next_length_info;
-      // Update usage_ if metadata charge policy calls for it
-      if (metadata_charge_policy_ ==
-          CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
-        // NOTE: ignoring page boundaries for simplicity
-        // FIFOCache: and the slot's probation word and ghost tag.
-        usage_.FetchAddRelaxed(sizeof(HandleImpl) +
-                               2 * sizeof(RelaxedAtomic<uint32_t>));
-      }
+      // FIFOCache: the slot was charged when Grow took it.
     }
     published_usable_size = LengthInfoToUsedLength(current_length_info);
   }
@@ -2415,21 +2471,15 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
                        &orig_home_shift);
   HandleImpl* const arr = array_.Get();
 
-  // We could go searching through the chain for any duplicate, but that's
-  // not typically helpful, except for the REDUNDANT block cache stats.
-  // (Inferior duplicates will age out with eviction.) However, we do skip
-  // insertion if the home slot (or some other we happen to probe) already
-  // has a match (already_matches below). This helps to keep better locality
-  // when we can.
+  // FIFOCache: HyperClockCache skips the insert if the home slot, or another
+  // it probes, holds an entry with the key. Here the probes don't check keys
+  // (see BeginSlotInsert): the entry is linked and then replaces any other
+  // with its key.
   //
-  // And we can do that as part of searching for an available slot to
-  // insert the new entry, because our preferred location and first slot
-  // checked will be the home slot.
-  //
-  // As the table initially grows to size, few entries will be in the same
-  // cache line as the chain head. However, churn in the cache relatively
-  // quickly improves the proportion of entries sharing that cache line with
-  // the chain head. Data:
+  // The search for an available slot starts at the home slot. As the table
+  // initially grows to size, few entries will be in the same cache line as the
+  // chain head. However, churn in the cache relatively quickly improves the
+  // proportion of entries sharing that cache line with the chain head. Data:
   //
   // Initial population only: (cache_bench with -ops_per_thread=1)
   // Entries at home count: 29,202 (out of 129,170 entries in 94,411 chains)
@@ -2462,21 +2512,14 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
   assert(home < used_length);
 
   size_t idx = home;
-  bool already_matches = false;
-  bool already_matches_ignore = false;
-  if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word,
-                    &already_matches)) {
+  if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word)) {
     assert(idx == home);
-  } else if (already_matches) {
-    return nullptr;
     // Here we try to populate newly-opened slots in the table, but not
     // when we can add something to its home slot. This makes the structure
-    // more performant more quickly on (initial) growth. We ignore "already
-    // matches" in this case because it is unlikely and difficult to
-    // incorporate logic for here cleanly and efficiently.
+    // more performant more quickly on (initial) growth.
   } else if (UNLIKELY(state.likely_empty_slot > 0) &&
              TryInsertSlot(proto, state.likely_empty_slot, initial_countdown,
-                           word_flags, &word, &already_matches_ignore)) {
+                           word_flags, &word)) {
     idx = state.likely_empty_slot;
   } else {
     // We need to search for an available slot outside of the home.
@@ -2510,12 +2553,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
       if (idx >= used_length) {
         idx -= used_length;
       }
-      if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word,
-                        &already_matches)) {
+      if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word)) {
         break;
-      }
-      if (already_matches) {
-        return nullptr;
       }
     }
     if (i == kMaxLinearProbe) {
@@ -2564,12 +2603,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
             }
           }
         }
-        if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word,
-                          &already_matches)) {
+        if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word)) {
           break;
-        }
-        if (already_matches) {
-          return nullptr;
         }
       }
     }
@@ -2625,6 +2660,9 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
                                                head_next_with_shift)) {
       // Success
       TEST_SYNC_POINT("FIFOCache::DoInsert:Linked");
+      // FIFOCache: replaces any other entry with the key, while our
+      // reference keeps this one in the table.
+      state.replaced = EraseReplaced(proto, arr + idx);
       if (!take_ref) {
         Unref(arr[idx]);
       }
@@ -2633,7 +2671,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
       // removed meanwhile, the cell is stale and the step skips it.
       if (word & kInProbation) {
         TEST_SYNC_POINT("FIFOCache::DoInsert:BeforeProbationPush");
-        if (!ProbationPush(idx, word)) {
+        if (!ProbationPush(idx, word, state)) {
           LeaveProbation(idx, word, proto.GetTotalCharge());
         }
       }
@@ -2642,8 +2680,40 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
   }
 }
 
+void AutoHyperClockTable::EvictOverCapacity(size_t up_to) {
+  // Only the deficit at the start, as inserts racing this one evict for
+  // their own charges. Each Evict call gives up at the effort cap, so call
+  // it again while calls free entries or find pins, until the pins found
+  // since anything was freed could have covered every entry twice.
+  const size_t usage = usage_.LoadRelaxed();
+  const size_t capacity = capacity_.LoadRelaxed();
+  size_t deficit = usage > capacity ? std::min(up_to, usage - capacity) : 0;
+  const size_t pins_limit = 2 * occupancy_.LoadRelaxed();
+  size_t pins_since_freed = 0;
+  while (deficit > 0) {
+    InsertState state;
+    StartInsert(state);
+    EvictionData data;
+    Evict(deficit, /*need_entry=*/false, state, &data);
+    occupancy_.FetchSub(data.freed_count);
+    usage_.FetchSubRelaxed(data.freed_charge);
+    if (data.freed_charge > 0) {
+      deficit -= std::min(deficit, data.freed_charge);
+      pins_since_freed = 0;
+    } else {
+      // Freeing entries of no charge takes nothing off the deficit, so it
+      // doesn't reset the count, or entries of no charge arriving meanwhile
+      // could keep this going.
+      pins_since_freed += data.seen_pinned_count;
+      if (data.seen_pinned_count == 0 || pins_since_freed > pins_limit) {
+        break;
+      }
+    }
+  }
+}
+
 AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
-    const UniqueId64x2& hashed_key, const Slice* key) {
+    const UniqueId64x2& hashed_key, const Slice* key, const HandleImpl* skip) {
   // Lookups are wait-free with low occurrence of retries, back-tracking,
   // and fallback. We do not have the benefit of holding a rewrite lock on
   // the chain so must be prepared for many kinds of mayhem, most notably
@@ -2709,7 +2779,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
 #else
     bool probably_equal = h->hashed_key == hashed_key;
 #endif
-    if (probably_equal) {
+    // FIFOCache: or skip.
+    if (probably_equal && h != skip) {
       // Increment acquire counter for definitive check
       auto add_acquire = AcquireCounter::PlusTransformPromiseNoOverflow(1);
       SlotMeta old_meta, new_meta;
@@ -2830,7 +2901,9 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
       // least guaranteed not to miss anything. Here in Lookup, it's just a
       // transient, slight hiccup in performance.
 
-      if (full_match_or_unknown) {
+      // FIFOCache: skip is kept as a read ref on the chain, like an entry
+      // with the same home.
+      if (full_match_or_unknown && h != skip) {
         // Full match.
         // Release old read ref on chain if applicable
         if (read_ref_on_chain) {
@@ -2993,6 +3066,30 @@ void AutoHyperClockTable::Erase(const UniqueId64x2& hashed_key,
   }
 }
 
+bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
+                                        const HandleImpl* keep) {
+  Slice heap_key;
+  const Slice* key = nullptr;
+  if (proto.HasHeapKey()) {
+    heap_key = proto.GetHeapKey()->key();
+    key = &heap_key;
+  }
+  bool replaced = false;
+  // Like Erase. If keep is erased meanwhile, by Erase or by a newer insert
+  // replacing it, that erases the rest, which may include the newer entry.
+  while (HandleImpl* h = Lookup(proto.hashed_key, key, keep)) {
+    if (keep != nullptr && !keep->meta.Load().IsVisible()) {
+      Unref(*h);
+      break;
+    }
+    replaced = true;
+    if (!TryEraseHandle(h, /*holding_ref=*/true, /*mark_invisible=*/true)) {
+      Unref(*h);
+    }
+  }
+  return replaced;
+}
+
 void AutoHyperClockTable::EraseUnRefEntries() {
   size_t usable_size = GetTableSize();
   for (size_t i = 0; i < usable_size; i++) {
@@ -3018,10 +3115,10 @@ void AutoHyperClockTable::EraseUnRefEntries() {
   }
 }
 
-void AutoHyperClockTable::Evict(size_t requested_charge, InsertState& state,
-                                EvictionData* data) {
+void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
+                                InsertState& state, EvictionData* data) {
   // precondition
-  assert(requested_charge > 0);
+  assert(requested_charge > 0 || need_entry);
 
   // We need the clock pointer to seemlessly "wrap around" at the end of the
   // table, and to be reasonably stable under Grow operations. This is
@@ -3090,7 +3187,7 @@ void AutoHyperClockTable::Evict(size_t requested_charge, InsertState& state,
     const size_t freed_before = data->freed_count;
     const size_t pinned_before = data->seen_pinned_count;
     if (probation_first && probation_steps < max_probation_steps &&
-        (++probation_steps, ProbationStep(data, &promoted))) {
+        (++probation_steps, ProbationStep(data, state, &promoted))) {
       if (promoted && resident_exhausted) {
         resident_exhausted = false;
         max_clock_pointer = 0;
@@ -3101,7 +3198,8 @@ void AutoHyperClockTable::Evict(size_t requested_charge, InsertState& state,
       // leaves probation's share) ends it.
       promoting = promoted || (promoting && data->freed_count == freed_before &&
                                data->seen_pinned_count == pinned_before);
-      if (data->freed_charge >= requested_charge) {
+      if (data->freed_charge >= requested_charge &&
+          (!need_entry || data->freed_count > 0)) {
         return;
       }
       if (IsEvictionEffortExceeded(*data)) {
@@ -3155,7 +3253,9 @@ void AutoHyperClockTable::Evict(size_t requested_charge, InsertState& state,
     to_finish_eviction.clear();
 
     // Loop exit conditions
-    if (data->freed_charge >= requested_charge) {
+    // FIFOCache: with an entry freed if one is needed.
+    if (data->freed_charge >= requested_charge &&
+        (!need_entry || data->freed_count > 0)) {
       return;
     }
 
@@ -3190,8 +3290,7 @@ ProbationQueue::ProbationQueue(size_t first_ring_capacity,
                                size_t max_ring_capacity)
     // Ring capacities are distinct powers of two up to max_ring_capacity, so
     // all of them fit in twice that.
-    : cells_(
-          MemMapping::AllocateLazyZeroed(sizeof(Cell) * 2 * max_ring_capacity)),
+    : cells_(sizeof(Cell) * 2 * max_ring_capacity),
       max_ring_capacity_(max_ring_capacity),
       max_rings_(static_cast<uint32_t>(FloorLog2(max_ring_capacity) -
                                        FloorLog2(first_ring_capacity) + 1)),
@@ -3347,10 +3446,9 @@ size_t AutoHyperClockTable::ProbationTarget() const {
 
 bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
                                         size_t idx, uint32_t initial_countdown,
-                                        uint32_t word_flags, uint32_t* word,
-                                        bool* already_matches) {
+                                        uint32_t word_flags, uint32_t* word) {
   HandleImpl& h = array_[idx];
-  if (!BeginSlotInsert(proto, h, initial_countdown, already_matches)) {
+  if (!BeginSlotInsert(h)) {
     return false;
   }
   // We own the slot, so its word is ours to write.
@@ -3371,17 +3469,26 @@ bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
   return true;
 }
 
-bool AutoHyperClockTable::ProbationPush(size_t idx, uint32_t word) {
+bool AutoHyperClockTable::ProbationPush(size_t idx, uint32_t word,
+                                        InsertState& state) {
   const uint64_t v = (uint64_t{idx} << 32) | word;
   if (probation_.Push(v)) {
     return true;
   }
   const size_t want = ProbationRingCapacity(occupancy_limit_.LoadRelaxed());
   if (want > probation_.RingCapacity()) {
-    if (probation_.TryAddRing(want) &&
-        metadata_charge_policy_ ==
-            CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
-      usage_.FetchAddRelaxed(want * sizeof(ProbationQueue::Cell));
+    // Charged first, so the strict limit can turn the ring down; then this
+    // entry goes to the resident queue below unless a ring has room.
+    const size_t ring_bytes = want * sizeof(ProbationQueue::Cell);
+    if (ChargeMetadata(ring_bytes, /*keep=*/0)) {
+      TEST_SYNC_POINT("FIFOCache::ProbationPush:RingCharged");
+      if (probation_.TryAddRing(want)) {
+        if (metadata_charge_policy_ == kFullChargeCacheMetadata) {
+          state.ring_charge += ring_bytes;
+        }
+      } else {
+        UnchargeMetadata(ring_bytes);
+      }
     }
     // Whether this call or another added it, or one is still being added.
     if (probation_.Push(v)) {
@@ -3573,7 +3680,8 @@ void AutoHyperClockTable::DropInsertRefCount(HandleImpl& h,
   word.CasStrongRelaxed(w, w & ~kCountsInsertRef);
 }
 
-bool AutoHyperClockTable::ProbationStep(EvictionData* data, bool* promoted) {
+bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
+                                        bool* promoted) {
   uint64_t v;
   if (!probation_.Pop(&v)) {
     return false;
@@ -3606,7 +3714,7 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, bool* promoted) {
       if ((cur & kSeenPinned) == 0) {
         MarkSeenPinned(idx, word);
       }
-      if (!ProbationPush(idx, word)) {
+      if (!ProbationPush(idx, word, state)) {
         LeaveProbationUnowned(idx, word);
       }
       return true;
@@ -3665,7 +3773,7 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, bool* promoted) {
     return true;
   }
   // Kept losing races to hits: give it another lap.
-  if (!ProbationPush(idx, word)) {
+  if (!ProbationPush(idx, word, state)) {
     LeaveProbationUnowned(idx, word);
   }
   return true;
@@ -3676,20 +3784,14 @@ void AutoHyperClockTable::LeaveProbationUnowned(size_t idx, uint32_t word) {
       idx, [&](HandleImpl& h) { LeaveProbation(idx, word, h.total_charge); });
 }
 
-size_t AutoHyperClockTable::CalcMaxUsableLength(
-    size_t capacity, size_t min_avg_value_size,
-    CacheMetadataChargePolicy metadata_charge_policy) {
-  double min_avg_slot_charge = min_avg_value_size * kMaxLoadFactor;
-  if (metadata_charge_policy == kFullChargeCacheMetadata) {
-    min_avg_slot_charge += sizeof(HandleImpl);
-  }
-  assert(min_avg_slot_charge > 0.0);
-  size_t num_slots =
-      static_cast<size_t>(capacity / min_avg_slot_charge + 0.999999);
-  // FIFOCache: at least one slot (so one page), so that a capacity of zero
-  // still gets a table, and slot indices that fit the probation queue's 32
-  // bits.
-  num_slots = std::max(num_slots, size_t{1});
+size_t AutoHyperClockTable::CalcMaxUsableLength(size_t reserved_capacity) {
+  // FIFOCache: one slot per 64 bytes, at least 2048, under either metadata
+  // policy, as FIFOCache reserved before this table: at the load factor,
+  // about one entry per 107 bytes. Slot indices fit the probation queue's
+  // 32 bits.
+  constexpr size_t kMinSlots = 2048;
+  constexpr size_t kBytesPerSlot = 64;
+  size_t num_slots = std::max(kMinSlots, reserved_capacity / kBytesPerSlot);
   num_slots = std::min(
       num_slots, (size_t{1} << 32) - kPresumedPageSize / sizeof(HandleImpl));
 

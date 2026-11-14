@@ -6,6 +6,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "plugin/fifo_cache/clock_table.h"
 #include "plugin/fifo_cache/fifo_cache_options.h"
@@ -16,9 +17,9 @@ namespace fifo_cache {
 
 // FIFOCache keeps its entries in AutoHyperClockCache's slot table, copied
 // into clock_table.h. There is no shard mutex: lookups, releases that don't
-// erase, and inserts that neither evict nor grow the table are wait-free,
-// and removing an entry from a chain or splitting a chain to grow the table
-// takes a lock on that chain only.
+// erase and inserts take no lock, and removing an entry from a chain
+// (erasing or evicting it, or an insert replacing it) or splitting a chain
+// to grow the table takes a lock on that chain only.
 class FIFOCache
 #ifdef NDEBUG
     final
@@ -41,6 +42,9 @@ class FIFOCache
   bool TEST_InProbation(const Slice& key);
   // Whether an insert of the key would find it in the ghost.
   bool TEST_InGhost(const Slice& key) const;
+  // The start of each shard's table mappings (see
+  // AutoHyperClockTable::TEST_GetMappings).
+  std::vector<const void*> TEST_GetMappings() const;
 };
 
 }  // namespace fifo_cache

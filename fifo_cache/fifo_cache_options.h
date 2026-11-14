@@ -18,59 +18,75 @@ namespace ROCKSDB_NAMESPACE {
 
 // EXPERIMENTAL: the API and the fifo_cache:// option string are subject to
 // change.
-// FIFOCache - A cache using segmented FIFO eviction to stay at or below a
-// set capacity. The cache is sharded to 2^num_shard_bits shards, by hash of
-// the key. The total capacity is divided and evenly assigned to each shard,
-// and each shard has two FIFO queues for evictions: new entries enter
-// probation, and probation victims with enough access frequency are promoted
-// to resident (second-chance) instead of being evicted. Keys (not values)
-// recently evicted from probation are remembered, and re-inserting one goes
-// directly to resident. Placement is inferred
-// from access frequency: Cache::Priority is ignored. Lookups take no lock;
-// inserts, erases and eviction take a per-shard mutex. Pinned entries are
-// never evicted; eviction sets long-pinned entries aside instead of
-// rescanning them, and a fully-pinned shard evicts nothing.
-// Recently evicted keys are remembered by a 4-byte tag per slot of the
-// table, at the slot the key maps to, so a later victim mapping to the same
-// slot replaces the tag. The tags count against capacity with the slots
-// under kFullChargeCacheMetadata.
-// Under kFullChargeCacheMetadata (the default) the slot table also counts
-// against capacity: 64 bytes per slot the table has grown to, 256 bytes
-// per shard at construction, growing with the entries, and shrinking back
-// once the shard is emptied (by EraseUnRefEntries, or by a capacity cut that
-// evicts every entry). A shard needs well over that much capacity to hold any
-// entry. Each shard reserves address space for max(2048, shard capacity / 64)
-// slots of 64 bytes up front, using max_capacity instead of capacity when it is
-// larger, and touches it as the table grows. On Linux the reservation does not
-// count against the commit limit unless vm.overcommit_memory=2; on Windows it
-// is committed up front. If it cannot be reserved, construction aborts, as for
-// HyperClockCache. The table cannot grow past its reservation, which holds
-// about one entry per 107 bytes of reserved capacity: once SetCapacity raises
-// capacity beyond that (about 38x for 4 KiB entries, with the default
-// max_capacity), new keys are also evicted by occupancy. Each shard also keeps
-// one cache line per thread that has used it (allocated 64 threads at a time,
-// for up to 8192 threads), which is not charged against capacity.
+// FIFOCache - A cache using S3-FIFO eviction to stay at or below a set
+// capacity. The cache is sharded to 2^num_shard_bits shards, by hash of the
+// key, and the total capacity is divided evenly among the shards. Each shard
+// is a hash table with two queues over its entries: new entries enter the
+// probation queue, a FIFO whose share is 12% of capacity, and an entry hit
+// at least twice by the time it reaches the head is promoted to the
+// resident queue instead of being evicted. The resident queue is a clock
+// over the table that keeps up to three hits per entry. Keys (not values)
+// recently evicted from probation are remembered, and inserting one again
+// puts it straight into the resident queue. Placement comes from hits
+// alone: Cache::Priority is ignored.
 //
-// Choosing num_shard_bits: hits take no lock, so more shards only spread
-// inserts (misses) over more locks, while fewer, larger shards share space
-// more evenly. In db_bench and cache_bench runs, the default (up to 64
-// shards) was best or tied from 256 MiB up; fewer shards were faster only
-// for a cache much smaller than its hot set, and very small shards were
-// slower. So keep the default unless the cache is much smaller than its hot
-// set.
+// The table is HyperClockCache's AutoHyperClockTable, and there is no shard
+// mutex: a lookup takes no lock, an insert links its entry without one, and
+// erasing or evicting an entry (for an insert too), or growing the table,
+// locks only the hash chains it rewrites.
+// Inserting a key the cache has replaces the old entry, and Insert returns
+// OkOverwritten; a pinned old entry stays, though lookups no longer find
+// it, until its last reference is released. (HyperClockCache keeps the old
+// entry instead and drops the new value.)
+//
+// Pinned entries are never evicted. Without strict_capacity_limit, an
+// insert's eviction gives up once it has passed 30 pinned entries for each
+// entry it freed, plus 30, and the insert takes usage over capacity, as in
+// HyperClockCache; later inserts evict back as eviction reaches unpinned
+// entries. Releasing the last reference to an entry doesn't erase it, even
+// over capacity, unless erase_if_last_ref is set. With
+// strict_capacity_limit, an insert that cannot make room fails with
+// MemoryLimit, or without a handle is dropped and returns OK, as if
+// inserted and evicted at once; either way an entry already cached under
+// the key stays. Under either limit, an insert whose charge would take
+// usage past half of size_t is refused the same way, and one whose key
+// can't be copied (see below) fails with MemoryLimit.
+//
+// Remembered keys take a 4-byte tag per slot of the table, at the slot the
+// key maps to, so a later victim mapping to the same slot replaces the tag.
+// Under kFullChargeCacheMetadata (the default) the table counts against
+// capacity: 72 bytes per slot the table has grown to (the 64-byte slot, its
+// probation word and its tag), starting at 64 slots per shard, or 4 for a
+// shard of 4 KiB or less, and growing with the entries; 16 bytes per cell
+// of the probation queue, which grows with the table; and for a key that
+// isn't 16 bytes long, 24 bytes plus the key, which is copied to the heap.
+// The table never shrinks. With strict_capacity_limit, the table grows only
+// if the slot fits within capacity beside the entry being inserted, and the
+// probation queue grows only if it fits within capacity, so after a
+// capacity cut below what the table already takes, the shard holds no
+// entries.
+//
+// Each shard reserves address space for max(2048, shard capacity / 64)
+// slots up front, using max_capacity instead of capacity when it is larger,
+// and touches it as the table grows. On Linux the reservation does not
+// count against the commit limit unless vm.overcommit_memory=2; on Windows
+// it is committed up front. If it cannot be reserved, construction aborts,
+// as for HyperClockCache. The table cannot grow past its reservation, which
+// holds about one entry per 107 bytes of reserved capacity: once
+// SetCapacity raises capacity beyond that (about 38x for 4 KiB entries,
+// with the default max_capacity), new keys are also evicted by occupancy.
 //
 // This is an opt-in implementation and not the default block cache. Besides
 // MakeSharedCache, a RocksDB built with this plugin creates one from
-// "fifo_cache://capacity=<n>;..." with the scalar fields below: as the whole
+// "fifo_cache://capacity=<n>;..." with the scalar fields below, as the whole
 // value given to Cache::CreateFromString with an empty result (e.g. db_bench
-// --cache_uri), or as the id of a block_cache option value (e.g.
-// block_cache={id={fifo_cache://capacity=1G;num_shard_bits=6}}).
-// memory_allocator and secondary_cache can only be set in C++.
+// --cache_uri). As the id of a block_cache option value, in an option
+// string or OPTIONS file, the URI carries a single option (e.g.
+// block_cache={id=fifo_cache://capacity=1G}). memory_allocator and
+// secondary_cache can only be set in C++.
 struct FIFOCacheOptions : public ShardedCacheOptions {
-  // Whether to use adaptive mutexes for cache shards. Note that adaptive
-  // mutexes need to be supported by the platform in order for this to have any
-  // effect. The default value is true if RocksDB is compiled with
-  // -DROCKSDB_DEFAULT_TO_ADAPTIVE_MUTEX, false otherwise.
+  // Ignored, as the cache has no mutex to configure. It is still accepted,
+  // true or false, so options that set it keep parsing.
   bool use_adaptive_mutex = kDefaultToAdaptiveMutex;
 
   // Capacity the slot table is reserved for, when larger than capacity (see
