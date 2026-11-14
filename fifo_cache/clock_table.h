@@ -722,8 +722,11 @@ class ProbationQueue {
   // still held by a pop.
   bool Push(uint64_t v);
   // Takes the oldest value. Returns false if there is none, or the oldest
-  // was claimed by a push that has not filled it yet.
-  bool Pop(uint64_t* v);
+  // was claimed by a push that has not filled it yet. Adds to *drained_cells
+  // the cells of each ring this call moves past, a closed ring every value
+  // of which has been taken: no push or pop takes from it again, so its
+  // cells are zeroed, and on Linux its whole pages go back to the OS.
+  bool Pop(uint64_t* v, size_t* drained_cells);
   // Takes the oldest value in the newest ring, even while older rings still
   // hold values. Returns false if that ring holds none, or its oldest was
   // claimed by a push that has not filled it yet. A ring added meanwhile
@@ -739,6 +742,9 @@ class ProbationQueue {
   bool TryAddRing(size_t capacity);
   // Cells in every ring added so far.
   size_t CellCount() const;
+  // Cells in the rings no pop has moved past: the ring pops take from, the
+  // newest, and any in between.
+  size_t LiveCellCount() const;
 
   // The start of the rings' mapping.
   const void* TEST_GetMapping() const { return cells_.Get(); }
@@ -763,6 +769,13 @@ class ProbationQueue {
   // Takes r's oldest value. Returns false if r holds none, or its oldest
   // was claimed by a push that has not filled it yet.
   static bool PopFromRing(Ring& r, uint64_t* v);
+  // Zeroes a ring pops have moved past, which a thread that loaded it
+  // earlier can still read. A zeroed cell reads to a pop as not yet pushed
+  // at every position. To a push it reads as free only at its position in
+  // the ring's first lap, where the push's claim fails against the closed
+  // enqueue position, and at any later position as not yet popped, after
+  // which the push checks for the close.
+  static void DropRing(const Ring& r);
 
   const NoReserveTypedMemMapping<Cell> cells_;
   const size_t max_ring_capacity_;

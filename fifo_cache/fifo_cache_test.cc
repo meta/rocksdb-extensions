@@ -1052,6 +1052,40 @@ TEST_F(FIFOCacheTest, StrictProbationRingOnlyWhenItFits) {
   EXPECT_LE(cache->GetUsage(), cache->GetCapacity());
 }
 
+// Once evictions have taken every entry of a ring older than the newest,
+// its cells stop being charged. Here 100 entries fill the first ring of 64
+// cells and part of the next, of 128. Evicting 64 of them empties the first
+// ring, and the pop for the 65th moves past it, taking its 64 cells (1 KiB)
+// out of usage along with the entries.
+TEST_F(FIFOCacheTest, DrainedProbationRingIsUncharged) {
+  std::shared_ptr<Cache> cache =
+      NewCache(1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  FIFOCache* fifo = Fifo(cache.get());
+  for (uint32_t i = 0; i < 100; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i)));
+  }
+  const size_t slots = cache->GetTableAddressCount();
+  ASSERT_EQ(slots * kSlotCharge + (64 + 128) * kQueueCellCharge,
+            fifo->TEST_GetMetadataCharge());
+  ASSERT_EQ(fifo->TEST_GetMetadataCharge() + 100, cache->GetUsage());
+
+  std::vector<std::string> evicted;
+  RecordEvictions(cache.get(), &evicted);
+  cache->SetCapacity(cache->GetUsage() - 64);
+  ASSERT_EQ(64, evicted.size());
+  EXPECT_EQ(slots * kSlotCharge + (64 + 128) * kQueueCellCharge,
+            fifo->TEST_GetMetadataCharge());
+  EXPECT_EQ(fifo->TEST_GetMetadataCharge() + 36, cache->GetUsage());
+
+  cache->SetCapacity(cache->GetUsage() - 1);
+  ASSERT_EQ(65, evicted.size());
+  EXPECT_EQ(K(64), evicted.back());
+  EXPECT_EQ(slots, cache->GetTableAddressCount());
+  EXPECT_EQ(slots * kSlotCharge + 128 * kQueueCellCharge,
+            fifo->TEST_GetMetadataCharge());
+  EXPECT_EQ(fifo->TEST_GetMetadataCharge() + 35, cache->GetUsage());
+}
+
 // Under strict_capacity_limit with the table charged, capacities from just
 // above the first table's charge (4 slots and a 4-cell ring) up keep
 // admitting new entries, with or without a handle, evicting for a slot
@@ -4333,12 +4367,17 @@ TEST_F(FIFOCacheTest, ProbationQueuePopNewestTakesFromTheNewestRing) {
   ASSERT_TRUE(q.Push(21));
   ASSERT_TRUE(q.PopNewest(&v));
   EXPECT_EQ(20, v);
+  size_t drained = 0;
   for (uint64_t want : {10, 11, 21}) {
-    ASSERT_TRUE(q.Pop(&v));
+    ASSERT_TRUE(q.Pop(&v, &drained));
     EXPECT_EQ(want, v);
   }
-  EXPECT_FALSE(q.Pop(&v));
+  // The pop of 21 moved past the first ring's 2 cells.
+  EXPECT_EQ(2, drained);
+  EXPECT_EQ(4, q.LiveCellCount());
+  EXPECT_FALSE(q.Pop(&v, &drained));
   EXPECT_FALSE(q.PopNewest(&v));
+  EXPECT_EQ(2, drained);
 }
 
 // A stale cell is skipped whatever its slot holds now. Here every key was
@@ -6252,18 +6291,23 @@ TEST_F(FIFOCacheTest, ProbationQueuePopClosesDrainedRing) {
   port::Thread add_thread([&] { EXPECT_TRUE(q.TryAddRing(4)); });
   adder.WaitParked();
   uint64_t v = 0;
-  EXPECT_TRUE(q.Pop(&v));
+  size_t drained = 0;
+  EXPECT_TRUE(q.Pop(&v, &drained));
   EXPECT_EQ(10, v);
-  EXPECT_FALSE(q.Pop(&v));
+  // Closes the first ring, moves past it and zeroes it, while the push
+  // still holds the position it loaded there.
+  EXPECT_FALSE(q.Pop(&v, &drained));
+  EXPECT_EQ(2, drained);
   pusher.Resume();
   push_thread.join();
   adder.Resume();
   add_thread.join();
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
-  ASSERT_TRUE(q.Pop(&v));
+  ASSERT_TRUE(q.Pop(&v, &drained));
   EXPECT_EQ(20, v);
-  EXPECT_FALSE(q.Pop(&v));
+  EXPECT_FALSE(q.Pop(&v, &drained));
+  EXPECT_EQ(2, drained);
 }
 
 // A pop doesn't move past a closed ring while a push to it has claimed a
@@ -6277,13 +6321,115 @@ TEST_F(FIFOCacheTest, ProbationQueuePopWaitsForPushInFlight) {
   pusher.WaitParked();
   EXPECT_TRUE(q.TryAddRing(4));
   uint64_t v = 0;
-  EXPECT_FALSE(q.Pop(&v));
+  size_t drained = 0;
+  EXPECT_FALSE(q.Pop(&v, &drained));
+  EXPECT_EQ(0, drained);
   pusher.Resume();
   push_thread.join();
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
-  ASSERT_TRUE(q.Pop(&v));
+  ASSERT_TRUE(q.Pop(&v, &drained));
   EXPECT_EQ(10, v);
+  // Taking 10 emptied the first ring, and the next pop moves past it.
+  EXPECT_EQ(0, drained);
+  EXPECT_FALSE(q.Pop(&v, &drained));
+  EXPECT_EQ(2, drained);
+}
+
+// A push that loaded a ring's enqueue position on a later lap, before the
+// ring was closed, drained and zeroed, reads its cell as not yet popped,
+// sees the close and goes to the newer ring instead of failing as if the
+// queue were full.
+TEST_F(FIFOCacheTest, ProbationQueuePushIntoZeroedRingMovesOn) {
+  fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 2,
+                               /*max_ring_capacity*/ 4);
+  uint64_t v = 0;
+  size_t drained = 0;
+  ASSERT_TRUE(q.Push(10));
+  ASSERT_TRUE(q.Push(11));
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  ASSERT_TRUE(q.Push(12));
+  Parker pusher("FIFOCache::ProbationQueue::Push:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  // Loads position 3, in the second lap.
+  port::Thread push_thread([&] { EXPECT_TRUE(q.Push(20)); });
+  pusher.WaitParked();
+  ASSERT_TRUE(q.TryAddRing(4));
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(12, v);
+  EXPECT_FALSE(q.Pop(&v, &drained));
+  EXPECT_EQ(2, drained);
+  pusher.Resume();
+  push_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(20, v);
+  EXPECT_EQ(2, drained);
+}
+
+// A pop that loaded the head before another pop moved past a drained ring
+// finds the ring empty and goes on to the newer one, and only the pop that
+// moved past it counts its cells.
+TEST_F(FIFOCacheTest, ProbationQueueRingDrainedOnceUnderRacingPops) {
+  fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 2,
+                               /*max_ring_capacity*/ 4);
+  uint64_t v = 0;
+  size_t drained = 0;
+  ASSERT_TRUE(q.Push(10));
+  ASSERT_TRUE(q.TryAddRing(4));
+  ASSERT_TRUE(q.Push(20));
+  ASSERT_TRUE(q.Push(21));
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  ASSERT_EQ(10, v);
+  Parker popper("FIFOCache::ProbationQueue::Pop:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  size_t parked_drained = 0;
+  uint64_t parked_v = 0;
+  port::Thread pop_thread(
+      [&] { EXPECT_TRUE(q.Pop(&parked_v, &parked_drained)); });
+  popper.WaitParked();
+  SyncPoint::GetInstance()->DisableProcessing();
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(20, v);
+  EXPECT_EQ(2, drained);
+  popper.Resume();
+  pop_thread.join();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(21, parked_v);
+  EXPECT_EQ(0, parked_drained);
+  EXPECT_EQ(4, q.LiveCellCount());
+}
+
+// A drained ring's cells read zero afterwards, and on Linux its whole pages
+// are dropped. The first ring here is 512 cells, 8 KiB.
+TEST_F(FIFOCacheTest, ProbationQueueDrainedRingIsZeroed) {
+  fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 512,
+                               /*max_ring_capacity*/ 1024);
+  uint64_t v = 0;
+  size_t drained = 0;
+  for (uint64_t i = 0; i < 512; ++i) {
+    ASSERT_TRUE(q.Push(1000 + i));
+  }
+  ASSERT_TRUE(q.TryAddRing(1024));
+  ASSERT_TRUE(q.Push(7));
+  for (uint64_t i = 0; i < 512; ++i) {
+    ASSERT_TRUE(q.Pop(&v, &drained));
+    ASSERT_EQ(1000 + i, v);
+  }
+  ASSERT_EQ(0, drained);
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(7, v);
+  EXPECT_EQ(512, drained);
+  const auto* cells =
+      static_cast<const fifo_cache::ProbationQueue::Cell*>(q.TEST_GetMapping());
+  for (size_t i = 0; i < 512; ++i) {
+    ASSERT_EQ(0, cells[i].seq.load()) << i;
+    ASSERT_EQ(0, cells[i].value.LoadRelaxed()) << i;
+  }
+  EXPECT_EQ(1024, q.LiveCellCount());
+  EXPECT_EQ(1536, q.CellCount());
 }
 
 // An insert that charges a probation ring evicts for the ring only, not

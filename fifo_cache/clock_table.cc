@@ -35,6 +35,11 @@
 #include <thread>
 #include <type_traits>
 
+#ifdef OS_LINUX
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "cache/cache_key.h"
 #include "cache/secondary_cache_adapter.h"
 #include "logging/logging.h"
@@ -1703,7 +1708,7 @@ size_t AutoHyperClockTable::GetTableSize() const {
 size_t AutoHyperClockTable::GetMetadataCharge() const {
   return GetTableSize() *
              (sizeof(HandleImpl) + 2 * sizeof(RelaxedAtomic<uint32_t>)) +
-         probation_.CellCount() * sizeof(ProbationQueue::Cell);
+         probation_.LiveCellCount() * sizeof(ProbationQueue::Cell);
 }
 
 size_t AutoHyperClockTable::GetOccupancyLimit() const {
@@ -3425,8 +3430,12 @@ bool ProbationQueue::Push(uint64_t v) {
         }
         // pos now holds the current enqueue position.
       } else if (dif < 0) {
-        // Full, or the pop of this cell's last value hasn't finished.
-        return false;
+        // Full, or the pop of this cell's last value hasn't finished, or
+        // the ring was closed, drained and zeroed since pos was loaded.
+        pos = r.enqueue.load(std::memory_order_acquire);
+        if ((pos & kClosed) == 0) {
+          return false;
+        }
       } else {
         pos = r.enqueue.load(std::memory_order_acquire);
       }
@@ -3466,9 +3475,10 @@ bool ProbationQueue::PopFromRing(Ring& r, uint64_t* v) {
   }
 }
 
-bool ProbationQueue::Pop(uint64_t* v) {
+bool ProbationQueue::Pop(uint64_t* v, size_t* drained_cells) {
   for (;;) {
     uint32_t h = head_.load(std::memory_order_acquire);
+    TEST_SYNC_POINT("FIFOCache::ProbationQueue::Pop:Loaded");
     Ring& r = rings_[h];
     if (PopFromRing(r, v)) {
       return true;
@@ -3487,8 +3497,39 @@ bool ProbationQueue::Pop(uint64_t* v) {
       return false;
     }
     // Every position pushed here has been taken: move on (or see that
-    // another thread did).
-    head_.compare_exchange_strong(h, h + 1, std::memory_order_acq_rel);
+    // another thread did). Only the thread that moves on drops the ring.
+    if (head_.compare_exchange_strong(h, h + 1, std::memory_order_acq_rel)) {
+      DropRing(r);
+      *drained_cells += static_cast<size_t>(r.mask + 1);
+    }
+  }
+}
+
+void ProbationQueue::DropRing(const Ring& r) {
+  Cell* const begin = r.cells;
+  Cell* const end = r.cells + r.mask + 1;
+  // The whole pages inside the ring, which no other ring shares.
+  Cell* dropped_begin = end;
+  Cell* dropped_end = end;
+#ifdef OS_LINUX
+  // Linux fills a dropped page of a private anonymous mapping with zeros on
+  // its next touch, and a read maps the shared zero page.
+  static const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+  const uintptr_t b =
+      (reinterpret_cast<uintptr_t>(begin) + page - 1) & ~(page - 1);
+  const uintptr_t e = reinterpret_cast<uintptr_t>(end) & ~(page - 1);
+  if (b < e && madvise(reinterpret_cast<void*>(b), e - b, MADV_DONTNEED) == 0) {
+    dropped_begin = reinterpret_cast<Cell*>(b);
+    dropped_end = reinterpret_cast<Cell*>(e);
+  }
+#endif
+  for (Cell* c = begin; c < end; ++c) {
+    if (c == dropped_begin) {
+      c = dropped_end - 1;
+      continue;
+    }
+    c->seq.store(0, std::memory_order_relaxed);
+    c->value.StoreRelaxed(0);
   }
 }
 
@@ -3529,6 +3570,11 @@ bool ProbationQueue::TryAddRing(size_t capacity) {
 size_t ProbationQueue::CellCount() const {
   const Ring& last = rings_[tail_.load(std::memory_order_acquire)];
   return static_cast<size_t>(last.cells - cells_.Get()) + last.mask + 1;
+}
+
+size_t ProbationQueue::LiveCellCount() const {
+  const Ring& first = rings_[head_.load(std::memory_order_acquire)];
+  return CellCount() - static_cast<size_t>(first.cells - cells_.Get());
 }
 
 size_t AutoHyperClockTable::ProbationRingCapacity(size_t occupancy_limit) {
@@ -3966,7 +4012,13 @@ void AutoHyperClockTable::DropInsertRefCount(HandleImpl& h,
 bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
                                         bool* promoted) {
   uint64_t v;
-  if (!probation_.Pop(&v)) {
+  size_t drained_cells = 0;
+  const bool popped = probation_.Pop(&v, &drained_cells);
+  if (drained_cells > 0) {
+    // Exactly once per ring, by the pop that moved past it.
+    UnchargeMetadata(drained_cells * sizeof(ProbationQueue::Cell));
+  }
+  if (!popped) {
     return false;
   }
   const size_t idx = static_cast<size_t>(v >> 32);

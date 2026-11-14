@@ -88,9 +88,11 @@ namespace ROCKSDB_NAMESPACE {
 // capacity: 72 bytes per slot the table has grown to (the 64-byte slot, its
 // probation word and its ghost cell), starting at 64 slots per shard, or 4 for
 // a shard of 4 KiB or less, and growing with the entries; 16 bytes per cell of
-// the probation queue, which grows with the table; and for a key that isn't 16
-// bytes long, 24 bytes plus the key, which is copied to the heap. The table
-// never shrinks. With strict_capacity_limit, the table grows only if the slot
+// the probation queue, which adds a larger ring as the table grows and stops
+// counting an older one, returning its whole pages to the OS on Linux, once
+// evictions have taken all it held; and for a key that isn't 16 bytes long,
+// 24 bytes plus the key, which is copied to the heap. The table never
+// shrinks. With strict_capacity_limit, the table grows only if the slot
 // fits within capacity beside the entry being inserted, and the probation queue
 // grows only if it fits within capacity, so after a capacity cut below what the
 // table already takes, the shard holds no entries.
