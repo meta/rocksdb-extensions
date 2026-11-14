@@ -2992,10 +2992,9 @@ TEST_F(FIFOCacheTest, ConcurrentReplacesAtOccupancyLimitKeepLifetimeExact) {
     EXPECT_EQ(0, cache->GetPinnedUsage());
     EXPECT_EQ(2 * 2048, cache->GetTableAddressCount());
     Keys(cache.get());
-    // Entries erased while an insert or a lookup held a reference it then
-    // dropped are left invisible for eviction to free, as in
-    // HyperClockCache, so occupancy can be above the visible count;
-    // EraseUnRefEntries frees them all.
+    // An entry whose last reference GetPinnedUsage drops after it is
+    // erased is left for a lookup or eviction to free, so occupancy can be
+    // above the visible count; EraseUnRefEntries frees them all.
     cache->EraseUnRefEntries();
     EXPECT_EQ(0, cache->GetOccupancyCount());
     EXPECT_EQ(0, LiveValues().load());
@@ -5425,14 +5424,19 @@ constexpr bool kLookupMaySkipNewest = false;
 #endif
 
 // Runs op on another thread, parks it the first time it reaches sync point
-// `point`, runs `meanwhile` here, then lets op finish.
+// `point` (with argument only_with_arg, if given), runs `meanwhile` here,
+// then lets op finish.
 void RunWhileParked(const std::string& point, const std::function<void()>& op,
-                    const std::function<void()>& meanwhile) {
+                    const std::function<void()>& meanwhile,
+                    const void* only_with_arg = nullptr) {
   std::promise<void> reached;
   std::promise<void> resume;
   std::shared_future<void> resumed = resume.get_future().share();
   std::atomic<bool> parked{false};
-  SyncPoint::GetInstance()->SetCallBack(point, [&](void*) {
+  SyncPoint::GetInstance()->SetCallBack(point, [&](void* arg) {
+    if (only_with_arg != nullptr && arg != only_with_arg) {
+      return;
+    }
     if (!parked.exchange(true)) {
       reached.set_value();
       resumed.wait();
@@ -5755,23 +5759,162 @@ TEST_F(FIFOCacheTest, HitWhileClockDropsInsertRefCount) {
   }
 }
 
+// Erasing an entry a handle holds only hides it, until the last reference
+// to it is dropped. Here the handle is released while Erase still holds the
+// reference its lookup took, so Erase drops the last one and frees the
+// entry.
+TEST_F(FIFOCacheTest, EraseFreesAnEntryWhoseLastReferenceItDrops) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10 * kU);
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(
+      cache->Insert(K("k"), new CountedValue(1), CountedHelper(), kU, &h));
+  RunWhileParked(
+      "FIFOCache::Erase:Marked", [&] { cache->Erase(K("k")); },
+      [&] { EXPECT_FALSE(cache->Release(h)); });
+  EXPECT_EQ(0, LiveValues().load());
+  EXPECT_EQ(0, cache->GetOccupancyCount());
+  EXPECT_EQ(0, cache->GetUsage());
+}
+
+// Likewise when an insert replaces an entry a handle holds, and the handle
+// is released while the insert still holds the old entry.
+TEST_F(FIFOCacheTest, ReplacingInsertFreesAnEntryWhoseLastReferenceItDrops) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10 * kU);
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(
+      cache->Insert(K("k"), new CountedValue(1), CountedHelper(), kU, &h));
+  RunWhileParked(
+      "FIFOCache::EraseReplaced:Marked",
+      [&] {
+        Status s =
+            cache->Insert(K("k"), new CountedValue(2), CountedHelper(), kU);
+        EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
+      },
+      [&] { EXPECT_FALSE(cache->Release(h)); });
+  EXPECT_EQ(1, LiveValues().load());
+  EXPECT_EQ(1, cache->GetOccupancyCount());
+  EXPECT_EQ(kU, cache->GetUsage());
+  h = cache->Lookup(K("k"));
+  ASSERT_NE(nullptr, h);
+  CheckCountedValue(cache.get(), h, 2);
+  cache->Release(h);
+}
+
+// GetPinnedUsage holds a reference to each entry while it reads it, and
+// drops it without freeing anything, so it can drop the last reference to
+// an erased entry, g here, and leave it in the table. The next lookup that
+// takes and drops a reference to g frees it, wherever on g's chain it does:
+// a lookup of g's key, which passes over it as hidden; a lookup of another
+// key with g's home, missing, which drops it at the end of the chain or on
+// reaching the next entry; and a lookup of a key behind g, found after the
+// first ten entries of the chain, where Lookup goes on with a full walk.
+// All keys have home 0, and the chain runs from the newest entry.
+TEST_F(FIFOCacheTest, LookupFreesAnErasedEntryWhoseLastReferenceItDrops) {
+  enum Case { kSameKey, kChainEnd, kNextEntry, kFoundBehind };
+  for (const Case c : {kSameKey, kChainEnd, kNextEntry, kFoundBehind}) {
+    SCOPED_TRACE(c);
+    std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 100);
+    // g, a missing key, an entry behind g, and nine ahead of g.
+    const std::vector<std::string> keys = KeysWithHomeZero(cache.get(), 12);
+    const std::string& g = keys[0];
+    const std::string& behind = keys[2];
+    size_t others = 0;
+    if (c == kNextEntry || c == kFoundBehind) {
+      ASSERT_OK(Insert(cache.get(), behind));
+      ++others;
+    }
+    Cache::Handle* h = nullptr;
+    ASSERT_OK(cache->Insert(g, new CountedValue(1), CountedHelper(), 1, &h));
+    if (c == kFoundBehind) {
+      for (size_t i = 3; i < 12; ++i) {
+        ASSERT_OK(Insert(cache.get(), keys[i]));
+        ++others;
+      }
+    }
+    cache->Erase(g);
+    RunWhileParked(
+        "FIFOCache::GetPinnedUsage:Held", [&] { cache->GetPinnedUsage(); },
+        [&] { EXPECT_FALSE(cache->Release(h)); }, h);
+    ASSERT_EQ(1, LiveValues().load());
+    ASSERT_EQ(others + 1, cache->GetOccupancyCount());
+    if (c == kFoundBehind) {
+      Cache::Handle* b = cache->Lookup(behind);
+      EXPECT_NE(nullptr, b);
+      cache->Release(b);
+    } else {
+      EXPECT_EQ(nullptr, cache->Lookup(c == kSameKey ? g : keys[1]));
+    }
+    EXPECT_EQ(0, LiveValues().load());
+    EXPECT_EQ(others, cache->GetOccupancyCount());
+    EXPECT_EQ(others, cache->GetUsage());
+  }
+}
+
+// A release that finds the entry hidden tries to free it after dropping its
+// reference, when another release may already have freed it and an insert
+// reused the slot. It frees only a hidden entry, so the new one stays.
+TEST_F(FIFOCacheTest, ReleaseOfAnErasedEntryKeepsTheEntryThatReusedItsSlot) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10 * kU);
+  Cache::Handle* h1 = nullptr;
+  ASSERT_OK(
+      cache->Insert(K("k"), new CountedValue(1), CountedHelper(), kU, &h1));
+  Cache::Handle* h2 = cache->Lookup(K("k"));
+  ASSERT_EQ(h1, h2);
+  cache->Erase(K("k"));
+  RunWhileParked(
+      "FIFOCache::Release:BeforeErase",
+      [&] { EXPECT_FALSE(cache->Release(h1)); },
+      [&] {
+        EXPECT_TRUE(cache->Release(h2));
+        ASSERT_EQ(0, LiveValues().load());
+        ASSERT_OK(
+            cache->Insert(K("k"), new CountedValue(2), CountedHelper(), kU));
+      });
+  EXPECT_EQ(1, LiveValues().load());
+  EXPECT_EQ(1, cache->GetOccupancyCount());
+  Cache::Handle* h = cache->Lookup(K("k"));
+  ASSERT_NE(nullptr, h);
+  CheckCountedValue(cache.get(), h, 2);
+  cache->Release(h);
+}
+
 // An entry erased while its insert still holds the reference it links the
-// entry with is left invisible with no references, as in HyperClockCache,
-// until a probation step frees it; being erased, it leaves no ghost.
-TEST_F(FIFOCacheTest, ErasedEntryFreedByEvictionLeavesNoGhost) {
+// entry with is freed when the insert drops that reference.
+TEST_F(FIFOCacheTest, ErasedEntryFreedByItsInsert) {
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 2);
-  FIFOCache* fifo = Fifo(cache.get());
   RunWhileParked(
       "FIFOCache::DoInsert:Linked",
       [&] { ASSERT_OK(Insert(cache.get(), K("k"))); },
       [&] { cache->Erase(K("k")); });
   EXPECT_FALSE(Holds(cache.get(), K("k")));
-  EXPECT_EQ(1, cache->GetUsage());
-  ASSERT_OK(Insert(cache.get(), K("a")));
-  ASSERT_OK(Insert(cache.get(), K("b")));
+  EXPECT_EQ(0, cache->GetUsage());
+  EXPECT_EQ(0, cache->GetOccupancyCount());
+}
+
+// An erased entry left with no references, as a scan's reference can leave
+// one (see LookupFreesAnErasedEntryWhoseLastReferenceItDrops), is freed by
+// the probation step that reaches it, and being erased, it leaves no
+// ghost. The three keys have homes of their own, so the inserts' lookups
+// don't pass over k.
+TEST_F(FIFOCacheTest, ErasedEntryFreedByEvictionLeavesNoGhost) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 2);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> keys = KeysWithOwnHomes(cache.get(), 3);
+  Cache::Handle* h = nullptr;
+  ASSERT_OK(Insert(cache.get(), keys[0], 1, &h));
+  cache->Erase(keys[0]);
+  RunWhileParked(
+      "FIFOCache::GetPinnedUsage:Held", [&] { cache->GetPinnedUsage(); },
+      [&] { EXPECT_FALSE(cache->Release(h)); }, h);
+  ASSERT_EQ(1, cache->GetUsage());
+  ASSERT_OK(Insert(cache.get(), keys[1]));
+  ASSERT_EQ(2, cache->GetUsage());
+  ASSERT_OK(Insert(cache.get(), keys[2]));
   EXPECT_EQ(2, cache->GetUsage());
-  EXPECT_TRUE(Holds(cache.get(), K("a")));
-  EXPECT_FALSE(fifo->TEST_InGhost(K("k")));
+  EXPECT_EQ(2, cache->GetOccupancyCount());
+  EXPECT_TRUE(Holds(cache.get(), keys[1]));
+  EXPECT_TRUE(Holds(cache.get(), keys[2]));
+  EXPECT_FALSE(fifo->TEST_InGhost(keys[0]));
 }
 
 // An insert whose entry is replaced by a newer insert of the key between
@@ -5800,11 +5943,11 @@ TEST_F(FIFOCacheTest, ReplacedInsertLeavesNewerEntry) {
   EXPECT_EQ(0, LiveValues().load());
 }
 
-// An insert whose new entry is erased after it erased the entry it
-// replaces, and before it takes over that entry's place, leaves it in
-// probation, where it waits, unreferenced and no longer found, for a
-// probation step or EraseUnRefEntries to free it, and the accounting
-// balances. Moving it to the resident queue would leave it to the clock.
+// An insert whose new entry is erased, while a lookup holds it, after the
+// insert erased the entry it replaces and before it takes over that entry's
+// place, leaves it in probation until the holder's release frees it, and
+// the accounting balances. In the resident queue, an entry erased this way
+// whose last reference a scan drops would wait for the resident clock.
 TEST_F(FIFOCacheTest, ReplacingEntryErasedBeforeItTakesThePlace) {
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 10);
   FIFOCache* fifo = Fifo(cache.get());
@@ -5817,23 +5960,28 @@ TEST_F(FIFOCacheTest, ReplacingEntryErasedBeforeItTakesThePlace) {
   ASSERT_OK(Insert(cache.get(), K("t")));
   ASSERT_FALSE(fifo->TEST_InProbation(K("k")));
   ASSERT_EQ(9, fifo->TEST_GetProbationUsage());
+  Cache::Handle* h = nullptr;
   RunWhileParked(
       "FIFOCache::DoInsert:BeforeInherit",
       [&] {
         Status s = Insert(cache.get(), K("k"));
         EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
       },
-      [&] { cache->Erase(K("k")); });
+      [&] {
+        h = cache->Lookup(K("k"));
+        ASSERT_NE(nullptr, h);
+        cache->Erase(K("k"));
+      });
   // The insert evicted K(1) for its charge and freed the old k. The new k,
   // erased before it could take the old one's place, stays in probation.
   EXPECT_FALSE(Contains(cache.get(), K("k")));
   EXPECT_EQ(9, fifo->TEST_GetProbationUsage());
   EXPECT_EQ(9, cache->GetUsage());
   EXPECT_EQ(9, cache->GetOccupancyCount());
-  cache->EraseUnRefEntries();
-  EXPECT_EQ(0, cache->GetUsage());
-  EXPECT_EQ(0, fifo->TEST_GetProbationUsage());
-  EXPECT_EQ(0, cache->GetOccupancyCount());
+  EXPECT_TRUE(cache->Release(h));
+  EXPECT_EQ(8, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(8, cache->GetUsage());
+  EXPECT_EQ(8, cache->GetOccupancyCount());
 }
 
 // An insert replacing two entries with its key, as when it races another

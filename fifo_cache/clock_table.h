@@ -1163,7 +1163,11 @@ class AutoHyperClockTable : public BaseClockTable {
   // Returns true if successful. Could fail if
   // * There are other references to the entry
   // * Some other thread has exclusive ownership or has freed it.
-  bool TryEraseHandle(HandleImpl* h, bool holding_ref, bool mark_invisible);
+  // FIFOCache: with only_if_invisible, only while the entry is still erased,
+  // for a caller that dropped its reference first: another thread can have
+  // freed the entry since, and an insert reused the slot.
+  bool TryEraseHandle(HandleImpl* h, bool holding_ref, bool mark_invisible,
+                      bool only_if_invisible = false);
 
   // Calculates the appropriate maximum table size, for creating the memory
   // mapping.

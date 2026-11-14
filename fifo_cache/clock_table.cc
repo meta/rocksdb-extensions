@@ -76,8 +76,10 @@ inline void MarkEmpty(ClockHandle& h) {
 // so it should not be marked as having been used.
 inline void Unref(const ClockHandle& h, uint32_t count = 1) {
   // Pretend we never took the reference
-  // WART: there's a tiny chance we release last ref to invisible
-  // entry here. If that happens, we let eviction take care of it.
+  // FIFOCache: only where the caller can't free the entry, in scans and on a
+  // mismatch in MatchAndRef. An erased entry whose last reference is dropped
+  // here is freed by the next lookup that takes and drops a reference to
+  // it, or by eviction.
   SlotMeta old_meta;
   h.meta.Apply(AcquireCounter::MinusTransformPromiseNoUnderflow(count),
                &old_meta);
@@ -1022,6 +1024,8 @@ size_t ClockCacheShard<Table>::GetPinnedUsage() const {
   size_t table_pinned_usage = 0;
   ConstApplyToEntriesRange(
       [&table_pinned_usage](const HandleImpl& h) {
+        TEST_SYNC_POINT_CALLBACK("FIFOCache::GetPinnedUsage:Held",
+                                 const_cast<HandleImpl*>(&h));
         SlotMeta meta = h.meta.LoadRelaxed();
         uint32_t refcount = meta.GetRefcount();
         // Holding one ref for ConstApplyToEntriesRange
@@ -2697,7 +2701,9 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
         word = TakeReplacedPlace(idx, word, replaced, proto.GetTotalCharge());
       }
       if (!take_ref) {
-        Unref(arr[idx]);
+        // Frees it if it was erased meanwhile and this was the last
+        // reference.
+        Release(arr + idx, /*useful=*/false, /*erase_if_last_ref=*/false);
       }
       // FIFOCache: queue it once it is linked and our reference is gone, so
       // a probation step sees it whole and not pinned by us. If it was
@@ -2755,6 +2761,13 @@ void AutoHyperClockTable::EvictOverCapacity(size_t up_to) {
 
 AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
     const UniqueId64x2& hashed_key, const Slice* key, const HandleImpl* skip) {
+  // FIFOCache: each reference this drops goes through Release (except
+  // MatchAndRef's on a mismatch), which frees an erased entry if that
+  // reference was its last, taking the chain's rewrite lock as any release
+  // of an erased entry does. Left for eviction, which a cache under its
+  // capacity and occupancy limit doesn't run, the erased copies of a key
+  // often replaced or erased would pile up in its chain.
+  //
   // Lookups are wait-free with low occurrence of retries, back-tracking,
   // and fallback. We do not have the benefit of holding a rewrite lock on
   // the chain so must be prepared for many kinds of mayhem, most notably
@@ -2833,7 +2846,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
             LIKELY(old_meta.IsVisible())) {
           return h;
         } else {
-          Unref(*h);
+          Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
         }
       } else {
         // For non-sharable states, incrementing the acquire counter has no
@@ -2891,7 +2904,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
         // to restart (TODO: improve in some cases?)
         h = nullptr;
         if (read_ref_on_chain) {
-          Unref(*read_ref_on_chain);
+          Release(read_ref_on_chain, /*useful=*/false,
+                  /*erase_if_last_ref=*/false);
           read_ref_on_chain = nullptr;
         }
         // Didn't make progress & retry
@@ -2916,7 +2930,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
         // Complete, clean iteration of the chain, not found.
         // Clean up.
         if (read_ref_on_chain) {
-          Unref(*read_ref_on_chain);
+          Release(read_ref_on_chain, /*useful=*/false,
+                  /*erase_if_last_ref=*/false);
         }
         return nullptr;
       } else {
@@ -2949,7 +2964,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
         // Release old read ref on chain if applicable
         if (read_ref_on_chain) {
           // Pretend we never took the reference.
-          Unref(*read_ref_on_chain);
+          Release(read_ref_on_chain, /*useful=*/false,
+                  /*erase_if_last_ref=*/false);
         }
         // Update the hit bit
         if (eviction_callback_) {
@@ -2968,13 +2984,14 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::Lookup(
         // NOTE: if we simply backtrack rather than continuing, we would
         // be in a wait loop (not allowed in Lookup!) until the other thread
         // finishes its Grow.
-        Unref(*h);
+        Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
       } else {
         // Correct home location, so we are on the right chain.
         // With new usable read ref, can release old one (if applicable).
         if (read_ref_on_chain) {
           // Pretend we never took the reference.
-          Unref(*read_ref_on_chain);
+          Release(read_ref_on_chain, /*useful=*/false,
+                  /*erase_if_last_ref=*/false);
         }
         // And keep the new one.
         read_ref_on_chain = h;
@@ -3000,7 +3017,8 @@ void AutoHyperClockTable::Remove(HandleImpl* h) {
 }
 
 bool AutoHyperClockTable::TryEraseHandle(HandleImpl* h, bool holding_ref,
-                                         bool mark_invisible) {
+                                         bool mark_invisible,
+                                         bool only_if_invisible) {
   SlotMeta meta = h->meta.Load();
   assert(!holding_ref || meta.IsShareable());
 
@@ -3021,10 +3039,15 @@ bool AutoHyperClockTable::TryEraseHandle(HandleImpl* h, bool holding_ref,
       // Someone else took ownership
       return false;
     }
+    if (only_if_invisible && meta.IsVisible()) {
+      // FIFOCache: freed since, and the slot reused by a new entry.
+      return false;
+    }
     // Note that if !holding_ref, there's a small chance that we release,
     // another thread replaces this entry with another, reaches zero refs, and
     // then we end up erasing that other entry. That's an acceptable risk /
-    // imprecision.
+    // imprecision. (FIFOCache: only_if_invisible rules it out where the
+    // entry was erased.)
   } while (!h->meta.CasWeak(meta, construction_meta));
   // Took ownership
   // TODO? Delay freeing?
@@ -3071,10 +3094,17 @@ bool AutoHyperClockTable::Release(HandleImpl* h, bool useful,
   // No underflow
   assert(old_meta.GetAcquireCounter() != old_meta.GetReleaseCounter());
 
-  if ((erase_if_last_ref || UNLIKELY(old_meta.IsInvisible()))) {
+  if (erase_if_last_ref) {
     // FIXME: There's a chance here that another thread could replace this
     // entry and we end up erasing the wrong one.
     return TryEraseHandle(h, /*holding_ref=*/false, /*mark_invisible=*/false);
+  } else if (UNLIKELY(old_meta.IsInvisible())) {
+    // FIFOCache: erased while referenced. Frees it if this was the last
+    // reference, and not a new entry in the slot if another release freed
+    // it first.
+    TEST_SYNC_POINT("FIFOCache::Release:BeforeErase");
+    return TryEraseHandle(h, /*holding_ref=*/false, /*mark_invisible=*/false,
+                          /*only_if_invisible=*/true);
   } else {
     return false;
   }
@@ -3101,8 +3131,11 @@ void AutoHyperClockTable::Erase(const UniqueId64x2& hashed_key,
         TryEraseHandle(h, /*holding_ref=*/true, /*mark_invisible=*/true);
     if (!gone) {
       // Only marked invisible, which is ok.
-      // Pretend we never took the reference from Lookup.
-      Unref(*h);
+      TEST_SYNC_POINT("FIFOCache::Erase:Marked");
+      // Pretend we never took the reference from Lookup. FIFOCache: unless
+      // the holders released theirs meanwhile, when this one is the last and
+      // frees the entry.
+      Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
     }
   }
 }
@@ -3121,7 +3154,7 @@ bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
   // replacing it, that erases the rest, which may include the newer entry.
   while (HandleImpl* h = Lookup(proto.hashed_key, key, keep)) {
     if (keep != nullptr && !keep->meta.Load().IsVisible()) {
-      Unref(*h);
+      Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
       break;
     }
     replaced = true;
@@ -3134,7 +3167,9 @@ bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
           std::max(replaced_entries->hits, HitsUnderRef(h));
     }
     if (!TryEraseHandle(h, /*holding_ref=*/true, /*mark_invisible=*/true)) {
-      Unref(*h);
+      TEST_SYNC_POINT("FIFOCache::EraseReplaced:Marked");
+      // As in Erase.
+      Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
     }
   }
   return replaced;
@@ -3817,9 +3852,11 @@ bool AutoHyperClockTable::LeaveProbation(size_t idx, uint32_t word,
 uint32_t AutoHyperClockTable::TakeReplacedPlace(size_t idx, uint32_t word,
                                                 const ReplacedEntries& replaced,
                                                 size_t total_charge) {
-  // Erased meanwhile: it stays in probation, where the next step to reach
-  // it frees it, rather than wait for the resident clock. (An erase right
-  // after this check leaves it to the clock, whose first visit frees it.)
+  // Erased meanwhile: whoever drops the last reference frees it. It stays in
+  // probation, so that if a scan drops that reference, the next step to
+  // reach it frees it, rather than the resident clock. (An erase right
+  // after this check can leave it to the clock, whose first visit frees
+  // it.)
   if (!array_[idx].meta.Load().IsVisible()) {
     return word;
   }
