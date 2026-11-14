@@ -39,6 +39,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// FIFOCache: in fifo_cache_options.h.
+struct FIFOCacheStats;
+
 namespace fifo_cache {
 
 // HyperClockCache is an alternative to LRUCache specifically tailored for
@@ -563,6 +566,13 @@ class BaseClockTable {
     size_t freed_charge = 0;
     size_t freed_count = 0;
     size_t seen_pinned_count = 0;
+    // FIFOCache: of freed_count, the entries freed from the probation
+    // queue; and the entries probation promoted.
+    size_t probation_freed_count = 0;
+    size_t promoted_count = 0;
+    // FIFOCache: whether Evict gave up at the effort cap, which its caller
+    // counts.
+    bool effort_cap_reached = false;
   };
 
   void TrackAndReleaseEvictedEntry(ClockHandle* h);
@@ -1029,6 +1039,9 @@ class AutoHyperClockTable : public BaseClockTable {
   // FIFOCache: kProbationPercent of capacity, rounded down.
   size_t ProbationTarget() const;
 
+  // FIFOCache: adds this table's probation usage and counts to *stats.
+  void AddStats(FIFOCacheStats* stats) const;
+
   // FIFOCache: what kFullChargeCacheMetadata charges for the table: its
   // slots, their probation words and ghost tags, and the probation queue's
   // rings.
@@ -1186,9 +1199,14 @@ class AutoHyperClockTable : public BaseClockTable {
   // queue if its probation word's identity is still word's. Returns whether
   // this call moved it.
   bool LeaveProbation(size_t idx, uint32_t word, size_t total_charge);
-  // LeaveProbation for a caller holding no reference to the entry: takes
-  // one to read its charge, unless the entry is already leaving the table.
+  // LeaveProbation for an entry the probation queue had no room to move to
+  // its tail, for a caller holding no reference to it: takes one to read its
+  // charge, unless the entry is already leaving the table. Counts it in
+  // probation_full_ if it moved it.
   void LeaveProbationUnowned(size_t idx, uint32_t word);
+  // Adds the evictions and promotions in data, from one Evict call, to the
+  // counts.
+  void CountEvictions(const EvictionData& data);
   // Runs fn(entry) holding a reference to the entry in slot idx, as Lookup
   // takes one, so its charge can be read, unless the slot is empty or under
   // (de)construction. Dropping the reference frees an entry erased
@@ -1276,6 +1294,14 @@ class AutoHyperClockTable : public BaseClockTable {
   // because racing updates can take it below zero for a moment; Evict reads
   // zero or less as an empty resident queue.
   RelaxedAtomic<int64_t> resident_count_{};
+
+  // FIFOCache: FIFOCacheStats' counts, on the cache line that inserts and
+  // evictions already write. The hit path counts nothing.
+  RelaxedAtomic<uint64_t> promotions_{};
+  RelaxedAtomic<uint64_t> ghost_returns_{};
+  RelaxedAtomic<uint64_t> probation_evictions_{};
+  RelaxedAtomic<uint64_t> resident_evictions_{};
+  RelaxedAtomic<uint64_t> probation_full_{};
 };  // class AutoHyperClockTable
 
 // A single shard of sharded cache.

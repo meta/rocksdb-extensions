@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +29,19 @@ class FIFOCache
  public:
   explicit FIFOCache(const FIFOCacheOptions& opts);
   const char* Name() const override { return "FIFOCache"; }
+
+  // The shards' FIFOCacheStats summed, as GetFIFOCacheStats returns them.
+  FIFOCacheStats GetStats() const;
+
+  // What HyperClockCache logs at DEBUG level, then GetStats at INFO level.
+  void ReportProblems(const std::shared_ptr<Logger>& info_log) const override;
+
+  // GetOptionsPtr(kSelfName) returns this FIFOCache. The adapter
+  // MakeSharedCache wraps it in for a secondary cache reports the same
+  // Name() and forwards this one name, so GetFIFOCacheStats finds the
+  // FIFOCache behind either without RTTI and never casts anything else.
+  static constexpr const char* kSelfName = "fifo_cache::FIFOCache";
+  const void* GetOptionsPtr(const std::string& name) const override;
 
   // Total charge of the entries in the probation queues, and of those last
   // seen pinned, which don't count toward probation's share.

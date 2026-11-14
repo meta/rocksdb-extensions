@@ -38,6 +38,7 @@
 #include "cache/cache_key.h"
 #include "cache/secondary_cache_adapter.h"
 #include "logging/logging.h"
+#include "plugin/fifo_cache/fifo_cache_options.h"
 #include "port/likely.h"
 #include "rocksdb/env.h"
 #include "test_util/sync_point.h"  // FIFOCache: the probation sync points
@@ -512,6 +513,9 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
     EvictionData data;
     static_cast<Table*>(this)->Evict(need_evict_charge,
                                      need_evict_for_occupancy, state, &data);
+    if (UNLIKELY(data.effort_cap_reached)) {
+      eviction_effort_exceeded_count_.FetchAddRelaxed(1);
+    }
     occupancy_.FetchSub(data.freed_count);
     if (LIKELY(data.freed_charge > need_evict_charge)) {
       assert(data.freed_count > 0);
@@ -585,6 +589,9 @@ inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
   if (need_evict_charge > 0 || UNLIKELY(need_evict_for_occupancy)) {
     static_cast<Table*>(this)->Evict(need_evict_charge,
                                      need_evict_for_occupancy, state, &data);
+    if (UNLIKELY(data.effort_cap_reached)) {
+      eviction_effort_exceeded_count_.FetchAddRelaxed(1);
+    }
     // Deal with potential occupancy deficit
     if (UNLIKELY(need_evict_for_occupancy) && data.freed_count == 0) {
       assert(data.freed_charge == 0);
@@ -2660,6 +2667,10 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
                                                head_next_with_shift)) {
       // Success
       TEST_SYNC_POINT("FIFOCache::DoInsert:Linked");
+      // FIFOCache: a ghost return counts once its entry is in the table.
+      if (state.ghost_hit) {
+        ghost_returns_.FetchAddRelaxed(1);
+      }
       // FIFOCache: replaces any other entry with the key, while our
       // reference keeps this one in the table.
       state.replaced = EraseReplaced(proto, arr + idx);
@@ -2671,8 +2682,9 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
       // removed meanwhile, the cell is stale and the step skips it.
       if (word & kInProbation) {
         TEST_SYNC_POINT("FIFOCache::DoInsert:BeforeProbationPush");
-        if (!ProbationPush(idx, word, state)) {
-          LeaveProbation(idx, word, proto.GetTotalCharge());
+        if (!ProbationPush(idx, word, state) &&
+            LeaveProbation(idx, word, proto.GetTotalCharge())) {
+          probation_full_.FetchAddRelaxed(1);
         }
       }
       return arr + idx;
@@ -2690,11 +2702,13 @@ void AutoHyperClockTable::EvictOverCapacity(size_t up_to) {
   size_t deficit = usage > capacity ? std::min(up_to, usage - capacity) : 0;
   const size_t pins_limit = 2 * occupancy_.LoadRelaxed();
   size_t pins_since_freed = 0;
+  bool effort_cap_reached = false;
   while (deficit > 0) {
     InsertState state;
     StartInsert(state);
     EvictionData data;
     Evict(deficit, /*need_entry=*/false, state, &data);
+    effort_cap_reached |= data.effort_cap_reached;
     occupancy_.FetchSub(data.freed_count);
     usage_.FetchSubRelaxed(data.freed_charge);
     if (data.freed_charge > 0) {
@@ -2709,6 +2723,11 @@ void AutoHyperClockTable::EvictOverCapacity(size_t up_to) {
         break;
       }
     }
+  }
+  // One effort cap stop for the cut, and only if it ends over capacity:
+  // the calls before the last that gave up at the cap were retried.
+  if (deficit > 0 && effort_cap_reached) {
+    eviction_effort_exceeded_count_.FetchAddRelaxed(1);
   }
 }
 
@@ -3119,6 +3138,15 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
                                 InsertState& state, EvictionData* data) {
   // precondition
   assert(requested_charge > 0 || need_entry);
+  // FIFOCache: each caller passes a fresh data, which this call's evictions
+  // and promotions are counted from once, on whichever return it takes.
+  assert(data->freed_count == 0 && data->probation_freed_count == 0 &&
+         data->promoted_count == 0 && !data->effort_cap_reached);
+  struct CountOnReturn {
+    AutoHyperClockTable& table;
+    const EvictionData& data;
+    ~CountOnReturn() { table.CountEvictions(data); }
+  } count_on_return{*this, *data};
 
   // We need the clock pointer to seemlessly "wrap around" at the end of the
   // table, and to be reasonably stable under Grow operations. This is
@@ -3203,7 +3231,8 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
         return;
       }
       if (IsEvictionEffortExceeded(*data)) {
-        eviction_effort_exceeded_count_.FetchAddRelaxed(1);
+        // FIFOCache: counted by the caller.
+        data->effort_cap_reached = true;
         return;
       }
       continue;
@@ -3278,7 +3307,8 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
     }
 
     if (IsEvictionEffortExceeded(*data)) {
-      eviction_effort_exceeded_count_.FetchAddRelaxed(1);
+      // FIFOCache: counted by the caller.
+      data->effort_cap_reached = true;
       return;
     }
   }
@@ -3737,7 +3767,9 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
       // word was read. Then the word no longer matches, LeaveProbation does
       // nothing, and the entry gets back the counts the reset took.
       *promoted = LeaveProbation(idx, word, h.total_charge);
-      if (!*promoted) {
+      if (*promoted) {
+        data->promoted_count += 1;
+      } else {
         h.meta.Apply(
             AcquireCounter::PlusTransformPromiseNoOverflow(acquire_count) +
             ReleaseCounter::PlusTransformPromiseNoOverflow(acquire_count));
@@ -3768,6 +3800,7 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
     TrackRemoval(idx, total_charge);
     data->freed_charge += total_charge;
     data->freed_count += 1;
+    data->probation_freed_count += 1;
     Remove(&h);
     TrackAndReleaseEvictedEntry(&h);
     return true;
@@ -3780,8 +3813,34 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
 }
 
 void AutoHyperClockTable::LeaveProbationUnowned(size_t idx, uint32_t word) {
-  WithReference(
-      idx, [&](HandleImpl& h) { LeaveProbation(idx, word, h.total_charge); });
+  WithReference(idx, [&](HandleImpl& h) {
+    if (LeaveProbation(idx, word, h.total_charge)) {
+      probation_full_.FetchAddRelaxed(1);
+    }
+  });
+}
+
+void AutoHyperClockTable::CountEvictions(const EvictionData& data) {
+  if (data.promoted_count > 0) {
+    promotions_.FetchAddRelaxed(data.promoted_count);
+  }
+  if (data.probation_freed_count > 0) {
+    probation_evictions_.FetchAddRelaxed(data.probation_freed_count);
+  }
+  if (data.freed_count > data.probation_freed_count) {
+    resident_evictions_.FetchAddRelaxed(data.freed_count -
+                                        data.probation_freed_count);
+  }
+}
+
+void AutoHyperClockTable::AddStats(FIFOCacheStats* stats) const {
+  stats->probation_usage += GetProbationUsage();
+  stats->promotions += promotions_.LoadRelaxed();
+  stats->ghost_returns += ghost_returns_.LoadRelaxed();
+  stats->probation_evictions += probation_evictions_.LoadRelaxed();
+  stats->resident_evictions += resident_evictions_.LoadRelaxed();
+  stats->effort_cap_stops += GetEvictionEffortExceededCount();
+  stats->probation_full += probation_full_.LoadRelaxed();
 }
 
 size_t AutoHyperClockTable::CalcMaxUsableLength(size_t reserved_capacity) {

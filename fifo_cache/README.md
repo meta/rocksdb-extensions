@@ -158,6 +158,38 @@ configure output. On Debian and Ubuntu, CMake installs the library under
 `FIFOCacheOptions` derives from `ShardedCacheOptions`, so `memory_allocator`
 and `secondary_cache` can be set here as well.
 
+### Monitoring
+
+RocksDB's statistics cover FIFOCache as they cover any block cache: the
+`BLOCK_CACHE_*` tickers count hits, misses and adds, and the
+`rocksdb.block-cache-usage`, `rocksdb.block-cache-pinned-usage` and
+`rocksdb.block-cache-entry-stats` properties give usage and entries. What
+only FIFOCache has, the state of its queues, comes from `GetFIFOCacheStats`,
+which also finds the cache behind the secondary-cache adapter that
+`MakeSharedCache` adds:
+
+```cpp
+rocksdb::FIFOCacheStats stats;
+if (rocksdb::GetFIFOCacheStats(*table_options.block_cache, &stats)) {
+  // stats.probation_usage, promotions, ghost_returns, probation_evictions,
+  // resident_evictions, effort_cap_stops, probation_full
+}
+```
+
+Apart from `probation_usage`, the fields count from the cache's creation, so
+export them as counters and watch their rates. The DB's `LOG` gets the same
+numbers at INFO level at each stats dump (`stats_dump_period_sec`), on a line
+starting `FIFOCache stats:`. `ghost_returns` against `probation_evictions` is
+the share of probation's victims that came back while their keys were
+remembered; with a secondary cache, the placeholders its adapter inserts
+are among the victims but never remembered, which lowers the share. A
+rising `effort_cap_stops` means inserts and capacity cuts are finding mostly
+pinned entries and leaving usage over capacity, so look at what holds
+handles (`rocksdb.block-cache-pinned-usage`). A rising `probation_full` means
+entries are skipping probation, either because entries erased while queued
+have filled its queue or, with `strict_capacity_limit`, because the queue
+can't grow within capacity.
+
 ## Limitations
 
 - RocksDB has to be built from source with the plugin; there is no
@@ -187,7 +219,8 @@ and `secondary_cache` can be set here as well.
 
 [`fifo_cache_test.cc`](fifo_cache_test.cc) covers the eviction policy and the
 ghost, replacing inserts, keys of any length, capacity and table
-accounting, pinning, concurrent use of the table and the option strings. Tests that steer
+accounting, pinning, concurrent use of the table, the counters and the option
+strings. Tests that steer
 interleavings with sync points run only in builds without `NDEBUG`. From the
 RocksDB tree with the plugin in place:
 

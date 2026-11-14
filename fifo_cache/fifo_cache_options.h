@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <utility>
 
@@ -28,7 +29,9 @@ namespace ROCKSDB_NAMESPACE {
 // over the table that keeps up to three hits per entry. Keys (not values)
 // recently evicted from probation are remembered, and inserting one again
 // puts it straight into the resident queue. Placement comes from hits
-// alone: Cache::Priority is ignored.
+// alone: Cache::Priority is ignored. GetFIFOCacheStats (below) reports
+// what the queues did, and Cache::ReportProblems, which RocksDB calls at
+// each stats dump, logs the same at INFO level.
 //
 // The table is HyperClockCache's AutoHyperClockTable, and there is no shard
 // mutex: a lookup takes no lock, an insert links its entry without one, and
@@ -112,5 +115,51 @@ struct FIFOCacheOptions : public ShardedCacheOptions {
   // Construct an instance of FIFOCache using these options
   std::shared_ptr<Cache> MakeSharedCache() const;
 };
+
+// A FIFOCache's S3-FIFO state, summed over its shards: probation's usage
+// now, and counts since the cache was created. RocksDB reports the rest for
+// any cache: hits, misses and adds per block role in the BLOCK_CACHE_*
+// tickers, usage, pinned usage, capacity and entries per role in the
+// rocksdb.block-cache-* properties, and Cache::GetOccupancyCount.
+struct FIFOCacheStats {
+  // Charge of the entries in the probation queues.
+  size_t probation_usage = 0;
+  // Entries promoted from the head of a probation queue to the resident
+  // queue, having been hit at least twice.
+  uint64_t promotions = 0;
+  // Inserts of a key remembered from a probation eviction, whose entries
+  // went straight into the resident queue. Against probation_evictions it
+  // shows how many of probation's victims came back while remembered
+  // (the placeholders CacheWithSecondaryAdapter inserts count among those
+  // victims, but are never remembered).
+  uint64_t ghost_returns = 0;
+  // Entries eviction removed from the probation queues and from the
+  // resident queue, for an insert or a capacity cut. Entries erased,
+  // replaced or removed by EraseUnRefEntries are not counted, except for
+  // one erased while pinned that eviction reaches as its last reference is
+  // released, before the release frees it.
+  uint64_t probation_evictions = 0;
+  uint64_t resident_evictions = 0;
+  // Times eviction gave up at the effort cap (see above) having freed less
+  // than it needed: once per insert whose eviction did, after which the
+  // insert takes usage over capacity (or, if it needed a slot the table
+  // didn't have, goes standalone or is dropped), and once per capacity cut
+  // that ends over the new capacity having given up at the cap. Never under
+  // strict_capacity_limit.
+  uint64_t effort_cap_stops = 0;
+  // Entries that went to the resident queue, on insert or on being moved
+  // to the tail of probation (as a pinned head is), because the probation
+  // queue was full: of the cells of entries erased while queued, which stay
+  // until eviction reaches them, or, under strict_capacity_limit, because
+  // growing the queue with the table didn't fit within capacity.
+  uint64_t probation_full = 0;
+};
+
+// Sets *stats to the FIFOCacheStats of the FIFOCache that cache is, or that
+// MakeSharedCache wrapped for a secondary cache. Other threads keep
+// counting while the shards are read, so the counts need not agree with
+// each other at one instant. Returns false and leaves *stats unchanged for
+// any other cache, a FIFOCache wrapped some other way included.
+bool GetFIFOCacheStats(const Cache& cache, FIFOCacheStats* stats);
 
 }  // namespace ROCKSDB_NAMESPACE

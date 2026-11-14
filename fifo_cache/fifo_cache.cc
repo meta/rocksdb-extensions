@@ -5,11 +5,14 @@
 
 #include "plugin/fifo_cache/fifo_cache.h"
 
+#include <cinttypes>
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "cache/secondary_cache_adapter.h"
+#include "logging/logging.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace fifo_cache {
@@ -69,6 +72,33 @@ size_t FIFOCache::TEST_GetMetadataCharge() const {
       [](Shard& shard) { return shard.GetTable().GetMetadataCharge(); });
 }
 
+FIFOCacheStats FIFOCache::GetStats() const {
+  FIFOCacheStats stats;
+  ForEachShard(
+      [&stats](const Shard* shard) { shard->GetTable().AddStats(&stats); });
+  return stats;
+}
+
+void FIFOCache::ReportProblems(const std::shared_ptr<Logger>& info_log) const {
+  AutoHyperClockCache::ReportProblems(info_log);
+  const FIFOCacheStats stats = GetStats();
+  ROCKS_LOG_INFO(info_log,
+                 "FIFOCache stats: probation usage %zu, promotions %" PRIu64
+                 ", ghost returns %" PRIu64 ", probation evictions %" PRIu64
+                 ", resident evictions %" PRIu64 ", effort cap stops %" PRIu64
+                 ", probation full %" PRIu64,
+                 stats.probation_usage, stats.promotions, stats.ghost_returns,
+                 stats.probation_evictions, stats.resident_evictions,
+                 stats.effort_cap_stops, stats.probation_full);
+}
+
+const void* FIFOCache::GetOptionsPtr(const std::string& name) const {
+  if (name == kSelfName) {
+    return this;
+  }
+  return AutoHyperClockCache::GetOptionsPtr(name);
+}
+
 std::vector<const void*> FIFOCache::TEST_GetMappings() const {
   std::vector<const void*> mappings;
   ForEachShard([&mappings](const Shard* shard) {
@@ -114,13 +144,40 @@ FIFOCacheOptionsTypeInfo() {
   return type_info;
 }
 
+bool GetFIFOCacheStats(const Cache& cache, FIFOCacheStats* stats) {
+  const auto* fifo =
+      static_cast<const FIFOCache*>(cache.GetOptionsPtr(FIFOCache::kSelfName));
+  if (fifo == nullptr) {
+    return false;
+  }
+  *stats = fifo->GetStats();
+  return true;
+}
+
+namespace {
+// CacheWithSecondaryAdapter reports its target's Name(), so a FIFOCache
+// wrapped in it looks like a bare one. This adapter also forwards
+// FIFOCache's GetOptionsPtr entry, so GetFIFOCacheStats finds the FIFOCache
+// behind it.
+class FIFOCacheSecondaryAdapter : public CacheWithSecondaryAdapter {
+ public:
+  using CacheWithSecondaryAdapter::CacheWithSecondaryAdapter;
+  const void* GetOptionsPtr(const std::string& name) const override {
+    if (name == FIFOCache::kSelfName) {
+      return target_->GetOptionsPtr(name);
+    }
+    return CacheWithSecondaryAdapter::GetOptionsPtr(name);
+  }
+};
+}  // namespace
+
 std::shared_ptr<Cache> FIFOCacheOptions::MakeSharedCache() const {
   if (num_shard_bits >= 20) {
     return nullptr;  // The cache cannot be sharded into too many fine pieces.
   }
   std::shared_ptr<Cache> cache = std::make_shared<FIFOCache>(*this);
   if (secondary_cache) {
-    cache = std::make_shared<CacheWithSecondaryAdapter>(cache, secondary_cache);
+    cache = std::make_shared<FIFOCacheSecondaryAdapter>(cache, secondary_cache);
   }
   return cache;
 }
