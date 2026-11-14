@@ -123,8 +123,9 @@ a string:
     --benchmarks=fillseq,readrandom --compression_type=none
   ```
 
-The string options are `capacity` (required, non-zero), `num_shard_bits`
-(below 20; by default chosen from the capacity), `strict_capacity_limit`,
+The string options are `capacity` (required, non-zero), `num_shard_bits` (below
+20; by default the most shards, up to 64 and a power of two, that leave each
+shard 4 MiB or more, and one shard under 8 MiB), `strict_capacity_limit`,
 `metadata_charge_policy` (`kFullChargeCacheMetadata` or
 `kDontChargeCacheMetadata`), `hash_seed`, `use_adaptive_mutex` (accepted and
 ignored) and `max_capacity`. A bad or unknown option fails with `InvalidArgument`.

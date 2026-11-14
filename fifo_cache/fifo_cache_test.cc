@@ -344,28 +344,72 @@ TEST_F(FIFOCacheTest, MakeSharedCacheValidation) {
                        kDefaultToAdaptiveMutex,
                        kDefaultCacheMetadataChargePolicy);
   EXPECT_EQ(nullptr, bad.MakeSharedCache());
+}
 
-  // num_shard_bits left negative picks RocksDB's default for the capacity,
-  // from MakeSharedCache and from the option string alike.
-  for (size_t capacity : {size_t{1} << 20, size_t{64} << 20}) {
-    FIFOCacheOptions dflt(capacity, /*num_shard_bits*/ -1,
+// num_shard_bits left negative gives the largest power of two of shards, up
+// to 64, that keeps each shard at 4 MiB or more, or one shard below 8 MiB, in
+// MakeSharedCache, the option string and the constructor alike. One byte
+// below each boundary keeps the smaller count.
+TEST_F(FIFOCacheTest, DefaultShardBitsKeepShardsAtLeast4MiB) {
+  constexpr size_t kMiB = size_t{1} << 20;
+  struct Case {
+    size_t capacity;
+    int bits;
+  };
+  for (const Case& c : std::vector<Case>{{1 * kMiB, 0},
+                                         {8 * kMiB - 1, 0},
+                                         {8 * kMiB, 1},
+                                         {16 * kMiB - 1, 1},
+                                         {16 * kMiB, 2},
+                                         {32 * kMiB - 1, 2},
+                                         {32 * kMiB, 3},
+                                         {64 * kMiB - 1, 3},
+                                         {64 * kMiB, 4},
+                                         {128 * kMiB - 1, 4},
+                                         {128 * kMiB, 5},
+                                         {256 * kMiB - 1, 5},
+                                         {256 * kMiB, 6},
+                                         {512 * kMiB, 6}}) {
+    SCOPED_TRACE(std::to_string(c.capacity));
+    FIFOCacheOptions dflt(c.capacity, /*num_shard_bits*/ -1,
                           /*strict_capacity_limit*/ false, nullptr,
                           kDefaultToAdaptiveMutex,
                           kDefaultCacheMetadataChargePolicy);
+    // One cache at a time, so the largest reserves only once.
     std::shared_ptr<Cache> cache = dflt.MakeSharedCache();
     ASSERT_NE(nullptr, cache);
-    auto* fifo = static_cast<FIFOCache*>(cache.get());
-    EXPECT_EQ(GetDefaultCacheShardBits(capacity), fifo->GetNumShardBits());
-    std::shared_ptr<Cache> from_string;
-    ASSERT_OK(Cache::CreateFromString(
-        ConfigOptions(), "fifo_cache://capacity=" + std::to_string(capacity),
-        &from_string));
-    EXPECT_EQ(GetDefaultCacheShardBits(capacity),
-              static_cast<FIFOCache*>(from_string.get())->GetNumShardBits());
-    FIFOCache direct(dflt);
-    EXPECT_EQ(GetDefaultCacheShardBits(capacity), direct.GetNumShardBits());
+    EXPECT_EQ(c.bits, static_cast<FIFOCache*>(cache.get())->GetNumShardBits());
     EXPECT_OK(Insert(cache.get(), K("a")));
     EXPECT_TRUE(Contains(cache.get(), K("a")));
+    cache.reset();
+    ASSERT_OK(Cache::CreateFromString(
+        ConfigOptions(), "fifo_cache://capacity=" + std::to_string(c.capacity),
+        &cache));
+    EXPECT_EQ(c.bits, static_cast<FIFOCache*>(cache.get())->GetNumShardBits());
+    cache.reset();
+    EXPECT_EQ(c.bits, FIFOCache(dflt).GetNumShardBits());
+  }
+
+  // An explicit num_shard_bits wins, above or below the default, zero
+  // included, in all three.
+  for (const Case& c :
+       std::vector<Case>{{64 * kMiB, 0}, {64 * kMiB, 6}, {1 * kMiB, 6}}) {
+    SCOPED_TRACE(std::to_string(c.capacity) + " " + std::to_string(c.bits));
+    FIFOCacheOptions opts(c.capacity, c.bits, /*strict_capacity_limit*/ false,
+                          nullptr, kDefaultToAdaptiveMutex,
+                          kDefaultCacheMetadataChargePolicy);
+    std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+    ASSERT_NE(nullptr, cache);
+    EXPECT_EQ(c.bits, static_cast<FIFOCache*>(cache.get())->GetNumShardBits());
+    std::shared_ptr<Cache> from_string;
+    ASSERT_OK(Cache::CreateFromString(
+        ConfigOptions(),
+        "fifo_cache://capacity=" + std::to_string(c.capacity) +
+            ";num_shard_bits=" + std::to_string(c.bits),
+        &from_string));
+    EXPECT_EQ(c.bits,
+              static_cast<FIFOCache*>(from_string.get())->GetNumShardBits());
+    EXPECT_EQ(c.bits, FIFOCache(opts).GetNumShardBits());
   }
 }
 

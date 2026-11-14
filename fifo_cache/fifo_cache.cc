@@ -18,16 +18,21 @@ namespace ROCKSDB_NAMESPACE {
 namespace fifo_cache {
 
 namespace {
+// A negative num_shard_bits gives each shard at least this much, or one
+// shard for a smaller cache (fifo_cache_options.h says why 4 MiB).
+constexpr size_t kMinShardSize = size_t{4} << 20;
+
 // The table's options. The slice assignment sets every ShardedCacheOptions
 // field, capacity included; estimated_entry_charge keeps its default of 0,
 // which AutoHyperClockTable requires. use_adaptive_mutex has nothing to
 // configure, and max_capacity goes to the cache's constructor beside these.
-// num_shard_bits left negative takes RocksDB's default for the capacity.
+// num_shard_bits left negative gets shards of at least kMinShardSize.
 HyperClockCacheOptions TableOptions(const FIFOCacheOptions& opts) {
   HyperClockCacheOptions table_opts(/*capacity*/ 0);
   static_cast<ShardedCacheOptions&>(table_opts) = opts;
   if (table_opts.num_shard_bits < 0) {
-    table_opts.num_shard_bits = GetDefaultCacheShardBits(table_opts.capacity);
+    table_opts.num_shard_bits =
+        GetDefaultCacheShardBits(table_opts.capacity, kMinShardSize);
   }
   return table_opts;
 }

@@ -33,6 +33,20 @@ namespace ROCKSDB_NAMESPACE {
 // what the queues did, and Cache::ReportProblems, which RocksDB calls at
 // each stats dump, logs the same at INFO level.
 //
+// A negative num_shard_bits (the default) gives each shard at least 4 MiB, up
+// to 64 shards, so a cache under 8 MiB has one. LRUCache defaults to 512 KiB
+// shards, but small shards cost hits and, with no shard mutex, the extra shards
+// don't buy throughput: over 15 db_bench workloads with caches of 1% to 30% of
+// the data, 4 MiB shards missed 14% less than 512 KiB ones on average (41% less
+// at most), and cache_bench at 16 and 64 MiB with 16 and 64 threads ran at
+// -3.7% to +5.8% of 512 KiB shards' median ops/sec, inside the run-to-run
+// spread. HyperClockCache's 32 MiB minimum missed 0.8% less than 4 MiB on
+// average, nearly all of it where a 9 MiB cache had one shard instead of two,
+// but one shard of 16 MiB did 4% fewer ops/sec than four at 64 threads. The
+// count is set when the cache is built, from capacity and not max_capacity, and
+// SetCapacity keeps it, so for a cache that will run well above its starting
+// capacity, set num_shard_bits for the capacity it will mostly run at.
+//
 // The table is HyperClockCache's AutoHyperClockTable, and there is no shard
 // mutex: a lookup takes no lock, an insert links its entry without one, and
 // erasing or evicting an entry (for an insert too), or growing the table,
