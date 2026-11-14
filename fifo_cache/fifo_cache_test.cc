@@ -80,9 +80,9 @@ constexpr size_t kHeapKeyHeader = sizeof(void*) + 2 * sizeof(size_t);
 
 // Under kFullChargeCacheMetadata each slot the table has grown to is
 // charged 64 bytes for itself, 4 for its probation word and 4 for its ghost
-// tag, and each cell of the probation queue's rings 16.
+// tag, and each cell of the probation queue's rings 8.
 constexpr size_t kSlotCharge = 64 + 4 + 4;
-constexpr size_t kQueueCellCharge = 16;
+constexpr size_t kQueueCellCharge = 8;
 
 // A charge unit for tests that count capacity in entries: 100 units of
 // capacity hold 100 entries of one unit, far below the table's 1639 at its
@@ -1023,7 +1023,7 @@ TEST_F(FIFOCacheTest, StrictMetadataNotChargedOverCapacity) {
 // Under strict_capacity_limit with the table charged, the probation queue
 // adds a ring only when it fits; until then an entry that finds the ring
 // full goes to the resident queue. Here 64 entries fill the first ring of
-// 64 cells, and the next ring has 128 (2 KiB).
+// 64 cells, and the next ring has 128 (1 KiB).
 TEST_F(FIFOCacheTest, StrictProbationRingOnlyWhenItFits) {
   std::shared_ptr<Cache> cache =
       NewCache(1 << 20, /*strict*/ true, kFullChargeCacheMetadata);
@@ -1055,7 +1055,7 @@ TEST_F(FIFOCacheTest, StrictProbationRingOnlyWhenItFits) {
 // Once evictions have taken every entry of a ring older than the newest,
 // its cells stop being charged. Here 100 entries fill the first ring of 64
 // cells and part of the next, of 128. Evicting 64 of them empties the first
-// ring, and the pop for the 65th moves past it, taking its 64 cells (1 KiB)
+// ring, and the pop for the 65th moves past it, taking its 64 cells (512 B)
 // out of usage along with the entries.
 TEST_F(FIFOCacheTest, DrainedProbationRingIsUncharged) {
   std::shared_ptr<Cache> cache =
@@ -6402,8 +6402,169 @@ TEST_F(FIFOCacheTest, ProbationQueueRingDrainedOnceUnderRacingPops) {
   EXPECT_EQ(4, q.LiveCellCount());
 }
 
+// A push whose position another push took meanwhile finds the cell filled,
+// rereads the position and pushes at the next one.
+TEST_F(FIFOCacheTest, ProbationQueuePushWhosePositionWasTakenTakesTheNext) {
+  fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 2,
+                               /*max_ring_capacity*/ 4);
+  Parker pusher("FIFOCache::ProbationQueue::Push:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  port::Thread push_thread([&] { EXPECT_TRUE(q.Push(20)); });
+  pusher.WaitParked();
+  ASSERT_TRUE(q.Push(10));
+  pusher.Resume();
+  push_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  uint64_t v = 0;
+  size_t drained = 0;
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(10, v);
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(20, v);
+  EXPECT_FALSE(q.Pop(&v, &drained));
+}
+
+// A pop whose position another pop took meanwhile finds the cell emptied,
+// rereads the position and takes the next value.
+TEST_F(FIFOCacheTest, ProbationQueuePopWhosePositionWasTakenTakesTheNext) {
+  fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 2,
+                               /*max_ring_capacity*/ 4);
+  ASSERT_TRUE(q.Push(10));
+  ASSERT_TRUE(q.Push(11));
+  Parker popper("FIFOCache::ProbationQueue::PopFromRing:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  uint64_t parked_v = 0;
+  size_t parked_drained = 0;
+  port::Thread pop_thread(
+      [&] { EXPECT_TRUE(q.Pop(&parked_v, &parked_drained)); });
+  popper.WaitParked();
+  uint64_t v = 0;
+  size_t drained = 0;
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(10, v);
+  popper.Resume();
+  pop_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(11, parked_v);
+  EXPECT_FALSE(q.Pop(&v, &drained));
+}
+
+// A cell claimed by a push a lap ago and not yet filled is not free for the
+// push a lap later: the ring of 2 is full.
+TEST_F(FIFOCacheTest, ProbationQueueCellClaimedALapBehindIsNotFree) {
+  fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 2,
+                               /*max_ring_capacity*/ 4);
+  Parker pusher("FIFOCache::ProbationQueue::Push:Claimed");
+  SyncPoint::GetInstance()->EnableProcessing();
+  // Claims position 0 and stops before filling it.
+  port::Thread push_thread([&] { EXPECT_TRUE(q.Push(10)); });
+  pusher.WaitParked();
+  ASSERT_TRUE(q.Push(11));
+  // Position 2 is the same cell as 0, a lap later.
+  EXPECT_FALSE(q.Push(12));
+  pusher.Resume();
+  push_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  uint64_t v = 0;
+  size_t drained = 0;
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(10, v);
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(11, v);
+  EXPECT_FALSE(q.Pop(&v, &drained));
+}
+
+// A cell whose value a pop has claimed and not yet emptied holds nothing
+// for the pop a lap later, and is no room for the push a lap later.
+TEST_F(FIFOCacheTest, ProbationQueueCellPoppedALapBehindIsNotFilled) {
+  fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 2,
+                               /*max_ring_capacity*/ 4);
+  ASSERT_TRUE(q.Push(10));
+  ASSERT_TRUE(q.Push(11));
+  Parker popper("FIFOCache::ProbationQueue::PopFromRing:Claimed");
+  SyncPoint::GetInstance()->EnableProcessing();
+  uint64_t parked_v = 0;
+  size_t parked_drained = 0;
+  // Claims position 0 and stops before emptying its cell.
+  port::Thread pop_thread(
+      [&] { EXPECT_TRUE(q.Pop(&parked_v, &parked_drained)); });
+  popper.WaitParked();
+  uint64_t v = 0;
+  size_t drained = 0;
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(11, v);
+  // Position 2 is the same cell as 0, a lap later.
+  EXPECT_FALSE(q.Pop(&v, &drained));
+  EXPECT_FALSE(q.Push(12));
+  popper.Resume();
+  pop_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(10, parked_v);
+  ASSERT_TRUE(q.Push(12));
+  ASSERT_TRUE(q.Pop(&v, &drained));
+  EXPECT_EQ(12, v);
+  EXPECT_FALSE(q.Pop(&v, &drained));
+}
+
+// The phase repeats every two laps. A push that loaded position 0 and
+// resumes two laps later finds the cell empty at the phase it wants, and
+// its claim fails against the moved position, so it pushes at the current
+// one; a pop that loaded position 0 finds the cell filled at the phase it
+// wants, and likewise takes the value at the current position.
+TEST_F(FIFOCacheTest, ProbationQueueClaimTwoLapsLateTakesTheCurrentPosition) {
+  for (const bool parks_push : {true, false}) {
+    SCOPED_TRACE(parks_push ? "push" : "pop");
+    fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 2,
+                                 /*max_ring_capacity*/ 4);
+    uint64_t v = 0;
+    size_t drained = 0;
+    Parker parker(parks_push ? "FIFOCache::ProbationQueue::Push:Loaded"
+                             : "FIFOCache::ProbationQueue::PopFromRing:Loaded");
+    SyncPoint::GetInstance()->EnableProcessing();
+    uint64_t parked_v = 0;
+    size_t parked_drained = 0;
+    port::Thread thread([&] {
+      if (parks_push) {
+        EXPECT_TRUE(q.Push(99));
+      } else {
+        EXPECT_TRUE(q.Pop(&parked_v, &parked_drained));
+      }
+    });
+    parker.WaitParked();
+    // Positions 0 to 3, two laps of the ring, pushed and popped, and
+    // position 4 (cell 0 again) filled with 14 if the pop is parked.
+    for (uint64_t i = 0; i < 4; ++i) {
+      ASSERT_TRUE(q.Push(10 + i));
+      ASSERT_TRUE(q.Pop(&v, &drained));
+      ASSERT_EQ(10 + i, v);
+    }
+    if (!parks_push) {
+      ASSERT_TRUE(q.Push(14));
+    }
+    parker.Resume();
+    thread.join();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    if (parks_push) {
+      ASSERT_TRUE(q.Push(15));
+      ASSERT_TRUE(q.Pop(&v, &drained));
+      EXPECT_EQ(99, v);
+      ASSERT_TRUE(q.Pop(&v, &drained));
+      EXPECT_EQ(15, v);
+    } else {
+      EXPECT_EQ(14, parked_v);
+    }
+    EXPECT_FALSE(q.Pop(&v, &drained));
+    EXPECT_EQ(0, drained);
+  }
+}
+
 // A drained ring's cells read zero afterwards, and on Linux its whole pages
-// are dropped. The first ring here is 512 cells, 8 KiB.
+// are dropped. The first ring here is 512 cells, 4 KiB.
 TEST_F(FIFOCacheTest, ProbationQueueDrainedRingIsZeroed) {
   fifo_cache::ProbationQueue q(/*first_ring_capacity*/ 512,
                                /*max_ring_capacity*/ 1024);
@@ -6425,8 +6586,7 @@ TEST_F(FIFOCacheTest, ProbationQueueDrainedRingIsZeroed) {
   const auto* cells =
       static_cast<const fifo_cache::ProbationQueue::Cell*>(q.TEST_GetMapping());
   for (size_t i = 0; i < 512; ++i) {
-    ASSERT_EQ(0, cells[i].seq.load()) << i;
-    ASSERT_EQ(0, cells[i].value.LoadRelaxed()) << i;
+    ASSERT_EQ(0, cells[i].load()) << i;
   }
   EXPECT_EQ(1024, q.LiveCellCount());
   EXPECT_EQ(1536, q.CellCount());

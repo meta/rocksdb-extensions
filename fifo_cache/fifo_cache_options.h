@@ -87,7 +87,7 @@ namespace ROCKSDB_NAMESPACE {
 // Under kFullChargeCacheMetadata (the default) the table counts against
 // capacity: 72 bytes per slot the table has grown to (the 64-byte slot, its
 // probation word and its ghost cell), starting at 64 slots per shard, or 4 for
-// a shard of 4 KiB or less, and growing with the entries; 16 bytes per cell of
+// a shard of 4 KiB or less, and growing with the entries; 8 bytes per cell of
 // the probation queue, which adds a larger ring as the table grows and stops
 // counting an older one, returning its whole pages to the OS on Linux, once
 // evictions have taken all it held; and for a key that isn't 16 bytes long,

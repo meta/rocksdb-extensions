@@ -3406,38 +3406,41 @@ ProbationQueue::ProbationQueue(size_t first_ring_capacity,
   }
   rings_[0].cells = cells_.Get();
   rings_[0].mask = first_ring_capacity - 1;
+  rings_[0].shift = FloorLog2(first_ring_capacity);
 }
 
 bool ProbationQueue::Push(uint64_t v) {
+  assert(v <= kMaxValue);
   for (;;) {
     const uint32_t t = tail_.load(std::memory_order_acquire);
     Ring& r = rings_[t];
-    // Acquire, so that a closed flag seen here comes with the newer tail_.
+    // Acquire, so that a closed flag seen here comes with the newer tail_,
+    // and the cell below is no older than the claim of its position a lap
+    // before found it (see Cell).
     uint64_t pos = r.enqueue.load(std::memory_order_acquire);
     TEST_SYNC_POINT("FIFOCache::ProbationQueue::Push:Loaded");
     while ((pos & kClosed) == 0) {
-      const uint64_t idx = pos & r.mask;
-      Cell& c = r.cells[idx];
-      const uint64_t seq = c.seq.load(std::memory_order_acquire) + idx;
-      const int64_t dif = static_cast<int64_t>(seq - pos);
-      if (dif == 0) {
+      Cell& c = r.cells[pos & r.mask];
+      const uint64_t lap = pos >> r.shift;
+      if ((c.load(std::memory_order_acquire) & kPhaseMask) ==
+          Phase(lap, /*filled=*/false)) {
         if (r.enqueue.compare_exchange_weak(pos, pos + 1,
-                                            std::memory_order_acquire)) {
+                                            std::memory_order_acq_rel)) {
           TEST_SYNC_POINT("FIFOCache::ProbationQueue::Push:Claimed");
-          c.value.StoreRelaxed(v);
-          c.seq.store(pos + 1 - idx, std::memory_order_release);
+          c.store((v << kPhaseBits) | Phase(lap, /*filled=*/true),
+                  std::memory_order_release);
           return true;
         }
         // pos now holds the current enqueue position.
-      } else if (dif < 0) {
-        // Full, or the pop of this cell's last value hasn't finished, or
-        // the ring was closed, drained and zeroed since pos was loaded.
-        pos = r.enqueue.load(std::memory_order_acquire);
-        if ((pos & kClosed) == 0) {
+      } else {
+        // Full, or the pop of this cell's last value hasn't finished, if pos
+        // hasn't moved. Otherwise another push took pos, or the ring was
+        // closed (and perhaps drained and zeroed) since pos was loaded.
+        const uint64_t cur = r.enqueue.load(std::memory_order_acquire);
+        if (cur == pos) {
           return false;
         }
-      } else {
-        pos = r.enqueue.load(std::memory_order_acquire);
+        pos = cur;
       }
     }
     // Closed: a newer ring takes pushes. tail_ moved before the close.
@@ -3449,28 +3452,33 @@ bool ProbationQueue::Push(uint64_t v) {
 }
 
 bool ProbationQueue::PopFromRing(Ring& r, uint64_t* v) {
-  uint64_t pos = r.dequeue.load(std::memory_order_relaxed);
+  // Acquire, so that the cell below is no older than the claim of its
+  // position a lap before found it (see Cell).
+  uint64_t pos = r.dequeue.load(std::memory_order_acquire);
+  TEST_SYNC_POINT("FIFOCache::ProbationQueue::PopFromRing:Loaded");
   for (;;) {
-    const uint64_t idx = pos & r.mask;
-    Cell& c = r.cells[idx];
-    const uint64_t seq = c.seq.load(std::memory_order_acquire) + idx;
-    const int64_t dif = static_cast<int64_t>(seq - (pos + 1));
-    if (dif == 0) {
-      // Filled, and stays so until popped, so the value read here is the
-      // one a successful claim below takes.
-      const uint64_t value = c.value.LoadRelaxed();
+    Cell& c = r.cells[pos & r.mask];
+    const uint64_t lap = pos >> r.shift;
+    const uint64_t cell = c.load(std::memory_order_acquire);
+    if ((cell & kPhaseMask) == Phase(lap, /*filled=*/true)) {
+      // Filled at pos, and stays so until popped, so the value read here is
+      // the one a successful claim below takes.
       if (r.dequeue.compare_exchange_weak(pos, pos + 1,
-                                          std::memory_order_relaxed)) {
-        *v = value;
-        c.seq.store(pos + r.mask + 1 - idx, std::memory_order_release);
+                                          std::memory_order_acq_rel)) {
+        TEST_SYNC_POINT("FIFOCache::ProbationQueue::PopFromRing:Claimed");
+        *v = cell >> kPhaseBits;
+        c.store(Phase(lap + 1, /*filled=*/false), std::memory_order_release);
         return true;
       }
       // pos now holds the current dequeue position.
-    } else if (dif < 0) {
-      // Nothing pushed at pos yet, or the push hasn't filled the cell.
-      return false;
     } else {
-      pos = r.dequeue.load(std::memory_order_relaxed);
+      // Nothing pushed at pos yet, or the push hasn't filled the cell, if
+      // pos hasn't moved. Otherwise another pop took pos.
+      const uint64_t cur = r.dequeue.load(std::memory_order_acquire);
+      if (cur == pos) {
+        return false;
+      }
+      pos = cur;
     }
   }
 }
@@ -3528,8 +3536,7 @@ void ProbationQueue::DropRing(const Ring& r) {
       c = dropped_end - 1;
       continue;
     }
-    c->seq.store(0, std::memory_order_relaxed);
-    c->value.StoreRelaxed(0);
+    c->store(0, std::memory_order_relaxed);
   }
 }
 
@@ -3560,6 +3567,7 @@ bool ProbationQueue::TryAddRing(size_t capacity) {
   Ring& next = rings_[t + 1];
   next.cells = last.cells + last.mask + 1;
   next.mask = capacity - 1;
+  next.shift = FloorLog2(capacity);
   assert(next.cells + capacity <= cells_.Get() + cells_.Count());
   tail_.store(t + 1, std::memory_order_release);
   TEST_SYNC_POINT("FIFOCache::ProbationQueue::TryAddRing:BeforeClose");
@@ -3617,7 +3625,7 @@ bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
 
 bool AutoHyperClockTable::ProbationPush(size_t idx, uint32_t word,
                                         InsertState& state) {
-  const uint64_t v = (uint64_t{idx} << 32) | word;
+  const uint64_t v = ProbationCell(idx, word);
   if (probation_.Push(v)) {
     return true;
   }
@@ -3660,8 +3668,7 @@ bool AutoHyperClockTable::ProbationPush(size_t idx, uint32_t word,
   // probation for the newer entry's sake. A second one, or a carried one
   // that finds no stale cell, goes to the resident queue.
   auto leave = [this](uint64_t cell) {
-    LeaveProbationUnowned(static_cast<size_t>(cell >> 32),
-                          static_cast<uint32_t>(cell));
+    LeaveProbationUnowned(ProbationCellSlot(cell), ProbationCellWord(cell));
   };
   bool carrying = false;
   uint64_t carried = 0;
@@ -3866,9 +3873,8 @@ uint32_t AutoHyperClockTable::HitsUnderRef(const HandleImpl* h) const {
 bool AutoHyperClockTable::IsStaleProbationCell(uint64_t v) const {
   // The word's identity only moves on (kInProbation cleared, or a later
   // entry's generation), so a cell found stale stays stale.
-  const uint32_t word = static_cast<uint32_t>(v);
-  return (probation_words_[static_cast<size_t>(v >> 32)].LoadRelaxed() &
-          kProbationIdentity) != (word & kProbationIdentity);
+  return (probation_words_[ProbationCellSlot(v)].LoadRelaxed() &
+          kProbationIdentity) != ProbationCellWord(v);
 }
 
 bool AutoHyperClockTable::LeaveProbation(size_t idx, uint32_t word,
@@ -4021,8 +4027,8 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
   if (!popped) {
     return false;
   }
-  const size_t idx = static_cast<size_t>(v >> 32);
-  const uint32_t word = static_cast<uint32_t>(v);
+  const size_t idx = ProbationCellSlot(v);
+  const uint32_t word = ProbationCellWord(v);
   HandleImpl& h = array_[idx];
   RelaxedAtomic<uint32_t>& w = probation_words_[idx];
   // Lookups and Releases change the counters under us, so a lost race is

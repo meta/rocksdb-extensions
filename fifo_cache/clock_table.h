@@ -700,11 +700,12 @@ class BaseClockTable {
   const uint32_t& hash_seed_;
 };
 
-// FIFOCache: the probation queue's order, a lock-free FIFO of 64-bit values
+// FIFOCache: the probation queue's order, a lock-free FIFO of 62-bit values
 // that grows with the table. It is a chain of bounded rings, each Vyukov's
-// MPMC ring buffer and each a larger power of two than the one before,
-// carved in order from one lazily zeroed reservation, so only rings in use
-// take memory. Pushes go to the newest ring and pops drain the oldest.
+// MPMC ring buffer with the sequence number cut to a phase that fits in the
+// cell's word beside the value, and each a larger power of two than the one
+// before, carved in order from one lazily zeroed reservation, so only rings
+// in use take memory. Pushes go to the newest ring and pops drain the oldest.
 // Adding a ring closes the one before it with a flag on its enqueue
 // position, as LCRQ does, and pops move past a closed ring once every
 // position pushed to it has been taken. Push and Pop never wait for another
@@ -717,6 +718,9 @@ class ProbationQueue {
   // Rings start at first_ring_capacity cells and stop at max_ring_capacity,
   // both powers of two.
   ProbationQueue(size_t first_ring_capacity, size_t max_ring_capacity);
+
+  // Values are below 2^62.
+  static constexpr uint64_t kMaxValue = (uint64_t{1} << 62) - 1;
 
   // Appends v. Returns false if the newest ring is full or its next cell is
   // still held by a pop.
@@ -749,32 +753,47 @@ class ProbationQueue {
   // The start of the rings' mapping.
   const void* TEST_GetMapping() const { return cells_.Get(); }
 
-  struct Cell {
-    // The Vyukov sequence number minus the cell's index in its ring, so
-    // that zeroed memory is a ring with nothing pushed.
-    std::atomic<uint64_t> seq;
-    RelaxedAtomic<uint64_t> value;
-  };
+  // A cell is one word: the value above the cell's phase, Vyukov's sequence
+  // number cut to the lap of the cell's position times two, plus one once a
+  // push has filled it, modulo 4. Claims release and loads of the positions
+  // acquire, so a thread holding position pos reads the cell no older than
+  // the claim of the cell's position a lap before pos found it, or zeroed
+  // memory, which is empty at lap 0. For a push that leaves three states:
+  // claimed a lap behind and not yet filled, filled a lap behind, or empty
+  // and ready. For a pop: filled a lap behind and not yet emptied, empty, or
+  // filled and ready. The phase tells the three apart. Any later state
+  // comes after another thread claimed pos, so the thread's own claim, a
+  // compare-and-swap of the full 64-bit position, fails, and its reread of
+  // the position finds it moved.
+  using Cell = std::atomic<uint64_t>;
+  static constexpr int kPhaseBits = 2;
+  static constexpr uint64_t kPhaseMask = (uint64_t{1} << kPhaseBits) - 1;
 
  private:
   struct Ring {
     Cell* cells = nullptr;
     uint64_t mask = 0;
+    // log2 of the ring's cells, which turns a position into its lap.
+    int shift = 0;
     ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> enqueue{0};
     ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> dequeue{0};
   };
   // Set on a ring's enqueue position once a newer ring takes its pushes.
   static constexpr uint64_t kClosed = uint64_t{1} << 63;
 
+  // The phase of a cell at a position of lap `lap`, filled or not.
+  static uint64_t Phase(uint64_t lap, bool filled) {
+    return (lap * 2 + (filled ? 1 : 0)) & kPhaseMask;
+  }
   // Takes r's oldest value. Returns false if r holds none, or its oldest
   // was claimed by a push that has not filled it yet.
   static bool PopFromRing(Ring& r, uint64_t* v);
   // Zeroes a ring pops have moved past, which a thread that loaded it
-  // earlier can still read. A zeroed cell reads to a pop as not yet pushed
-  // at every position. To a push it reads as free only at its position in
-  // the ring's first lap, where the push's claim fails against the closed
-  // enqueue position, and at any later position as not yet popped, after
-  // which the push checks for the close.
+  // earlier can still read. A zeroed cell is empty at an even lap, so a pop
+  // never finds it filled and returns empty once it rereads the position
+  // and finds it unmoved. A push finds it free at every other lap, where its
+  // claim fails against the closed enqueue position, and otherwise rereads
+  // the position and sees the close.
   static void DropRing(const Ring& r);
 
   const NoReserveTypedMemMapping<Cell> cells_;
@@ -1135,7 +1154,10 @@ class AutoHyperClockTable : public BaseClockTable {
   static constexpr uint32_t kInProbation = 1;
   static constexpr uint32_t kCountsInsertRef = 2;
   static constexpr uint32_t kSeenPinned = 4;
-  static constexpr uint32_t kProbationGenerationOne = 8;
+  static constexpr int kProbationFlagBits = 3;
+  static constexpr int kProbationGenerationBits = 32 - kProbationFlagBits;
+  static constexpr uint32_t kProbationGenerationOne = uint32_t{1}
+                                                      << kProbationFlagBits;
   static constexpr uint32_t kProbationIdentity =
       ~(kCountsInsertRef | kSeenPinned);
 
@@ -1222,6 +1244,23 @@ class AutoHyperClockTable : public BaseClockTable {
   // first if the newest is full and the table has outgrown it, adding the
   // ring's bytes to state.ring_charge if they are charged to usage.
   bool ProbationPush(size_t idx, uint32_t word, InsertState& state);
+  // A probation queue value: slot idx above the generation of its word,
+  // which with kInProbation, set on every word queued, is the word's
+  // identity. The slot index takes 32 bits and the generation 29, inside
+  // the queue's 62.
+  static uint64_t ProbationCell(size_t idx, uint32_t word) {
+    assert(word & kInProbation);
+    assert(idx <= UINT32_MAX);
+    return (uint64_t{idx} << kProbationGenerationBits) |
+           (word >> kProbationFlagBits);
+  }
+  static size_t ProbationCellSlot(uint64_t v) {
+    return static_cast<size_t>(v >> kProbationGenerationBits);
+  }
+  // The word's identity, with no other flags.
+  static uint32_t ProbationCellWord(uint64_t v) {
+    return (static_cast<uint32_t>(v) << kProbationFlagBits) | kInProbation;
+  }
   // Whether a queued value no longer names the entry it was pushed for.
   bool IsStaleProbationCell(uint64_t v) const;
   // The ghost (see ghost_): a key's tag can be in any of the kGhostWays
@@ -1358,7 +1397,7 @@ class AutoHyperClockTable : public BaseClockTable {
   // table can reach into 15 bits of ghost stamp steps.
   const int ghost_stamp_shift_;
 
-  // FIFOCache: the probation queue's order, as (slot index << 32 | word).
+  // FIFOCache: the probation queue's order, as ProbationCell values.
   ProbationQueue probation_;
 
   // FIFOCache: charge of the entries with kInProbation set, and of those
