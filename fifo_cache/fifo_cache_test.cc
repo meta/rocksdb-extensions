@@ -2479,6 +2479,241 @@ TEST_F(FIFOCacheTest, ProbationKeepsPayingAsItEvictsReleasedPins) {
   EXPECT_EQ(kU, fifo->TEST_GetProbationPinnedUsage());
 }
 
+// Probation as it stands after FillWithHeldHeadsAtProbationsHead: K(1000)
+// to K(1083) resident, and probation holding the four entries P(200) to P(203)
+// at its head and
+// C(300) to C(311) behind them, 16 * kU in all, none yet seen pinned. Each
+// P is inserted with a handle that is kept and returned (kHeld), with one
+// released at once (kReleased), or without one (kNoHandle).
+enum class PHandle { kHeld, kReleased, kNoHandle };
+static std::vector<Cache::Handle*> FillWithHeldHeadsAtProbationsHead(
+    Cache* cache, std::vector<std::string>* evicted,
+    const std::vector<PHandle>& p_handles) {
+  for (uint32_t i = 1000; i < 1084; ++i) {
+    EXPECT_OK(FIFOCacheTest::Insert(cache, K(i), kU));
+    FIFOCacheTest::HitNTimes(cache, K(i), 2);
+  }
+  for (uint32_t i = 100; i < 116; ++i) {
+    EXPECT_OK(FIFOCacheTest::Insert(cache, K(i), kU));
+  }
+  EXPECT_EQ(100 * kU, cache->GetUsage());
+  // Promotes K(1000) to K(1083) and evicts K(100).
+  EXPECT_OK(FIFOCacheTest::Insert(cache, K("t0"), kU));
+  std::vector<Cache::Handle*> handles;
+  for (uint32_t i = 200; i < 204; ++i) {
+    const PHandle mode = p_handles[i - 200];
+    Cache::Handle* h = nullptr;
+    EXPECT_OK(FIFOCacheTest::Insert(cache, K(i), kU,
+                                    mode == PHandle::kNoHandle ? nullptr : &h));
+    if (mode == PHandle::kHeld) {
+      handles.push_back(h);
+    } else if (mode == PHandle::kReleased) {
+      EXPECT_FALSE(cache->Release(h));
+    }
+  }
+  for (uint32_t i = 300; i < 312; ++i) {
+    EXPECT_OK(FIFOCacheTest::Insert(cache, K(i), kU));
+  }
+  std::vector<std::string> expected;
+  for (uint32_t i = 100; i < 116; ++i) {
+    expected.push_back(K(i));
+  }
+  expected.push_back(K("t0"));
+  EXPECT_EQ(expected, *evicted);
+  return handles;
+}
+
+// Heads still held by their inserter when they reach probation's head widen
+// probation's share by their charge, less a sixteenth of the charge of the
+// heads found unpinned on their first visit. D's eviction rotates the four
+// held heads (4 * kU) and evicts C(300) (kU / 16 back), leaving probation
+// with 12 * kU unpinned: E would take it over 12% of capacity, but not over
+// that plus the allowance, so the resident clock pays for E.
+TEST_F(FIFOCacheTest, HeldHeadsWidenProbationsShare) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  std::vector<Cache::Handle*> held =
+      FillWithHeldHeadsAtProbationsHead(cache.get(), &evicted,
+                                        std::vector<PHandle>(4, PHandle::kHeld));
+  EXPECT_EQ(0, Stats(cache.get()).pinned_allowance);
+  EXPECT_OK(Insert(cache.get(), K("D"), kU));
+  EXPECT_EQ(K(300), evicted.back());
+  EXPECT_EQ(4 * kU - kU / 16, Stats(cache.get()).pinned_allowance);
+  EXPECT_EQ(16 * kU, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(4 * kU, fifo->TEST_GetProbationPinnedUsage());
+  const size_t before = evicted.size();
+  EXPECT_OK(Insert(cache.get(), K("E"), kU));
+  EXPECT_GT(evicted.size(), before);
+  for (size_t i = before; i < evicted.size(); ++i) {
+    EXPECT_GE(evicted[i], K(1000)) << i;
+    EXPECT_LT(evicted[i], K(1084)) << i;
+  }
+  EXPECT_TRUE(Holds(cache.get(), K(301)));
+  EXPECT_EQ(17 * kU, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(4 * kU - kU / 16, Stats(cache.get()).pinned_allowance);
+  for (Cache::Handle* h : held) {
+    EXPECT_FALSE(cache->Release(h));
+  }
+}
+
+// Heads held through a lookup's handle don't widen it, whether inserted
+// without a handle or with one released before the lookup: a hit entry is
+// pinned again however long the queue. So E's eviction finds probation
+// over its share and takes C(301).
+TEST_F(FIFOCacheTest, LookupPinsDoNotWidenProbationsShare) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FillWithHeldHeadsAtProbationsHead(
+      cache.get(), &evicted,
+      {PHandle::kNoHandle, PHandle::kNoHandle, PHandle::kReleased,
+       PHandle::kReleased});
+  std::vector<Cache::Handle*> held;
+  for (uint32_t i = 200; i < 204; ++i) {
+    if (Cache::Handle* h = cache->Lookup(K(i))) {
+      held.push_back(h);
+    }
+  }
+  EXPECT_EQ(4, held.size());
+  EXPECT_OK(Insert(cache.get(), K("D"), kU));
+  EXPECT_EQ(K(300), evicted.back());
+  EXPECT_EQ(0, Stats(cache.get()).pinned_allowance);
+  EXPECT_OK(Insert(cache.get(), K("E"), kU));
+  EXPECT_EQ(K(301), evicted.back());
+  for (Cache::Handle* h : held) {
+    EXPECT_FALSE(cache->Release(h));
+  }
+}
+
+// Once inserters release their handles quickly again, each Evict call gives
+// back a sixteenth, rounded up, of the charge of the heads it found unpinned
+// on their first visit, evicted or promoted, until the allowance from
+// HeldHeadsWidenProbationsShare is gone. The released P's are erased, so
+// every probation head the loop reaches is on its first visit, and the
+// entries it inserts charge kU + 1, so the rounding shows.
+TEST_F(FIFOCacheTest, WidenedShareNarrowsOnceHandlesAreReleased) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  std::vector<Cache::Handle*> held = FillWithHeldHeadsAtProbationsHead(
+      cache.get(), &evicted, std::vector<PHandle>(4, PHandle::kHeld));
+  EXPECT_OK(Insert(cache.get(), K("D"), kU));
+  EXPECT_EQ(4 * kU - kU / 16, Stats(cache.get()).pinned_allowance);
+  for (uint32_t i = 200; i < 204; ++i) {
+    EXPECT_FALSE(cache->Release(held[i - 200]));
+    cache->Erase(K(i));
+  }
+  ASSERT_EQ(0, fifo->TEST_GetProbationPinnedUsage());
+  // C(301), now at probation's head, is promoted on its first visit.
+  HitNTimes(cache.get(), K(301), 2);
+  size_t allowance = 4 * kU - kU / 16;
+  uint64_t promotions = Stats(cache.get()).promotions;
+  uint64_t promoted = 0;
+  for (uint32_t i = 400; allowance > 0; ++i) {
+    ASSERT_LT(i, 1000u);
+    const size_t before = evicted.size();
+    ASSERT_OK(Insert(cache.get(), K(i), kU + 1));
+    size_t first_visit_charge = 0;
+    for (size_t e = before; e < evicted.size(); ++e) {
+      const std::string& key = evicted[e];
+      if (key >= K(1000) && key < K(1084)) {
+        continue;  // resident
+      }
+      first_visit_charge += key >= K(400) && key < K(1000) ? kU + 1 : kU;
+    }
+    const FIFOCacheStats stats = Stats(cache.get());
+    first_visit_charge += (stats.promotions - promotions) * kU;
+    promoted += stats.promotions - promotions;
+    promotions = stats.promotions;
+    allowance -= std::min(allowance, (first_visit_charge + 15) / 16);
+    ASSERT_EQ(allowance, stats.pinned_allowance) << i;
+  }
+  EXPECT_EQ(1, promoted);
+}
+
+// One Evict call's growth and give-back are netted. X's eviction evicts
+// C(301) to C(311) and D on their first visit (12 * kU / 16 back) and finds
+// S, held by its inserter, on its first (16 bytes of growth). P(200) and
+// P(201), which a step saw pinned before their release, give nothing back:
+// P(200), hit twice since, is promoted, and P(201) is evicted.
+TEST_F(FIFOCacheTest, OneEvictionNetsGrowthAgainstGiveBack) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  std::vector<Cache::Handle*> held = FillWithHeldHeadsAtProbationsHead(
+      cache.get(), &evicted, std::vector<PHandle>(4, PHandle::kHeld));
+  EXPECT_OK(Insert(cache.get(), K("D"), kU));
+  const size_t allowance = 4 * kU - kU / 16;
+  EXPECT_EQ(allowance, Stats(cache.get()).pinned_allowance);
+  Cache::Handle* s = nullptr;
+  EXPECT_OK(Insert(cache.get(), K("S"), 16, &s));
+  EXPECT_EQ(allowance, Stats(cache.get()).pinned_allowance);
+  EXPECT_FALSE(cache->Release(held[0]));
+  EXPECT_FALSE(cache->Release(held[1]));
+  HitNTimes(cache.get(), K(200), 2);
+  const uint64_t promotions = Stats(cache.get()).promotions;
+  const size_t before = evicted.size();
+  EXPECT_OK(Insert(cache.get(), K("X"), 20 * kU));
+  std::vector<std::string> expected;
+  for (uint32_t i = 301; i < 312; ++i) {
+    expected.push_back(K(i));
+  }
+  expected.push_back(K(201));
+  expected.push_back(K("D"));
+  if (evicted.size() >= before + expected.size()) {
+    EXPECT_EQ(expected,
+              std::vector<std::string>(evicted.begin() + before,
+                                       evicted.begin() + before +
+                                           expected.size()));
+  } else {
+    ADD_FAILURE() << evicted.size() - before << " evicted";
+  }
+  EXPECT_EQ(promotions + 1, Stats(cache.get()).promotions);
+  EXPECT_TRUE(Holds(cache.get(), K(200)));
+  EXPECT_FALSE(fifo->TEST_InProbation(K(200)));
+  EXPECT_EQ(allowance + 16 - 12 * kU / 16, Stats(cache.get()).pinned_allowance);
+  EXPECT_FALSE(cache->Release(s));
+  EXPECT_FALSE(cache->Release(held[2]));
+  EXPECT_FALSE(cache->Release(held[3]));
+}
+
+// The allowance stops at four times probation's share of capacity, and a
+// capacity cut lowers that at once, before any eviction updates it.
+TEST_F(FIFOCacheTest, PinnedAllowanceStopsAtFourShares) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  std::vector<Cache::Handle*> pins;
+  for (uint32_t i = 200; i < 223; ++i) {
+    Cache::Handle* h = nullptr;
+    EXPECT_OK(Insert(cache.get(), K(i), i < 222 ? 4 * kU : kU, &h));
+    pins.push_back(h);
+  }
+  for (uint32_t i = 0; i < 11; ++i) {
+    EXPECT_OK(Insert(cache.get(), K(i), kU));
+  }
+  // The 89 * kU of pins rotate, held by their inserter, and K(0) is evicted.
+  EXPECT_OK(Insert(cache.get(), K("y"), kU));
+  EXPECT_EQ(std::vector<std::string>{K(0)}, evicted);
+  EXPECT_EQ(48 * kU, Stats(cache.get()).pinned_allowance);
+  // Raising capacity raises the cap, not the allowance.
+  cache->SetCapacity(200 * kU);
+  EXPECT_EQ(48 * kU, Stats(cache.get()).pinned_allowance);
+  // A cut that evicts nothing still lowers the cap.
+  for (uint32_t i = 200; i < 223; ++i) {
+    EXPECT_FALSE(cache->Release(pins[i - 200]));
+    cache->Erase(K(i));
+  }
+  ASSERT_EQ(11 * kU, cache->GetUsage());
+  cache->SetCapacity(50 * kU);
+  EXPECT_EQ(std::vector<std::string>{K(0)}, evicted);
+  EXPECT_EQ(24 * kU, Stats(cache.get()).pinned_allowance);
+}
+
 TEST_F(FIFOCacheTest, PinnedProbationEntriesDoNotHoldBudget) {
   std::vector<std::string> evicted;
   std::shared_ptr<Cache> cache = NewCache(100 * kU);
@@ -5508,9 +5743,9 @@ TEST_F(FIFOCacheTest, ReportProblemsLogsStats) {
     ASSERT_EQ(1, logger->lines.size()) << secondary;
     const std::string& line = logger->lines[0];
     const std::string want =
-        "FIFOCache stats: probation usage 9, promotions 1, ghost returns 0, "
-        "probation evictions 1, resident evictions 0, effort cap stops 0, "
-        "probation full 0";
+        "FIFOCache stats: probation usage 9, pinned allowance 0, promotions "
+        "1, ghost returns 0, probation evictions 1, resident evictions 0, "
+        "effort cap stops 0, probation full 0";
     ASSERT_GE(line.size(), want.size()) << line;
     EXPECT_EQ(want, line.substr(line.size() - want.size())) << line;
   }

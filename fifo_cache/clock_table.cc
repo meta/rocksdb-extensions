@@ -3292,6 +3292,8 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
   // have, a lap of the queue, so heads that keep rotating (losing every claim
   // to hits, which the effort cap doesn't count) cannot keep this call going.
   const size_t probation_target = ProbationTarget();
+  // Read once, the first time probation is over its target.
+  size_t pinned_allowance = SIZE_MAX;
   const size_t max_probation_steps = probation_.CellCount();
   size_t probation_steps = 0;
   bool resident_exhausted = false;
@@ -3312,9 +3314,17 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
     const size_t probation_unpinned = probation_usage > probation_pinned
                                           ? probation_usage - probation_pinned
                                           : 0;
+    // Over its share, the target plus the pinned allowance.
+    const size_t probation_demand = probation_unpinned + state.probation_charge;
+    bool probation_over = probation_demand > probation_target;
+    if (probation_over) {
+      if (pinned_allowance == SIZE_MAX) {
+        pinned_allowance = PinnedAllowance(probation_target);
+      }
+      probation_over = probation_demand - probation_target > pinned_allowance;
+    }
     const bool probation_first =
-        promoting || resident_exhausted ||
-        probation_unpinned + state.probation_charge > probation_target ||
+        promoting || resident_exhausted || probation_over ||
         resident_count_.LoadRelaxed() -
                 static_cast<int64_t>(data->resident_removed) <=
             0;
@@ -3633,6 +3643,12 @@ size_t AutoHyperClockTable::ProbationTarget() const {
   const size_t capacity = capacity_.LoadRelaxed();
   return capacity / 100 * kProbationPercent +
          capacity % 100 * kProbationPercent / 100;
+}
+
+size_t AutoHyperClockTable::PinnedAllowance(size_t probation_target) const {
+  // Capped again here, for a capacity cut since it last changed.
+  return std::min(pinned_allowance_.LoadRelaxed(),
+                  kPinnedAllowanceTargets * probation_target);
 }
 
 bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
@@ -4021,7 +4037,8 @@ void AutoHyperClockTable::WithReference(size_t idx, const Fn& fn) {
   Release(&h, /*useful=*/false, /*erase_if_last_ref=*/false);
 }
 
-void AutoHyperClockTable::MarkSeenPinned(size_t idx, uint32_t word) {
+size_t AutoHyperClockTable::MarkSeenPinned(size_t idx, uint32_t word) {
+  size_t marked = 0;
   WithReference(idx, [&](HandleImpl& h) {
     RelaxedAtomic<uint32_t>& w = probation_words_[idx];
     uint32_t cur = w.LoadRelaxed();
@@ -4029,10 +4046,12 @@ void AutoHyperClockTable::MarkSeenPinned(size_t idx, uint32_t word) {
            (cur & kSeenPinned) == 0) {
       if (w.CasWeakRelaxed(cur, cur | kSeenPinned)) {
         probation_pinned_usage_.FetchAddRelaxed(h.total_charge);
+        marked = h.total_charge;
         break;
       }
     }
   });
+  return marked;
 }
 
 void AutoHyperClockTable::SweepProbationEntry(HandleImpl& h, uint32_t word,
@@ -4117,7 +4136,12 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
       // step or sweep sees it unpinned.
       data->seen_pinned_count++;
       if ((cur & kSeenPinned) == 0) {
-        MarkSeenPinned(idx, word);
+        const size_t marked = MarkSeenPinned(idx, word);
+        if ((cur & kCountsInsertRef) && acquire_count == 1) {
+          // Held by its inserter alone, so no lookup has hit it: a longer
+          // queue would have outlasted the pin (see pinned_allowance_).
+          data->allowance_grow_charge += marked;
+        }
       }
       if (!ProbationPush(idx, word, state)) {
         LeaveProbationUnowned(idx, word);
@@ -4145,6 +4169,9 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
                                  /*counters_reset=*/true);
       if (*promoted) {
         data->promoted_count += 1;
+        if ((cur & kSeenPinned) == 0) {
+          data->allowance_shrink_charge += h.total_charge;
+        }
       } else {
         h.meta.Apply(
             AcquireCounter::PlusTransformPromiseNoOverflow(acquire_count) +
@@ -4172,6 +4199,9 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
     if (meta.IsVisible() && !IsPlaceholder(h)) {
       // Evicted rather than erased, and not a placeholder.
       GhostPut(h.hashed_key);
+    }
+    if ((cur & kSeenPinned) == 0) {
+      data->allowance_shrink_charge += total_charge;
     }
     TrackEvictionRemoval(idx, total_charge, data);
     data->freed_charge += total_charge;
@@ -4213,6 +4243,25 @@ void AutoHyperClockTable::CountEvictions(const EvictionData& data) {
     resident_count_.FetchSubRelaxed(
         static_cast<int64_t>(data.resident_removed));
   }
+  if (data.allowance_grow_charge > 0 || data.allowance_shrink_charge > 0) {
+    // Rounded up, so small charges give some back too.
+    const size_t give_back =
+        data.allowance_shrink_charge / kPinnedAllowanceDecay +
+        (data.allowance_shrink_charge % kPinnedAllowanceDecay != 0 ? 1 : 0);
+    const size_t cap = kPinnedAllowanceTargets * ProbationTarget();
+    size_t cur = pinned_allowance_.LoadRelaxed();
+    for (;;) {
+      size_t next = std::min(cur, cap);
+      if (data.allowance_grow_charge >= give_back) {
+        next += std::min(data.allowance_grow_charge - give_back, cap - next);
+      } else {
+        next -= std::min(give_back - data.allowance_grow_charge, next);
+      }
+      if (next == cur || pinned_allowance_.CasWeakRelaxed(cur, next)) {
+        break;
+      }
+    }
+  }
   if (data.promoted_count > 0) {
     promotions_.FetchAddRelaxed(data.promoted_count);
   }
@@ -4227,6 +4276,7 @@ void AutoHyperClockTable::CountEvictions(const EvictionData& data) {
 
 void AutoHyperClockTable::AddStats(FIFOCacheStats* stats) const {
   stats->probation_usage += GetProbationUsage();
+  stats->pinned_allowance += PinnedAllowance(ProbationTarget());
   stats->promotions += promotions_.LoadRelaxed();
   stats->ghost_returns += ghost_returns_.LoadRelaxed();
   stats->probation_evictions += probation_evictions_.LoadRelaxed();

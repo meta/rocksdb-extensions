@@ -579,6 +579,11 @@ class BaseClockTable {
     size_t probation_pinned_removed_charge = 0;
     size_t resident_removed = 0;
     size_t probation_precharge = 0;
+    // FIFOCache: the charge of heads the call found pinned by their
+    // inserter alone on their first visit, and of heads it found unpinned on
+    // theirs, which CountEvictions applies to the pinned allowance.
+    size_t allowance_grow_charge = 0;
+    size_t allowance_shrink_charge = 0;
     // FIFOCache: whether Evict gave up at the effort cap, which its caller
     // counts.
     bool effort_cap_reached = false;
@@ -1099,6 +1104,9 @@ class AutoHyperClockTable : public BaseClockTable {
   }
   // FIFOCache: kProbationPercent of capacity, rounded down.
   size_t ProbationTarget() const;
+  // FIFOCache: the pinned allowance (see pinned_allowance_), at most
+  // kPinnedAllowanceTargets times probation_target.
+  size_t PinnedAllowance(size_t probation_target) const;
 
   // FIFOCache: adds this table's probation usage and counts to *stats.
   void AddStats(FIFOCacheStats* stats) const;
@@ -1143,6 +1151,11 @@ class AutoHyperClockTable : public BaseClockTable {
   // by charge. The resident clock caps counts at kMaxCountdown, the same 3.
   static constexpr uint32_t kPromoteThreshold = 2;
   static constexpr size_t kProbationPercent = 12;
+  // FIFOCache: the pinned allowance's cap, in probation targets, and the
+  // part of an unpinned first visit's charge it gives back (see
+  // pinned_allowance_).
+  static constexpr size_t kPinnedAllowanceTargets = 4;
+  static constexpr size_t kPinnedAllowanceDecay = 16;
   // FIFOCache: how many cells a push into a full probation queue takes from
   // the newest ring looking for a stale one to drop, before sending its entry
   // to the resident queue.
@@ -1367,7 +1380,8 @@ class AutoHyperClockTable : public BaseClockTable {
   bool ProbationStep(EvictionData* data, InsertState& state, bool* promoted);
   // Marks the probation entry in slot idx seen pinned, if its word's
   // identity is still word's, taking a reference to read its charge.
-  void MarkSeenPinned(size_t idx, uint32_t word);
+  // Returns the charge it marked, 0 if it marked nothing.
+  size_t MarkSeenPinned(size_t idx, uint32_t word);
   // The probation queue's ring size for a table with this occupancy limit.
   static size_t ProbationRingCapacity(size_t occupancy_limit);
 
@@ -1434,6 +1448,20 @@ class AutoHyperClockTable : public BaseClockTable {
   // because racing updates can take it below zero for a moment; Evict reads
   // zero or less as an empty resident queue.
   RelaxedAtomic<int64_t> resident_count_{};
+
+  // FIFOCache: room in probation's share for entries their inserter still
+  // holds when they reach the head. An entry inserted with a handle counts
+  // toward the share as unpinned until a step finds it pinned, so if
+  // inserters hold their handles for longer than a lap of the queue, every
+  // head is still pinned and gets rotated, and the queue stays shorter than
+  // the pins' lives. The allowance grows by the charge of a head pinned by
+  // its inserter alone on its first visit and shrinks by
+  // 1/kPinnedAllowanceDecay of the charge of a head found unpinned on its
+  // first visit, between zero and kPinnedAllowanceTargets probation targets,
+  // so it settles where about one first visit in kPinnedAllowanceDecay + 1
+  // finds its head held. Pins taken by lookups don't count: a hot entry is
+  // pinned again however long the queue is.
+  RelaxedAtomic<size_t> pinned_allowance_{};
 
   // FIFOCache: FIFOCacheStats' counts, on the cache line that inserts and
   // Evict calls already write (CountEvictions, once per call). The hit path

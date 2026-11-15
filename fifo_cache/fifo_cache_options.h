@@ -25,13 +25,16 @@ namespace ROCKSDB_NAMESPACE {
 // is a hash table with two queues over its entries: new entries enter the
 // probation queue, a FIFO whose share is 12% of capacity, and an entry hit
 // at least twice by the time it reaches the head is promoted to the
-// resident queue instead of being evicted. The resident queue is a clock
-// over the table that keeps up to three hits per entry. Keys (not values)
-// recently evicted from probation are remembered, and inserting one again
-// puts it straight into the resident queue. Placement comes from hits
-// alone: Cache::Priority is ignored. GetFIFOCacheStats (below) reports
-// what the queues did, and Cache::ReportProblems, which RocksDB calls at
-// each stats dump, logs the same at INFO level.
+// resident queue instead of being evicted. The share grows, up to five
+// times that, while entries reach the head still held through the handle
+// their insert returned, until most are released by the time they get
+// there. The resident queue is a clock over the table that keeps up to
+// three hits per entry. Keys (not values) recently evicted from probation
+// are remembered, and inserting one again puts it straight into the
+// resident queue. Placement comes from hits alone: Cache::Priority is
+// ignored. GetFIFOCacheStats (below) reports what the queues did, and
+// Cache::ReportProblems, which RocksDB calls at each stats dump, logs the
+// same at INFO level.
 //
 // A negative num_shard_bits (the default) gives each shard at least 4 MiB, up
 // to 64 shards, so a cache under 8 MiB has one. LRUCache defaults to 512 KiB
@@ -152,6 +155,9 @@ struct FIFOCacheOptions : public ShardedCacheOptions {
 struct FIFOCacheStats {
   // Charge of the entries in the probation queues.
   size_t probation_usage = 0;
+  // How far probation's share is above 12% of capacity now, for entries
+  // still held through their insert's handle when they reached the head.
+  size_t pinned_allowance = 0;
   // Entries promoted from the head of a probation queue to the resident
   // queue, having been hit at least twice.
   uint64_t promotions = 0;

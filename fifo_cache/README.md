@@ -173,15 +173,15 @@ which also finds the cache behind the secondary-cache adapter that
 ```cpp
 rocksdb::FIFOCacheStats stats;
 if (rocksdb::GetFIFOCacheStats(*table_options.block_cache, &stats)) {
-  // stats.probation_usage, promotions, ghost_returns, probation_evictions,
-  // resident_evictions, effort_cap_stops, probation_full
+  // stats.probation_usage, pinned_allowance, promotions, ghost_returns,
+  // probation_evictions, resident_evictions, effort_cap_stops, probation_full
 }
 ```
 
-Apart from `probation_usage`, the fields count from the cache's creation, so
-export them as counters and watch their rates. The DB's `LOG` gets the same
-numbers at INFO level at each stats dump (`stats_dump_period_sec`), on a line
-starting `FIFOCache stats:`. `ghost_returns` against `probation_evictions` is
+Apart from `probation_usage` and `pinned_allowance`, the fields count from
+the cache's creation, so export them as counters and watch their rates. The
+DB's `LOG` gets the same numbers at INFO level at each stats dump
+(`stats_dump_period_sec`), on a line starting `FIFOCache stats:`. `ghost_returns` against `probation_evictions` is
 the share of probation's victims that came back while their keys were
 remembered; with a secondary cache, the placeholders its adapter inserts
 are among the victims but never remembered, which lowers the share. A
@@ -193,7 +193,11 @@ some there as it first fills if entries are erased meanwhile, as RocksDB
 erases the dummy entry it inserts for each block a compaction reads; one
 that keeps rising after the cache has filled means the queue is full of
 entries still queued or, with `strict_capacity_limit`, that the queue can't
-grow within capacity.
+grow within capacity. `pinned_allowance` is how far probation's share has
+grown past 12% of capacity because entries reached the head of the queue
+still held through the handle their insert returned. It stays near zero
+unless those handles are kept for about as long as new entries take to
+reach the head, and it is at most four times that 12%.
 
 ## Limitations
 

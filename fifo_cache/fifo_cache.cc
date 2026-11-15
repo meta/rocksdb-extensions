@@ -99,11 +99,13 @@ void FIFOCache::ReportProblems(const std::shared_ptr<Logger>& info_log) const {
   AutoHyperClockCache::ReportProblems(info_log);
   const FIFOCacheStats stats = GetStats();
   ROCKS_LOG_INFO(info_log,
-                 "FIFOCache stats: probation usage %zu, promotions %" PRIu64
+                 "FIFOCache stats: probation usage %zu, pinned allowance %zu, "
+                 "promotions %" PRIu64
                  ", ghost returns %" PRIu64 ", probation evictions %" PRIu64
                  ", resident evictions %" PRIu64 ", effort cap stops %" PRIu64
                  ", probation full %" PRIu64,
-                 stats.probation_usage, stats.promotions, stats.ghost_returns,
+                 stats.probation_usage, stats.pinned_allowance,
+                 stats.promotions, stats.ghost_returns,
                  stats.probation_evictions, stats.resident_evictions,
                  stats.effort_cap_stops, stats.probation_full);
 }
