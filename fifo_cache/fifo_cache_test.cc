@@ -2949,8 +2949,8 @@ TEST_F(FIFOCacheTest, InsertReplacesUnpinnedEntry) {
 }
 
 // A replacing insert keeps the replaced entry's place, counting itself as a
-// hit on it, as S3-FIFO counts an update: replacing a resident entry puts the
-// new one in the resident queue with the old one's hits plus one. Of five
+// hit on it: replacing a resident entry puts the new one in the resident
+// queue with the old one's hits plus one. Of five
 // entries promoted together, k0 not hit since and k1, k3 and k4 hit twice,
 // k2, replaced with a handle or without and so at one hit, goes second,
 // wherever the slots are. Starting over in probation would evict it first,

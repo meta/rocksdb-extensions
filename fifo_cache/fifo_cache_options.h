@@ -60,7 +60,7 @@ namespace ROCKSDB_NAMESPACE {
 // entry instead and drops the new value.) The new entry keeps the old one's
 // place: it goes to the resident queue if the old one was there, and
 // otherwise wherever a new entry would go, and it starts with the old one's
-// hits plus one, up to 3, as S3-FIFO counts an update as a hit.
+// hits plus one, up to 3, counting the insert as a hit.
 //
 // Pinned entries are never evicted. Without strict_capacity_limit, an
 // insert's eviction gives up once it has passed 30 pinned entries for each

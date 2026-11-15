@@ -1300,8 +1300,9 @@ class AutoHyperClockTable : public BaseClockTable {
   // doesn't use and never 0 (an empty cell), above a 16-bit stamp: the
   // count of probation evictions when the key was evicted, in steps of
   // 2^ghost_stamp_shift_. A tag counts while its age, the steps since its
-  // stamp, is under the shard's entry count rounded up to steps, the bound
-  // S3-FIFO's ghost has. A stamp up to kGhostStampSlack steps ahead of the
+  // stamp, is under the shard's entry count rounded up to steps. (S3-FIFO's
+  // ghost holds as many keys as its main queue holds entries, which leaves
+  // out probation's share.) A stamp up to kGhostStampSlack steps ahead of the
   // count a reader loaded is age 0.
   static constexpr size_t kGhostWays = 8;
   static constexpr uint32_t kGhostStampSlack = 256;

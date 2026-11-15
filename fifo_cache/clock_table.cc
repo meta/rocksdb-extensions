@@ -3970,7 +3970,9 @@ uint32_t AutoHyperClockTable::TakeReplacedPlace(size_t idx, uint32_t word,
   if (!array_[idx].meta.Load().IsVisible()) {
     return word;
   }
-  // As S3-FIFO counts an update of a cached key as a hit on it.
+  // The insert counts as one more hit: a key inserted while cached has been
+  // accessed again (two readers that missed one block, or a placeholder
+  // replaced by its block).
   const uint32_t hits =
       std::min(replaced.hits + 1, uint32_t{ClockHandle::kMaxCountdown});
   array_[idx].meta.Apply(AcquireCounter::PlusTransformPromiseNoOverflow(hits) +
