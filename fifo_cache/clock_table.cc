@@ -3786,8 +3786,13 @@ uint32_t AutoHyperClockTable::GhostNow() const {
 
 uint32_t AutoHyperClockTable::GhostReach() const {
   const size_t step = size_t{1} << ghost_stamp_shift_;
-  const size_t steps =
-      (occupancy_.LoadRelaxed() + step - 1) >> ghost_stamp_shift_;
+  // As many keys as the resident queue's share of the entries: all but
+  // probation's, rounded down as ProbationTarget rounds it.
+  const size_t entries = occupancy_.LoadRelaxed();
+  const size_t resident_share =
+      entries - (entries / 100 * kProbationPercent +
+                 entries % 100 * kProbationPercent / 100);
+  const size_t steps = (resident_share + step - 1) >> ghost_stamp_shift_;
   // Racing inserts can take occupancy a little past its limit.
   return static_cast<uint32_t>(std::min(steps, size_t{1} << 15));
 }

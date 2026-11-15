@@ -79,14 +79,16 @@ namespace ROCKSDB_NAMESPACE {
 // of the key's hash and the count of probation evictions when it was
 // evicted. A key's cell can be any of the eight in the group of slots
 // holding the slot it maps to, and counts for as many probation evictions
-// as the shard has entries, as in S3-FIFO, rounded up to the count's step:
-// one eviction for a shard reserved for up to about 2.6 MB (see
-// max_capacity below), 2^n for one reserved for 2^n times that. A victim
+// as the shard has entries less probation's 12% (rounded down), the size of
+// S3-FIFO's ghost, rounded up to the count's step: one eviction for a shard
+// reserved for up to about 2.6 MB (see max_capacity below), 2^n for one
+// reserved for 2^n times that. A victim
 // whose group has no empty cell replaces the oldest, unless all eight are
 // from its own step, and while a group's eight cells all count, an insert
 // of a key that isn't remembered matches one of them 1 time in 8,192. A
-// cell that stopped counting counts again if the shard later holds more
-// entries than the evictions since its key's, or 65,280 steps on.
+// cell that stopped counting counts again if the shard later holds enough
+// entries for that count to cover the evictions since its key's, or 65,280
+// steps on.
 // Under kFullChargeCacheMetadata (the default) the table counts against
 // capacity: 72 bytes per slot the table has grown to (the 64-byte slot, its
 // probation word and its ghost cell), starting at 64 slots per shard, or 4 for

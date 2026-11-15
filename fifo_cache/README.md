@@ -9,8 +9,9 @@ Eviction*](https://jasony.me/publication/sosp23-s3fifo.pdf) (SOSP '23):
 - Probation entries that were hit again are promoted to the resident queue,
   which evicts with a second-chance clock.
 - Keys evicted from probation are remembered (16 bits of each key's hash,
-  no values) for as many probation evictions as the shard has entries;
-  re-inserting one goes straight to resident.
+  no values) for as many probation evictions as the resident queue's share
+  of the shard's entries, as in the paper; re-inserting one goes straight
+  to resident.
 - There is no shard mutex. Each shard is HyperClockCache's hash table: a
   lookup takes no lock, bumps a per-entry counter and moves nothing, an
   insert links its entry without a lock, and erasing, evicting (for an
