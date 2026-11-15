@@ -570,6 +570,15 @@ class BaseClockTable {
     // queue; and the entries probation promoted.
     size_t probation_freed_count = 0;
     size_t promoted_count = 0;
+    // FIFOCache: what the call's evictions take off probation usage, off its
+    // seen-pinned part and off the resident count, and the probation charge
+    // of the entry the call evicts for (see InsertState::probation_charge),
+    // which CountEvictions applies once, on return. Evict reads each counter
+    // less what it has pending here.
+    size_t probation_removed_charge = 0;
+    size_t probation_pinned_removed_charge = 0;
+    size_t resident_removed = 0;
+    size_t probation_precharge = 0;
     // FIFOCache: whether Evict gave up at the effort cap, which its caller
     // counts.
     bool effort_cap_reached = false;
@@ -1008,6 +1017,10 @@ class AutoHyperClockTable : public BaseClockTable {
     size_t probation_charge = 0;
     bool ghost_hit = false;
     uint32_t ghost_value = 0;
+    // FIFOCache: whether the insert's eviction added probation_charge to
+    // probation usage, so TryInsertSlot doesn't, and a path that doesn't put
+    // the entry in a slot takes it back out (UndoProbationPrecharge).
+    bool probation_precharged = false;
     // FIFOCache: whether DoInsert replaced an entry with the key, and the
     // bytes of table slots (see ChargeUsageMaybeEvictNonStrict) and of
     // probation rings (see EvictForChargedRing) the insert charged to usage.
@@ -1112,6 +1125,9 @@ class AutoHyperClockTable : public BaseClockTable {
   void GhostTake(const ClockHandleBasicData& proto, InsertState& state);
   void GhostPutBack(const ClockHandleBasicData& proto,
                     const InsertState& state);
+  // FIFOCache: for an insert that doesn't put its entry in a slot after its
+  // eviction added the entry's probation charge: takes the charge back out.
+  void UndoProbationPrecharge(const InsertState& state);
   // FIFOCache: whether the key is in the ghost.
   bool InGhost(const UniqueId64x2& hashed_key) const;
   // FIFOCache: whether the entry in a table slot is in the probation queue.
@@ -1236,10 +1252,12 @@ class AutoHyperClockTable : public BaseClockTable {
 
   // TryInsert for DoInsert that also writes the slot's probation word, with
   // word_flags, while the slot is under construction, so the entry is
-  // published with it. Sets *word to the word written.
+  // published with it, and counts the entry in its queue (in probation
+  // usage only if the insert's eviction hasn't, see
+  // InsertState::probation_precharged). Sets *word to the word written.
   bool TryInsertSlot(const ClockHandleBasicData& proto, size_t idx,
                      uint32_t initial_countdown, uint32_t word_flags,
-                     uint32_t* word);
+                     bool probation_precharged, uint32_t* word);
   // Pushes (slot idx, word) onto the probation queue, adding a larger ring
   // first if the newest is full and the table has outgrown it, adding the
   // ring's bytes to state.ring_charge if they are charged to usage.
@@ -1317,7 +1335,8 @@ class AutoHyperClockTable : public BaseClockTable {
   // probation_full_ if it moved it.
   void LeaveProbationUnowned(size_t idx, uint32_t word);
   // Adds the evictions and promotions in data, from one Evict call, to the
-  // counts.
+  // counts, and applies the call's pending changes to probation usage, its
+  // seen-pinned part and the resident count.
   void CountEvictions(const EvictionData& data);
   // Runs fn(entry) holding a reference to the entry in slot idx, as Lookup
   // takes one, so its charge can be read, unless the slot is empty or under
@@ -1337,6 +1356,10 @@ class AutoHyperClockTable : public BaseClockTable {
   // For whoever took ownership of the entry in slot idx to remove it: takes
   // it out of whichever queue's accounting it is in.
   void TrackRemoval(size_t idx, size_t total_charge);
+  // TrackRemoval for Evict's own removals, which adds the counter changes to
+  // data for CountEvictions to apply once.
+  void TrackEvictionRemoval(size_t idx, size_t total_charge,
+                            EvictionData* data);
   // Handles one probation head: skips it if stale, rotates it to the tail
   // if pinned, promotes it if hit kPromoteThreshold times (setting
   // *promoted), else evicts it. Returns false if the queue had nothing to
@@ -1401,7 +1424,9 @@ class AutoHyperClockTable : public BaseClockTable {
   ProbationQueue probation_;
 
   // FIFOCache: charge of the entries with kInProbation set, and of those
-  // that also have kSeenPinned set.
+  // that also have kSeenPinned set. An Evict call's removals come off, and
+  // its insert's probation charge goes on, when the call returns (see
+  // CountEvictions).
   ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<size_t> probation_usage_{};
   RelaxedAtomic<size_t> probation_pinned_usage_{};
 
@@ -1411,7 +1436,8 @@ class AutoHyperClockTable : public BaseClockTable {
   RelaxedAtomic<int64_t> resident_count_{};
 
   // FIFOCache: FIFOCacheStats' counts, on the cache line that inserts and
-  // evictions already write. The hit path counts nothing.
+  // Evict calls already write (CountEvictions, once per call). The hit path
+  // counts nothing.
   RelaxedAtomic<uint64_t> promotions_{};
   RelaxedAtomic<uint64_t> ghost_returns_{};
   RelaxedAtomic<uint64_t> probation_evictions_{};

@@ -518,8 +518,13 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
   // no charge, where HyperClockCache asks for a charge of 1.
   if (need_evict_charge > 0 || UNLIKELY(need_evict_for_occupancy)) {
     EvictionData data;
+    // FIFOCache: Evict adds the entry's probation charge with its own
+    // changes to the counters (see InsertState::probation_precharged).
+    assert(!state.probation_precharged);
+    data.probation_precharge = state.probation_charge;
     static_cast<Table*>(this)->Evict(need_evict_charge,
                                      need_evict_for_occupancy, state, &data);
+    state.probation_precharged = data.probation_precharge > 0;
     if (UNLIKELY(data.effort_cap_reached)) {
       eviction_effort_exceeded_count_.FetchAddRelaxed(1);
     }
@@ -594,8 +599,12 @@ inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
   // no charge, as in the strict case.
   EvictionData data;
   if (need_evict_charge > 0 || UNLIKELY(need_evict_for_occupancy)) {
+    // FIFOCache: as in the strict case.
+    assert(!state.probation_precharged);
+    data.probation_precharge = state.probation_charge;
     static_cast<Table*>(this)->Evict(need_evict_charge,
                                      need_evict_for_occupancy, state, &data);
+    state.probation_precharged = data.probation_precharge > 0;
     if (UNLIKELY(data.effort_cap_reached)) {
       eviction_effort_exceeded_count_.FetchAddRelaxed(1);
     }
@@ -668,11 +677,12 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   derived.StartInsert(state);
   EvictForChargedRing<Table> evict_for_ring(derived, state);
   // FIFOCache: for an insert accepted without a slot (dropped, or standalone
-  // with a handle): reverts occupancy, puts the ghost tag back, and erases
-  // any entry with the key, so the old value doesn't stay visible. Returns
-  // whether there was one.
+  // with a handle): reverts occupancy and the probation charge its eviction
+  // added, puts the ghost tag back, and erases any entry with the key, so
+  // the old value doesn't stay visible. Returns whether there was one.
   auto accept_without_slot = [&]() {
     occupancy_.FetchSubRelaxed(1);
+    derived.UndoProbationPrecharge(state);
     derived.GhostPutBack(proto, state);
     return derived.EraseReplaced(proto, nullptr);
   };
@@ -704,6 +714,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
     if (!s.ok()) {
       // Revert occupancy
       occupancy_.FetchSubRelaxed(1);
+      derived.UndoProbationPrecharge(state);
       derived.GhostPutBack(proto, state);
       // FIFOCache: without a handle, dropped as if inserted and evicted at
       // once, as FIFOCache and LRUCache do, where HyperClockCache returns
@@ -2545,14 +2556,15 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
   assert(home < used_length);
 
   size_t idx = home;
-  if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word)) {
+  if (TryInsertSlot(proto, idx, initial_countdown, word_flags,
+                    state.probation_precharged, &word)) {
     assert(idx == home);
     // Here we try to populate newly-opened slots in the table, but not
     // when we can add something to its home slot. This makes the structure
     // more performant more quickly on (initial) growth.
   } else if (UNLIKELY(state.likely_empty_slot > 0) &&
              TryInsertSlot(proto, state.likely_empty_slot, initial_countdown,
-                           word_flags, &word)) {
+                           word_flags, state.probation_precharged, &word)) {
     idx = state.likely_empty_slot;
   } else {
     // We need to search for an available slot outside of the home.
@@ -2586,7 +2598,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
       if (idx >= used_length) {
         idx -= used_length;
       }
-      if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word)) {
+      if (TryInsertSlot(proto, idx, initial_countdown, word_flags,
+                        state.probation_precharged, &word)) {
         break;
       }
     }
@@ -2636,7 +2649,8 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
             }
           }
         }
-        if (TryInsertSlot(proto, idx, initial_countdown, word_flags, &word)) {
+        if (TryInsertSlot(proto, idx, initial_countdown, word_flags,
+                          state.probation_precharged, &word)) {
           break;
         }
       }
@@ -3205,14 +3219,27 @@ void AutoHyperClockTable::EraseUnRefEntries() {
   }
 }
 
+namespace {
+// A counter read by Evict less the removals it has pending, at zero or more:
+// a step or clock sweep that marks an entry seen pinned adds its charge after
+// setting the bit, so an eviction can take the entry out before the add
+// lands.
+inline size_t SubtractPending(size_t counter, size_t pending) {
+  return counter > pending ? counter - pending : 0;
+}
+}  // namespace
+
 void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
                                 InsertState& state, EvictionData* data) {
   // precondition
   assert(requested_charge > 0 || need_entry);
-  // FIFOCache: each caller passes a fresh data, which this call's evictions
-  // and promotions are counted from once, on whichever return it takes.
+  // FIFOCache: each caller passes a fresh data (but for the insert's
+  // probation charge), which this call's evictions, promotions and counter
+  // changes are counted from once, on whichever return it takes.
   assert(data->freed_count == 0 && data->probation_freed_count == 0 &&
-         data->promoted_count == 0 && !data->effort_cap_reached);
+         data->promoted_count == 0 && data->probation_removed_charge == 0 &&
+         data->probation_pinned_removed_charge == 0 &&
+         data->resident_removed == 0 && !data->effort_cap_reached);
   struct CountOnReturn {
     AutoHyperClockTable& table;
     const EvictionData& data;
@@ -3273,15 +3300,24 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
 
   // Loop until enough freed, or limit reached (see bottom of loop)
   for (;;) {
-    const size_t probation_usage = probation_usage_.LoadRelaxed();
-    const size_t probation_pinned = probation_pinned_usage_.LoadRelaxed();
+    // The counters less this call's removals, which CountEvictions takes
+    // off on return. (The insert's precharge isn't in them either, and is
+    // state.probation_charge here.)
+    const size_t probation_usage =
+        SubtractPending(probation_usage_.LoadRelaxed(),
+                        data->probation_removed_charge);
+    const size_t probation_pinned =
+        SubtractPending(probation_pinned_usage_.LoadRelaxed(),
+                        data->probation_pinned_removed_charge);
     const size_t probation_unpinned = probation_usage > probation_pinned
                                           ? probation_usage - probation_pinned
                                           : 0;
     const bool probation_first =
         promoting || resident_exhausted ||
         probation_unpinned + state.probation_charge > probation_target ||
-        resident_count_.LoadRelaxed() <= 0;
+        resident_count_.LoadRelaxed() -
+                static_cast<int64_t>(data->resident_removed) <=
+            0;
     bool promoted = false;
     const size_t freed_before = data->freed_count;
     const size_t pinned_before = data->seen_pinned_count;
@@ -3343,7 +3379,8 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
 
     for (HandleImpl* h : to_finish_eviction) {
       // FIFOCache: a resident entry, by the check in ClockUpdate.
-      TrackRemoval(static_cast<size_t>(h - array_.Get()), h->total_charge);
+      TrackEvictionRemoval(static_cast<size_t>(h - array_.Get()),
+                           h->total_charge, data);
       TrackAndReleaseEvictedEntry(h);
       // NOTE: setting likely_empty_slot here can cause us to reduce the
       // portion of "at home" entries, probably because an evicted entry
@@ -3600,7 +3637,9 @@ size_t AutoHyperClockTable::ProbationTarget() const {
 
 bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
                                         size_t idx, uint32_t initial_countdown,
-                                        uint32_t word_flags, uint32_t* word) {
+                                        uint32_t word_flags,
+                                        bool probation_precharged,
+                                        uint32_t* word) {
   HandleImpl& h = array_[idx];
   if (!BeginSlotInsert(h)) {
     return false;
@@ -3614,8 +3653,11 @@ bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
       word_flags;
   w.StoreRelaxed(*word);
   if (word_flags & kInProbation) {
-    probation_usage_.FetchAddRelaxed(proto.GetTotalCharge());
+    if (!probation_precharged) {
+      probation_usage_.FetchAddRelaxed(proto.GetTotalCharge());
+    }
   } else {
+    assert(!probation_precharged);
     resident_count_.FetchAddRelaxed(1);
   }
   // Publishes the word with the entry (a release store).
@@ -3939,6 +3981,28 @@ void AutoHyperClockTable::TrackRemoval(size_t idx, size_t total_charge) {
   }
 }
 
+void AutoHyperClockTable::TrackEvictionRemoval(size_t idx, size_t total_charge,
+                                               EvictionData* data) {
+  // The word is cleared now, so nothing moves the entry between the
+  // counters' parts once it is gone; the counters change on return.
+  const uint32_t old_word =
+      probation_words_[idx].FetchAndRelaxed(~(kInProbation | kSeenPinned));
+  if (old_word & kInProbation) {
+    data->probation_removed_charge += total_charge;
+    if (old_word & kSeenPinned) {
+      data->probation_pinned_removed_charge += total_charge;
+    }
+  } else {
+    data->resident_removed += 1;
+  }
+}
+
+void AutoHyperClockTable::UndoProbationPrecharge(const InsertState& state) {
+  if (state.probation_precharged) {
+    probation_usage_.FetchSubRelaxed(state.probation_charge);
+  }
+}
+
 template <typename Fn>
 void AutoHyperClockTable::WithReference(size_t idx, const Fn& fn) {
   HandleImpl& h = array_[idx];
@@ -4109,7 +4173,7 @@ bool AutoHyperClockTable::ProbationStep(EvictionData* data, InsertState& state,
       // Evicted rather than erased, and not a placeholder.
       GhostPut(h.hashed_key);
     }
-    TrackRemoval(idx, total_charge);
+    TrackEvictionRemoval(idx, total_charge, data);
     data->freed_charge += total_charge;
     data->freed_count += 1;
     data->probation_freed_count += 1;
@@ -4133,6 +4197,22 @@ void AutoHyperClockTable::LeaveProbationUnowned(size_t idx, uint32_t word) {
 }
 
 void AutoHyperClockTable::CountEvictions(const EvictionData& data) {
+  // The insert's probation charge and the removals in one change.
+  if (data.probation_precharge > data.probation_removed_charge) {
+    probation_usage_.FetchAddRelaxed(data.probation_precharge -
+                                     data.probation_removed_charge);
+  } else if (data.probation_removed_charge > data.probation_precharge) {
+    probation_usage_.FetchSubRelaxed(data.probation_removed_charge -
+                                     data.probation_precharge);
+  }
+  if (data.probation_pinned_removed_charge > 0) {
+    probation_pinned_usage_.FetchSubRelaxed(
+        data.probation_pinned_removed_charge);
+  }
+  if (data.resident_removed > 0) {
+    resident_count_.FetchSubRelaxed(
+        static_cast<int64_t>(data.resident_removed));
+  }
   if (data.promoted_count > 0) {
     promotions_.FetchAddRelaxed(data.promoted_count);
   }

@@ -912,6 +912,8 @@ TEST_F(FIFOCacheTest, StrictInsertWithHandleFailsWhenAllPinned) {
   EXPECT_EQ(nullptr, pc);
   EXPECT_FALSE(Contains(cache.get(), K("c")));
   EXPECT_EQ(2, cache->GetUsage());
+  // The refused entry's charge isn't left in probation's.
+  EXPECT_EQ(2, Fifo(cache.get())->TEST_GetProbationUsage());
   // An entry larger than the capacity never fits.
   cache->Release(pa);
   s = Insert(cache.get(), K("big"), 3, &pc);
@@ -2397,11 +2399,86 @@ TEST_F(FIFOCacheTest, ProbationBudgetCountsIncomingCharge) {
   EXPECT_EQ((std::vector<std::string>{K(0), K("big")}), evicted);
 }
 
+// The queue choice is made again at each step of one insert's eviction,
+// counting what the steps before it removed: a ghost return of 10 * kU,
+// which charges nothing to probation, over probation at 21 * kU takes nine
+// heads, which bring probation to its share, and then the resident clock
+// pays the rest with big.
+TEST_F(FIFOCacheTest, ProbationStopsPayingAtItsShareWithinOneInsert) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  const std::vector<std::string> nine = NineKeysWithOwnHomes(cache.get());
+  GhostNineBehindBig(cache.get(), fifo, nine);
+  evicted.clear();
+  ASSERT_OK(Insert(cache.get(), nine[0], 10 * kU));
+  std::vector<std::string> expected;
+  for (uint32_t i = 0; i < 9; ++i) {
+    expected.push_back(K(i));
+  }
+  expected.push_back(K("big"));
+  EXPECT_EQ(expected, evicted);
+  EXPECT_EQ(12 * kU, fifo->TEST_GetProbationUsage());
+  EXPECT_FALSE(fifo->TEST_InProbation(nine[0]));
+  EXPECT_EQ(22 * kU, cache->GetUsage());
+}
+
 // Long-lived pins in probation, such as cache reservations or pinned index
 // and filter blocks, leave its share once an eviction step sees them
 // pinned, so with 13 pins over a share of 12 the resident clock still runs:
 // an entry there with no hits goes rather than the next unpinned probation
 // entry.
+// A head a step marked seen pinned, evicted once its pin is released,
+// leaves probation's pinned part as it leaves probation, so the unpinned
+// part the next step weighs is what it was: z, at 4 * kU over probation's 9
+// unpinned, takes the four released pins at the head. Were the pinned part
+// left as it was, the second step would see probation at its share and leave
+// the rest to the resident clock, which would take big.
+TEST_F(FIFOCacheTest, ProbationKeepsPayingAsItEvictsReleasedPins) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  std::vector<Cache::Handle*> pins;
+  for (uint32_t i = 200; i < 205; ++i) {
+    Cache::Handle* h = nullptr;
+    ASSERT_OK(Insert(cache.get(), K(i), kU, &h));
+    pins.push_back(h);
+  }
+  ASSERT_OK(Insert(cache.get(), K("big"), 86 * kU));
+  HitNTimes(cache.get(), K("big"), 2);
+  for (uint32_t i = 0; i < 9; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  EXPECT_EQ(100 * kU, cache->GetUsage());
+  // The pins rotate, marked seen pinned, big is promoted and K(0) evicted.
+  EXPECT_OK(Insert(cache.get(), K("t"), kU));
+  EXPECT_EQ(std::vector<std::string>{K(0)}, evicted);
+  EXPECT_EQ(5 * kU, fifo->TEST_GetProbationPinnedUsage());
+  for (Cache::Handle* h : pins) {
+    EXPECT_FALSE(cache->Release(h));
+  }
+  // Erasing K(1)..K(8) leaves the released pins at probation's head, and
+  // entries queued behind t fill the cache again.
+  for (uint32_t i = 1; i < 9; ++i) {
+    cache->Erase(K(i));
+  }
+  for (uint32_t i = 100; i < 108; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), kU));
+  }
+  ASSERT_EQ(100 * kU, cache->GetUsage());
+  ASSERT_EQ(14 * kU, fifo->TEST_GetProbationUsage());
+  ASSERT_EQ(5 * kU, fifo->TEST_GetProbationPinnedUsage());
+  ASSERT_OK(Insert(cache.get(), K("z"), 4 * kU));
+  EXPECT_EQ((std::vector<std::string>{K(0), K(200), K(201), K(202), K(203)}),
+            evicted);
+  EXPECT_TRUE(Holds(cache.get(), K("big")));
+  EXPECT_TRUE(Holds(cache.get(), K(204)));
+  EXPECT_EQ(14 * kU, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(kU, fifo->TEST_GetProbationPinnedUsage());
+}
+
 TEST_F(FIFOCacheTest, PinnedProbationEntriesDoNotHoldBudget) {
   std::vector<std::string> evicted;
   std::shared_ptr<Cache> cache = NewCache(100 * kU);
@@ -3171,6 +3248,10 @@ TEST_F(FIFOCacheTest, FullTableEvictsByOccupancyOrGoesStandalone) {
     pins.push_back(h);
   }
   EXPECT_EQ(1639, cache->GetOccupancyCount());
+  // None of the three inserts below that evict for a slot and find none
+  // leaves its charge in probation's.
+  FIFOCache* fifo = Fifo(cache.get());
+  EXPECT_EQ(1639, fifo->TEST_GetProbationUsage());
   Cache::Handle* outside = nullptr;
   Status s = Insert(cache.get(), K("outside"), 1, &outside);
   EXPECT_TRUE(s.IsOkOverwritten()) << s.ToString();
@@ -3178,15 +3259,18 @@ TEST_F(FIFOCacheTest, FullTableEvictsByOccupancyOrGoesStandalone) {
   EXPECT_EQ(1639, cache->GetOccupancyCount());
   EXPECT_FALSE(Contains(cache.get(), K("outside")));
   EXPECT_EQ(1640, cache->GetPinnedUsage());
+  EXPECT_EQ(1639, fifo->TEST_GetProbationUsage());
   EXPECT_TRUE(cache->Release(outside));
   ASSERT_OK(Insert(cache.get(), K("dropped")));
   EXPECT_FALSE(Holds(cache.get(), K("dropped")));
   EXPECT_EQ(1639, cache->GetUsage());
+  EXPECT_EQ(1639, fifo->TEST_GetProbationUsage());
   cache->SetStrictCapacityLimit(true);
   Cache::Handle* strict = nullptr;
   s = Insert(cache.get(), K("strict"), 1, &strict);
   EXPECT_TRUE(s.IsMemoryLimit()) << s.ToString();
   EXPECT_EQ(nullptr, strict);
+  EXPECT_EQ(1639, fifo->TEST_GetProbationUsage());
   for (Cache::Handle* h : pins) {
     EXPECT_FALSE(cache->Release(h));
   }
@@ -5743,27 +5827,72 @@ TEST_F(FIFOCacheTest, EmptyResidentQueueSkipsTheClock) {
   std::vector<Cache::Handle*> pins;
   for (uint32_t i = 200; i < 223; ++i) {
     Cache::Handle* h = nullptr;
-    ASSERT_OK(Insert(cache.get(), K(i), i < 222 ? 4 * kU : kU, &h));
+    EXPECT_OK(Insert(cache.get(), K(i), i < 222 ? 4 * kU : kU, &h));
     pins.push_back(h);
   }
   for (uint32_t i = 0; i < 11; ++i) {
-    ASSERT_OK(Insert(cache.get(), K(i), kU));
+    EXPECT_OK(Insert(cache.get(), K(i), kU));
   }
-  ASSERT_EQ(100 * kU, cache->GetUsage());
+  EXPECT_EQ(100 * kU, cache->GetUsage());
   // Over its share: the pins rotate and K(0) is evicted.
-  ASSERT_OK(Insert(cache.get(), K("y"), kU));
-  ASSERT_EQ(std::vector<std::string>{K(0)}, evicted);
-  ASSERT_EQ(89 * kU, fifo->TEST_GetProbationPinnedUsage());
+  EXPECT_OK(Insert(cache.get(), K("y"), kU));
+  EXPECT_EQ(std::vector<std::string>{K(0)}, evicted);
+  EXPECT_EQ(89 * kU, fifo->TEST_GetProbationPinnedUsage());
   // Probation's 11 unpinned plus z's 1 make its share of 12.
   size_t resident_steps = 0;
   SyncPoint::GetInstance()->SetCallBack("FIFOCache::Evict:ResidentStep",
                                         [&](void*) { ++resident_steps; });
   SyncPoint::GetInstance()->EnableProcessing();
-  ASSERT_OK(Insert(cache.get(), K("z"), kU));
+  EXPECT_OK(Insert(cache.get(), K("z"), kU));
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   EXPECT_EQ((std::vector<std::string>{K(0), K(1)}), evicted);
   EXPECT_EQ(0, resident_steps);
+  for (Cache::Handle* h : pins) {
+    EXPECT_FALSE(cache->Release(h));
+  }
+}
+
+// The step that takes the resident queue's last entry hands the insert to
+// probation, as an empty resident queue does, rather than running the clock
+// on over a table it can take nothing more from: z, landing probation at its
+// share, needs more than r's charge, and probation pays the rest with K(1).
+TEST_F(FIFOCacheTest, ClockStopsAtTheStepThatEmptiesTheResidentQueue) {
+  std::vector<std::string> evicted;
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  RecordEvictions(cache.get(), &evicted);
+  FIFOCache* fifo = Fifo(cache.get());
+  std::vector<Cache::Handle*> pins;
+  for (uint32_t i = 200; i < 223; ++i) {
+    Cache::Handle* h = nullptr;
+    EXPECT_OK(Insert(cache.get(), K(i), i < 222 ? 4 * kU : kU, &h));
+    pins.push_back(h);
+  }
+  EXPECT_OK(Insert(cache.get(), K("r"), kU));
+  HitNTimes(cache.get(), K("r"), 2);
+  for (uint32_t i = 0; i < 10; ++i) {
+    EXPECT_OK(Insert(cache.get(), K(i), kU));
+  }
+  EXPECT_EQ(100 * kU, cache->GetUsage());
+  // The pins rotate, r is promoted and K(0) is evicted.
+  EXPECT_OK(Insert(cache.get(), K("y"), kU));
+  EXPECT_EQ(std::vector<std::string>{K(0)}, evicted);
+  EXPECT_EQ(99 * kU, fifo->TEST_GetProbationUsage());
+  EXPECT_EQ(89 * kU, fifo->TEST_GetProbationPinnedUsage());
+  size_t steps_after_r = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FIFOCache::Evict:ResidentStep", [&](void*) {
+        if (std::find(evicted.begin(), evicted.end(), K("r")) !=
+            evicted.end()) {
+          ++steps_after_r;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  EXPECT_OK(Insert(cache.get(), K("z"), 2 * kU));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ((std::vector<std::string>{K(0), K("r"), K(1)}), evicted);
+  EXPECT_EQ(0, steps_after_r);
   for (Cache::Handle* h : pins) {
     EXPECT_FALSE(cache->Release(h));
   }
