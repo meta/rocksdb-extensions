@@ -55,7 +55,7 @@ if [[ ! -f "${revision_marker}" ||
   rm -rf "${rocksdb_source}"
   mkdir -p "${rocksdb_source}"
   curl -fsSL --retry 3 \
-    "https://github.com/facebook/rocksdb/archive/${rocksdb_revision}.tar.gz" |
+    "https://github.com/meta/rocksdb/archive/${rocksdb_revision}.tar.gz" |
     tar -xz --strip-components=1 -C "${rocksdb_source}"
   printf '%s\n' "${rocksdb_revision}" > "${revision_marker}"
 fi

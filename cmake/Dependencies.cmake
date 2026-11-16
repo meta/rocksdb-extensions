@@ -7,10 +7,10 @@ include_guard(GLOBAL)
 
 include(FetchContent)
 
-set(ROCKSDB_EXTENSIONS_ROCKSDB_GIT_REPOSITORY "https://github.com/facebook/rocksdb.git" CACHE STRING "RocksDB repository")
+set(ROCKSDB_EXTENSIONS_ROCKSDB_GIT_REPOSITORY "https://github.com/meta/rocksdb.git" CACHE STRING "RocksDB repository")
 set(ROCKSDB_EXTENSIONS_ROCKSDB_GIT_TAG "main" CACHE STRING "RocksDB revision with external_table.h support")
 set(ROCKSDB_EXTENSIONS_ROCKSDB_SOURCE_DIR "" CACHE PATH "Optional local RocksDB source directory")
-set(ROCKSDB_EXTENSIONS_FOLLY_GIT_REPOSITORY "https://github.com/facebook/folly.git" CACHE STRING "Folly repository")
+set(ROCKSDB_EXTENSIONS_FOLLY_GIT_REPOSITORY "https://github.com/meta/folly.git" CACHE STRING "Folly repository")
 set(ROCKSDB_EXTENSIONS_FOLLY_GIT_TAG "main" CACHE STRING "Folly revision")
 set(ROCKSDB_EXTENSIONS_FOLLY_SOURCE_DIR "" CACHE PATH "Optional local Folly source directory")
 set(ROCKSDB_EXTENSIONS_VELOX_GIT_REPOSITORY "https://github.com/facebookincubator/velox.git" CACHE STRING "Velox repository")

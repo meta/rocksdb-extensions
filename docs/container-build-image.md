@@ -15,7 +15,7 @@ for devvm parity and reproducing local package behavior.
 
 `scripts/build-container-image.sh` is adapted from
 `/home/xbw/bin/rocksdb-docker-build.sh`. The original script builds upstream
-RocksDB Ubuntu images for `ghcr.io/facebook/rocksdb_ubuntu`; this repository's
+RocksDB Ubuntu images for `ghcr.io/meta/rocksdb_ubuntu`; this repository's
 copy builds `rocksdb-extensions` images and can optionally validate the repo
 build inside the image.
 
@@ -63,7 +63,7 @@ Build with the host-side devvm apt proxy:
 Override tags or base images with environment variables:
 
 ```bash
-IMAGE_REGISTRY=ghcr.io/facebook \
+IMAGE_REGISTRY=ghcr.io/meta \
 IMAGE_PREFIX=rocksdb-extensions \
 UBUNTU_BASE_IMAGE=<internal-mirror>/ubuntu:24.04 \
 CENTOS_BASE_IMAGE=<internal-mirror>/centos/centos:stream9 \
@@ -79,7 +79,7 @@ are configurable because some environments block public registry pulls.
 podman run --rm -it \
   -v "$PWD:/workspace/rocksdb-extensions:Z" \
   -w /workspace/rocksdb-extensions \
-  ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0 \
+  ghcr.io/meta/rocksdb-extensions_ubuntu:24.0 \
   ./scripts/build-latest-releases.sh --locked
 ```
 
@@ -91,7 +91,7 @@ podman run --rm -it \
   -w /workspace/rocksdb-extensions \
   -e ROCKSDB_REVISION=v11.8.1 \
   -e NIMBLE_REVISION=<nimble-commit> \
-  ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0 \
+  ghcr.io/meta/rocksdb-extensions_ubuntu:24.0 \
   ./scripts/build-latest-releases.sh
 ```
 

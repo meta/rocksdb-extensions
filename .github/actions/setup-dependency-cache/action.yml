@@ -110,7 +110,7 @@ runs:
           sha256sum "${executable_path}" | cut -d' ' -f1
         }
 
-        rocksdb_commit="$(resolve_remote_ref facebook/rocksdb "${ROCKSDB_REVISION}")"
+        rocksdb_commit="$(resolve_remote_ref meta/rocksdb "${ROCKSDB_REVISION}")"
         nimble_commit="$(resolve_remote_ref facebookincubator/nimble "${NIMBLE_REVISION}")"
         cc_content_hash="$(fingerprint_executable "${CACHE_CC}")"
         cxx_content_hash="$(fingerprint_executable "${CACHE_CXX}")"
