@@ -36,6 +36,10 @@ class FIFOCache
   // What HyperClockCache logs at DEBUG level, then GetStats at INFO level.
   void ReportProblems(const std::shared_ptr<Logger>& info_log) const override;
 
+  // For GetPrintableOptions, after the options every sharded cache prints:
+  // metadata_charge_policy, and max_capacity as it was set.
+  void AppendPrintableOptions(std::string& str) const override;
+
   // GetOptionsPtr(kSelfName) returns this FIFOCache. The adapter
   // MakeSharedCache wraps it in for a secondary cache reports the same
   // Name() and forwards this one name, so GetFIFOCacheStats finds the
@@ -62,6 +66,10 @@ class FIFOCache
   // The start of each shard's table mappings (see
   // AutoHyperClockTable::TEST_GetMappings).
   std::vector<const void*> TEST_GetMappings() const;
+
+ private:
+  const size_t max_capacity_;
+  const CacheMetadataChargePolicy metadata_charge_policy_;
 };
 
 }  // namespace fifo_cache

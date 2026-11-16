@@ -39,7 +39,20 @@ HyperClockCacheOptions TableOptions(const FIFOCacheOptions& opts) {
 }  // namespace
 
 FIFOCache::FIFOCache(const FIFOCacheOptions& opts)
-    : AutoHyperClockCache(TableOptions(opts), opts.max_capacity) {}
+    : AutoHyperClockCache(TableOptions(opts), opts.max_capacity),
+      max_capacity_(opts.max_capacity),
+      metadata_charge_policy_(opts.metadata_charge_policy) {}
+
+void FIFOCache::AppendPrintableOptions(std::string& str) const {
+  AutoHyperClockCache::AppendPrintableOptions(str);
+  str.append("    metadata_charge_policy : ");
+  str.append(metadata_charge_policy_ == kFullChargeCacheMetadata
+                 ? "kFullChargeCacheMetadata"
+                 : "kDontChargeCacheMetadata");
+  str.append("\n    max_capacity : ");
+  str.append(std::to_string(max_capacity_));
+  str.append("\n");
+}
 
 size_t FIFOCache::TEST_GetProbationUsage() const {
   return SumOverShards(
@@ -96,18 +109,22 @@ FIFOCacheStats FIFOCache::GetStats() const {
 }
 
 void FIFOCache::ReportProblems(const std::shared_ptr<Logger>& info_log) const {
+  if (info_log == nullptr) {
+    // RocksDB checks for a logger before calling; a direct caller may not.
+    return;
+  }
   AutoHyperClockCache::ReportProblems(info_log);
   const FIFOCacheStats stats = GetStats();
-  ROCKS_LOG_INFO(info_log,
-                 "FIFOCache stats: probation usage %zu, pinned allowance %zu, "
-                 "promotions %" PRIu64
-                 ", ghost returns %" PRIu64 ", probation evictions %" PRIu64
-                 ", resident evictions %" PRIu64 ", effort cap stops %" PRIu64
-                 ", probation full %" PRIu64,
-                 stats.probation_usage, stats.pinned_allowance,
-                 stats.promotions, stats.ghost_returns,
-                 stats.probation_evictions, stats.resident_evictions,
-                 stats.effort_cap_stops, stats.probation_full);
+  ROCKS_LOG_INFO(
+      info_log,
+      "FIFOCache stats: probation usage %zu, pinned allowance %zu, "
+      "promotions %" PRIu64 ", ghost returns %" PRIu64
+      ", probation evictions %" PRIu64 ", resident evictions %" PRIu64
+      ", effort cap stops %" PRIu64 ", probation full %" PRIu64
+      ", pinned twice %" PRIu64,
+      stats.probation_usage, stats.pinned_allowance, stats.promotions,
+      stats.ghost_returns, stats.probation_evictions, stats.resident_evictions,
+      stats.effort_cap_stops, stats.probation_full, stats.pinned_twice);
 }
 
 const void* FIFOCache::GetOptionsPtr(const std::string& name) const {

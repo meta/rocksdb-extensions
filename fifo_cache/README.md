@@ -6,12 +6,18 @@ Eviction*](https://jasony.me/publication/sosp23-s3fifo.pdf) (SOSP '23):
 
 - New entries enter a small probation queue. Entries read only once, and
   scans, leave through it without disturbing the hot set.
-- Probation entries that were hit again are promoted to the resident queue,
-  which evicts with a second-chance clock.
+- Probation entries hit at least twice by the time they reach its head are
+  promoted to the resident queue. That queue is HyperClockCache's clock,
+  which keeps up to three hits per entry and visits entries in the table's
+  order, not in the order they arrived as the paper's main queue does.
 - Keys evicted from probation are remembered (16 bits of each key's hash,
   no values) for as many probation evictions as the resident queue's share
   of the shard's entries, as in the paper; re-inserting one goes straight
   to resident.
+- Cache reservations, the entries with no value that `WriteBufferManager`
+  and `CacheReservationManager` insert to account memory, go straight to the
+  resident queue and are never remembered. A probation entry still held
+  through a handle when it reaches the head a second time goes there too.
 - There is no shard mutex. Each shard is HyperClockCache's hash table: a
   lookup takes no lock, bumps a per-entry counter and moves nothing, an
   insert links its entry without a lock, and erasing, evicting (for an
@@ -175,7 +181,8 @@ which also finds the cache behind the secondary-cache adapter that
 rocksdb::FIFOCacheStats stats;
 if (rocksdb::GetFIFOCacheStats(*table_options.block_cache, &stats)) {
   // stats.probation_usage, pinned_allowance, promotions, ghost_returns,
-  // probation_evictions, resident_evictions, effort_cap_stops, probation_full
+  // probation_evictions, resident_evictions, effort_cap_stops, probation_full,
+  // pinned_twice
 }
 ```
 
@@ -198,7 +205,13 @@ grow within capacity. `pinned_allowance` is how far probation's share has
 grown past 12% of capacity because entries reached the head of the queue
 still held through the handle their insert returned. It stays near zero
 unless those handles are kept for about as long as new entries take to
-reach the head, and it is at most four times that 12%.
+reach the head, and it is at most four times that 12%. `pinned_twice` counts
+entries that went from probation to the resident queue because they were
+still held a lap after a step first found them held, such as the index and
+filter blocks a table reader pins: those are passed over by the resident
+clock as HyperClockCache's would, and each one adds its charge to
+`pinned_allowance` once, which unpinned entries reaching the head then take
+back a sixteenth at a time.
 
 ## Limitations
 

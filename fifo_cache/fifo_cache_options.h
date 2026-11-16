@@ -28,13 +28,16 @@ namespace ROCKSDB_NAMESPACE {
 // resident queue instead of being evicted. The share grows, up to five
 // times that, while entries reach the head still held through the handle
 // their insert returned, until most are released by the time they get
-// there. The resident queue is a clock over the table that keeps up to
-// three hits per entry. Keys (not values) recently evicted from probation
+// there. The resident queue is HyperClockCache's clock, which keeps up to
+// three hits per entry and visits entries in the table's order rather than
+// the order they arrived. Keys (not values) recently evicted from probation
 // are remembered, and inserting one again puts it straight into the
-// resident queue. Placement comes from hits alone: Cache::Priority is
-// ignored. GetFIFOCacheStats (below) reports what the queues did, and
-// Cache::ReportProblems, which RocksDB calls at each stats dump, logs the
-// same at INFO level.
+// resident queue. So does inserting an entry with no value and a helper
+// other than kNoopCacheItemHelper, as RocksDB's cache reservations are,
+// which is never remembered either. Placement comes from hits alone:
+// Cache::Priority is ignored. GetFIFOCacheStats (below) reports what the queues
+// did, and Cache::ReportProblems, which RocksDB calls at each stats dump, logs
+// the same at INFO level.
 //
 // A negative num_shard_bits (the default) gives each shard at least 4 MiB, up
 // to 64 shards, so a cache under 8 MiB has one. LRUCache defaults to 512 KiB
@@ -62,9 +65,14 @@ namespace ROCKSDB_NAMESPACE {
 // otherwise wherever a new entry would go, and it starts with the old one's
 // hits plus one, up to 3, counting the insert as a hit.
 //
-// Pinned entries are never evicted. Without strict_capacity_limit, an
-// insert's eviction gives up once it has passed 30 pinned entries for each
-// entry it freed, plus 30, and the insert takes usage over capacity, as in
+// Pinned entries are never evicted. A probation entry still pinned when
+// the queue's head reaches it again, a lap after it went to the tail for
+// being pinned, goes to the resident queue, whose clock passes over it
+// while it stays pinned, as HyperClockCache's does. Without
+// strict_capacity_limit, an insert's eviction stops stepping a queue once
+// those steps have passed 30 pinned entries for each entry it freed, plus
+// 30 (the clock counting the pinned probation entries it passes), and
+// gives up when it has stopped both, taking usage over capacity, as in
 // HyperClockCache; later inserts evict back as eviction reaches unpinned
 // entries. Releasing the last reference to an entry doesn't erase it, even
 // over capacity, unless erase_if_last_ref is set. With
@@ -81,12 +89,15 @@ namespace ROCKSDB_NAMESPACE {
 // holding the slot it maps to, and counts for as many probation evictions
 // as the shard has entries less probation's 12% (rounded down), the size of
 // S3-FIFO's ghost, rounded up to the count's step: one eviction for a shard
-// reserved for up to about 2.6 MB (see max_capacity below), 2^n for one
-// reserved for 2^n times that. A victim
-// whose group has no empty cell replaces the oldest, unless all eight are
-// from its own step, and while a group's eight cells all count, an insert
-// of a key that isn't remembered matches one of them 1 time in 8,192. A
-// cell that stopped counting counts again if the shard later holds enough
+// of up to about 2.6 MB capacity, 2^n for one of 2^n times that, whatever
+// max_capacity (see below) reserves. A SetCapacity that changes the step
+// forgets the remembered keys. A cell counts for at most 32,768 steps, which
+// falls short of that share only for entries averaging under 70 bytes of
+// charge, under kDontChargeCacheMetadata with max_capacity above capacity.
+// A victim whose group has no empty cell replaces the oldest, unless all
+// eight are from its own step, and while a group's eight cells all count, an
+// insert of a key that isn't remembered matches one of them 1 time in 8,192.
+// A cell that stopped counting counts again if the shard later holds enough
 // entries for that count to cover the evictions since its key's, or 65,280
 // steps on.
 // Under kFullChargeCacheMetadata (the default) the table counts against
@@ -197,6 +208,14 @@ struct FIFOCacheStats {
   // a new one couldn't be added: under strict_capacity_limit, when it
   // didn't fit within capacity.
   uint64_t probation_full = 0;
+  // Entries that went to the resident queue because a probation step found
+  // them pinned a lap after it had moved them to the tail for being pinned:
+  // entries held for longer than the queue's laps, as a table reader holds
+  // pinned index and filter blocks, or that lookups keep pinned. The
+  // resident clock passes over them while they stay pinned, as
+  // HyperClockCache's does. Each one its inserter alone held on its first
+  // visit added its charge to pinned_allowance then.
+  uint64_t pinned_twice = 0;
 };
 
 // Sets *stats to the FIFOCacheStats of the FIFOCache that cache is, or that
