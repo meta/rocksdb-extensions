@@ -1146,6 +1146,11 @@ class AutoHyperClockTable : public BaseClockTable {
   void EraseUnRefEntries();
 
   size_t GetTableSize() const;
+  // FIFOCache: the slots Grow has claimed, each charged then. Grows that
+  // finish out of order can leave it ahead of GetTableSize() until an
+  // insert brings the length up, with entries in the slots between, so
+  // scans of the table's entries go this far.
+  size_t GetClaimedLength() const;
 
   size_t GetOccupancyLimit() const;
 
@@ -1217,10 +1222,8 @@ class AutoHyperClockTable : public BaseClockTable {
   void UndoProbationPrecharge(const InsertState& state);
   // FIFOCache: whether the key is in the ghost.
   bool InGhost(const UniqueId64x2& hashed_key) const;
-  // FIFOCache: whether the resident clock is resting (see clock_laps_),
-  // and whether the latest rest set lasts, called off or not.
+  // FIFOCache: whether the resident clock is resting (see clock_laps_).
   bool ClockResting() const;
-  bool ClockRestLasts() const;
   // FIFOCache: whether the entry in a table slot is in the probation queue.
   bool IsInProbation(const HandleImpl* h) const;
   // FIFOCache: whether the entry's counters still include the reference
@@ -1480,16 +1483,23 @@ class AutoHyperClockTable : public BaseClockTable {
   // seen-pinned part and the resident count.
   void CountEvictions(const EvictionData& data);
   // Counts a probation eviction in data, adding the call's pending ones to
-  // probation_evictions_ once there are kMaxPendingProbationEvictions.
+  // probation_evictions_ once there are kMaxPendingProbationEvictions, and
+  // then clearing a rest that is over (see clock_laps_).
   void CountProbationEviction(EvictionData* data);
   // At the return to the start of the table that ends lap `lap` (see
-  // clock_laps_): sets a rest and returns true if no step has credited that
-  // lap or a later one.
-  bool RestClockAfterLap(uint32_t lap);
+  // clock_laps_): sets a rest lasting until probation_evictions_ reaches
+  // `end` and returns true if no step has credited that lap or a later one.
+  bool RestClockAfterLap(uint32_t lap, uint64_t end);
   // Credits lap `lap` for a step that evicted or ran down a countdown,
-  // calling off a standing rest that judged it. Returns whether it called
-  // one off.
+  // which ends a standing rest if the lap is later than the credited one.
+  // Returns whether the lap was the one the rest judged and the rest
+  // lasted, so that the credit called it off.
   bool CreditClockLap(uint32_t lap);
+  // Whether the rest in clock_laps_ word `laps` lasts at `evictions`
+  // probation evictions; and, if it is over, clears it from clock_laps_
+  // while the word is still `laps`.
+  static bool ClockRestLasts(uint64_t laps, uint64_t evictions);
+  void EndClockRestIfOver(uint64_t laps, uint64_t evictions);
   // The call's probation evictions not yet in probation_evictions_.
   static size_t PendingProbationEvictions(const EvictionData& data) {
     return data.probation_freed_count - data.probation_freed_published;
@@ -1641,47 +1651,59 @@ class AutoHyperClockTable : public BaseClockTable {
   // its first step (the clock pointer over the step size, mod 2^32). A lap
   // none of whose steps evicted an entry or ran down a countdown found
   // nothing in the resident queue but pinned entries, so the return that
-  // ends it sets clock_rest_until_ to as many probation evictions ahead as
-  // the shard has entries, and until probation_evictions_ reaches it Evict
-  // sends probation first, as for a resident queue of cache reservations
-  // alone, the rest of that call included. A resident queue of entries held
-  // for good, such as pinned index and filter blocks in a cache they nearly
+  // ends it rests the clock for as many probation evictions as the shard
+  // has entries (up to kMaxClockRest), counted from the return with that
+  // call's own evictions so far included, and while it rests Evict sends
+  // probation first, as for a resident queue of cache reservations alone,
+  // the rest of that call included. A resident queue of entries held for
+  // good, such as pinned index and filter blocks in a cache they nearly
   // fill, then costs a lap of the clock about once per turnover of the
-  // shard, not a sweep on every insert, and an entry released meanwhile
-  // waits for the clock until the rest is over. A call whose probation has
-  // nothing to pop still steps the clock.
+  // shard, not a sweep on every insert. A call whose probation has nothing
+  // to pop still steps the clock.
   //
   // clock_laps_ holds, in its low 32 bits, the latest lap credited by a step
-  // that evicted or ran down a countdown, and above them a bit set while a rest
-  // stands and the lap that rest judged, mod 2^31. On a small shard, a lap's
-  // steps can still be under way when another thread's step ends it, as many
-  // laps of them as threads stepping the clock cover. So a return rests the
-  // clock only if no step has credited the lap it ends (or a later one), and a
-  // step crediting the lap a standing rest judged calls the rest off while it
-  // lasts, which takes it out of resident_all_pinned (see
-  // clock_rests_called_off_). A step still under way when a later lap rests the
-  // clock finds that lap's rest in the word, so its own lap stays counted. Both
-  // go by compare-and-swap on the one word, so a step either credits its lap
-  // before the return reads the word or finds the rest the return set there. A
-  // useful step writes the word only for a lap's first credit or to call a rest
-  // off, and a return only to set a rest, which also credits the word up to the
-  // step before the lap it judged. So at each return the credited lap is within
-  // a lap of the clock, and comparing step numbers mod 2^32 holds between
-  // returns, which are at most 2^30 steps apart. A rest that is over keeps its
-  // bit, and only a rest that lasts is called off, so a lap 2^31 steps on, with
-  // the judged number mod 2^31, calls one off only if the clock took that many
-  // steps while it lasted, as it does only for calls whose probation has
-  // nothing to pop. The word starts with lap 0 credited, so the first lap isn't
-  // judged before it starts. The two sit on a line of their own: every eviction
-  // reads clock_rest_until_ and every useful step clock_laps_, and each is
-  // written about twice a lap at most.
+  // that evicted or ran down a countdown; above them a bit set while a rest
+  // stands; and above that the probation eviction count at which the rest
+  // ends, mod 2^31. A return rests the clock only if no step has credited
+  // the lap it ends (or a later one), and the rest credits the word up to
+  // the step before that lap, so while the bit is set the lap the rest
+  // judged is the one after the credited lap. On a small shard, a lap's
+  // steps can still be under way when another thread's step ends it, as
+  // many laps of them as threads stepping the clock cover. A step crediting
+  // the lap a standing rest judged calls the rest off while it lasts, which
+  // takes it out of resident_all_pinned (see clock_rests_called_off_). A
+  // step crediting a later lap ends the rest too, as something in the
+  // resident queue isn't pinned, but the lap judged found only pinned
+  // entries, so the rest stays counted. The credit, the rest and its end
+  // change only by compare-and-swap of the whole word, so a step either
+  // credits its lap before the return reads the word or finds the rest the
+  // return set there, and a rest that is over is cleared only if the word
+  // still holds it. A useful step writes the word only for a lap's first
+  // credit, and a return only to set a rest. So at each return the credited
+  // lap is within a lap of the clock, and comparing step numbers mod 2^32
+  // holds between returns, which are at most 2^30 steps apart. A rest lasts
+  // while the count is short of its end by less than 2^30, which covers its
+  // length (kMaxClockRest plus less than kMaxPendingProbationEvictions), and
+  // a rest that is over is cleared when Evict starts and each time a call
+  // adds kMaxPendingProbationEvictions of its evictions to the count, before
+  // the count can come within 2^30 of the end again. Lap names go by the
+  // clock's mask, which doubles as the table grows past a power of two, so a
+  // return whose mask changes, or differs from the shard's, doesn't judge the
+  // lap it ends: steps under either mask can be under way in it. A step under
+  // way across such a change can name a later lap than the one a rest judged,
+  // which ends the rest without calling it off. The word starts with lap 0
+  // credited, so the first lap isn't judged before it starts. It sits on a line
+  // of its own: every eviction reads it, a call reads it every
+  // kMaxPendingProbationEvictions probation evictions, and it is written
+  // about twice a lap at most.
   static constexpr uint64_t kClockLapMask = 0xffffffff;
   static constexpr uint64_t kClockRestSet = uint64_t{1} << 32;
-  static constexpr int kClockRestLapShift = 33;
-  static constexpr uint32_t kClockRestLapMask = 0x7fffffff;
+  static constexpr int kClockRestEndShift = 33;
+  static constexpr uint32_t kClockRestEndMask = 0x7fffffff;
+  static constexpr size_t kMaxClockRest = size_t{1} << 29;
+  static_assert(kMaxClockRest + kMaxPendingProbationEvictions <
+                (kClockRestEndMask >> 1) + 1);
   ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<uint64_t> clock_laps_ {};
-  // Zero when not resting.
-  RelaxedAtomic<uint64_t> clock_rest_until_{};
 };  // class AutoHyperClockTable
 
 // A single shard of sharded cache.

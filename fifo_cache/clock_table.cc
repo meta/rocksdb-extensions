@@ -529,13 +529,16 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
     // FIFOCache: a capacity cut that came before the charge above in usage_'s
     // order of updates is visible here, and the charge goes by it: undone, and
     // made again against the new capacity. A cut that came after it sees the
-    // charge in usage (see EvictOverCapacity), and an insert with no charge
-    // to add (new_usage == old_usage, so usage is at capacity) evicts as much
-    // as it inserts.
-    if (new_usage == old_usage || capacity_.LoadRelaxed() >= capacity) {
+    // charge in usage (see EvictOverCapacity). An insert with no charge to
+    // add (new_usage == old_usage, so usage is at the capacity it loaded),
+    // which evicts as much as it inserts, checks the capacity again too, so
+    // one that comes after a cut goes by it.
+    if (capacity_.LoadRelaxed() >= capacity) {
       break;
     }
-    usage_.FetchSubRelaxed(new_usage - old_usage);
+    if (new_usage != old_usage) {
+      usage_.FetchSubRelaxed(new_usage - old_usage);
+    }
   }
   // How much do we need to evict then?
   size_t need_evict_charge = old_usage + total_charge - new_usage;
@@ -915,7 +918,8 @@ void ClockCacheShard<Table>::ApplyToSomeEntries(
   // hyper clock cache, entries will generally stay in their existing
   // slots, so we don't need to be aware of the high-level organization
   // that makes lookup efficient.
-  size_t length = table_.GetTableSize();
+  // FIFOCache: up to the claimed slots (see GetClaimedLength).
+  size_t length = table_.GetClaimedLength();
 
   assert(average_entries_per_lock > 0);
 
@@ -1082,7 +1086,7 @@ size_t ClockCacheShard<Table>::GetPinnedUsage() const {
           table_pinned_usage += h.GetTotalCharge();
         }
       },
-      table_.HandlePtr(0), table_.HandlePtr(table_.GetTableSize()), true);
+      table_.HandlePtr(0), table_.HandlePtr(table_.GetClaimedLength()), true);
 
   return table_pinned_usage + table_.GetStandaloneUsage();
 }
@@ -1737,8 +1741,8 @@ AutoHyperClockTable::~AutoHyperClockTable() {
   }
 #endif  // !NDEBUG
 
-  // Metadata charging only follows the published table size
-  // FIFOCache: and the probation words and rings.
+  // FIFOCache: metadata charging follows the slots Grow claimed, and the
+  // probation words and rings.
   assert(usage_.LoadRelaxed() == 0 ||
          usage_.LoadRelaxed() == GetMetadataCharge());
   assert(occupancy_.LoadRelaxed() == 0);
@@ -1748,8 +1752,12 @@ size_t AutoHyperClockTable::GetTableSize() const {
   return LengthInfoToUsedLength(length_info_.Load());
 }
 
+size_t AutoHyperClockTable::GetClaimedLength() const {
+  return std::min(grow_frontier_.LoadRelaxed(), array_.Count());
+}
+
 size_t AutoHyperClockTable::GetMetadataCharge() const {
-  return GetTableSize() *
+  return GetClaimedLength() *
              (sizeof(HandleImpl) + 2 * sizeof(RelaxedAtomic<uint32_t>)) +
          probation_.LiveCellCount() * sizeof(ProbationQueue::Cell);
 }
@@ -3340,7 +3348,8 @@ bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
 }
 
 void AutoHyperClockTable::EraseUnRefEntries() {
-  size_t usable_size = GetTableSize();
+  // FIFOCache: up to the claimed slots (see GetClaimedLength).
+  size_t usable_size = GetClaimedLength();
   for (size_t i = 0; i < usable_size; i++) {
     HandleImpl& h = array_[i];
 
@@ -3448,16 +3457,16 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
   // gets no more steps until a free raises its allowance, and the call gives
   // up when both have none.
   //
-  // While the clock rests (see clock_rest_until_), probation goes first, as
-  // for a resident queue of reservations alone.
+  // While the clock rests (see clock_laps_), probation goes first, as for a
+  // resident queue of reservations alone.
   const size_t probation_target = ProbationTarget();
   bool clock_resting = false;
-  if (uint64_t rest_until = clock_rest_until_.LoadRelaxed(); rest_until != 0) {
-    // Unless called off (see clock_laps_).
-    clock_resting = (clock_laps_.LoadRelaxed() & kClockRestSet) != 0 &&
-                    probation_evictions_.LoadRelaxed() < rest_until;
+  if (const uint64_t laps = clock_laps_.LoadRelaxed();
+      (laps & kClockRestSet) != 0) {
+    const uint64_t evictions = probation_evictions_.LoadRelaxed();
+    clock_resting = ClockRestLasts(laps, evictions);
     if (!clock_resting) {
-      clock_rest_until_.CasStrongRelaxed(rest_until, 0);
+      EndClockRestIfOver(laps, evictions);
     }
   }
   // Read once, the first time probation is over its target.
@@ -3554,30 +3563,33 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
     // FIFOCache: the step's number, and the length in steps of its lap (see
     // clock_laps_), at the mask before any update below.
     const uint32_t step = static_cast<uint32_t>(old_clock_pointer / step_size);
-    auto lap_steps = [&clock_pointer_mask] {
-      return static_cast<uint32_t>(
-          std::max(size_t{1}, (clock_pointer_mask + 1) / step_size));
-    };
+    const uint32_t lap_steps = static_cast<uint32_t>(
+        std::max(size_t{1}, (clock_pointer_mask + 1) / step_size));
 
     if (UNLIKELY((old_clock_pointer & clock_pointer_mask) == 0)) {
-      // FIFOCache: the lap this step ends.
-      const uint32_t ended_lap = step - lap_steps();
       // Back at the beginning. See if clock_pointer_mask should be updated.
       uint64_t mask = BottomNBits(
           UINT64_MAX, LengthInfoToMinShift(state.saved_length_info));
+      // FIFOCache: a lap no step of which has evicted or run down a
+      // countdown rests the clock, from the rest of this call on, unless
+      // the mask changes here or the shard's differs (see clock_laps_).
+      const bool judge = clock_pointer_mask == mask &&
+                         clock_pointer_mask_.LoadRelaxed() == mask;
       if (clock_pointer_mask != mask) {
         clock_pointer_mask = static_cast<size_t>(mask);
         clock_pointer_mask_.StoreRelaxed(clock_pointer_mask);
       }
-      // FIFOCache: a lap no step of which has evicted or run down a
-      // countdown rests the clock, from the rest of this call on (see
-      // clock_laps_).
-      if (RestClockAfterLap(ended_lap)) {
-        ++data->clock_rests;
-        clock_resting = true;
-        clock_rest_until_.StoreRelaxed(probation_evictions_.LoadRelaxed() +
-                                       PendingProbationEvictions(*data) +
-                                       occupancy_.LoadRelaxed());
+      if (judge) {
+        uint32_t ended_lap = step - lap_steps;
+        TEST_SYNC_POINT_CALLBACK("FIFOCache::Evict:JudgingLap", &ended_lap);
+        const uint64_t end = probation_evictions_.LoadRelaxed() +
+                             PendingProbationEvictions(*data) +
+                             std::min(occupancy_.LoadRelaxed(), kMaxClockRest);
+        if (RestClockAfterLap(ended_lap, end)) {
+          TEST_SYNC_POINT("FIFOCache::Evict:RestedClock");
+          ++data->clock_rests;
+          clock_resting = true;
+        }
       }
     }
 
@@ -3612,7 +3624,7 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
     if (data->freed_count != resident_freed_before ||
         data->clock_countdowns != countdowns_before) {
       TEST_SYNC_POINT("FIFOCache::Evict:CreditingLap");
-      if (CreditClockLap(step & ~(lap_steps() - 1))) {
+      if (CreditClockLap(step & ~(lap_steps - 1))) {
         ++data->clock_rests_called_off;
       }
     }
@@ -3997,15 +4009,31 @@ size_t AutoHyperClockTable::GhostGroup(const UniqueId64x2& hashed_key) const {
 }
 
 bool AutoHyperClockTable::ClockResting() const {
-  return (clock_laps_.LoadRelaxed() & kClockRestSet) != 0 && ClockRestLasts();
+  return ClockRestLasts(clock_laps_.LoadRelaxed(),
+                        probation_evictions_.LoadRelaxed());
 }
 
-bool AutoHyperClockTable::ClockRestLasts() const {
-  const uint64_t rest_until = clock_rest_until_.LoadRelaxed();
-  return rest_until != 0 && probation_evictions_.LoadRelaxed() < rest_until;
+bool AutoHyperClockTable::ClockRestLasts(uint64_t laps, uint64_t evictions) {
+  if ((laps & kClockRestSet) == 0) {
+    return false;
+  }
+  const uint32_t left = (static_cast<uint32_t>(laps >> kClockRestEndShift) -
+                         static_cast<uint32_t>(evictions)) &
+                        kClockRestEndMask;
+  return left != 0 && left <= (kClockRestEndMask >> 1);
 }
 
-bool AutoHyperClockTable::RestClockAfterLap(uint32_t lap) {
+void AutoHyperClockTable::EndClockRestIfOver(uint64_t laps,
+                                             uint64_t evictions) {
+  if ((laps & kClockRestSet) != 0 && !ClockRestLasts(laps, evictions)) {
+    TEST_SYNC_POINT("FIFOCache::EndClockRestIfOver:Over");
+    // Fails if the word has changed, which only a credit, a rest or a clear
+    // does, so it holds this rest no longer.
+    clock_laps_.CasStrongRelaxed(laps, laps & kClockLapMask);
+  }
+}
+
+bool AutoHyperClockTable::RestClockAfterLap(uint32_t lap, uint64_t end) {
   uint64_t laps = clock_laps_.LoadRelaxed();
   for (;;) {
     const uint32_t credited = static_cast<uint32_t>(laps & kClockLapMask);
@@ -4015,7 +4043,8 @@ bool AutoHyperClockTable::RestClockAfterLap(uint32_t lap) {
     // Credited up to the step before the lap, which it was not.
     const uint64_t rested =
         uint64_t{lap - 1} | kClockRestSet |
-        (uint64_t{lap & kClockRestLapMask} << kClockRestLapShift);
+        (uint64_t{static_cast<uint32_t>(end) & kClockRestEndMask}
+         << kClockRestEndShift);
     if (clock_laps_.CasWeakRelaxed(laps, rested)) {
       return true;
     }
@@ -4026,20 +4055,14 @@ bool AutoHyperClockTable::CreditClockLap(uint32_t lap) {
   uint64_t laps = clock_laps_.LoadRelaxed();
   for (;;) {
     const uint32_t credited = static_cast<uint32_t>(laps & kClockLapMask);
-    const bool later = static_cast<int32_t>(lap - credited) > 0;
-    const bool judged =
-        (laps & kClockRestSet) != 0 &&
-        (laps >> kClockRestLapShift) == (lap & kClockRestLapMask) &&
-        ClockRestLasts();
-    if (!later && !judged) {
+    if (static_cast<int32_t>(lap - credited) <= 0) {
       return false;
     }
-    uint64_t next = later ? (laps & ~kClockLapMask) | lap : laps;
-    if (judged) {
-      next &= kClockLapMask;
-    }
-    if (clock_laps_.CasWeakRelaxed(laps, next)) {
-      return judged;
+    const bool called_off =
+        lap == credited + 1 &&
+        ClockRestLasts(laps, probation_evictions_.LoadRelaxed());
+    if (clock_laps_.CasWeakRelaxed(laps, uint64_t{lap})) {
+      return called_off;
     }
   }
 }
@@ -4080,6 +4103,18 @@ uint32_t AutoHyperClockTable::GhostAge(uint32_t cell, uint32_t now) {
 uint32_t AutoHyperClockTable::GhostRestamp(uint32_t c, uint32_t old_now,
                                            int old_shift, uint32_t now,
                                            int shift) {
+  const uint32_t ahead = (c - old_now) & 0xffff;
+  if (ahead != 0 && ahead <= kGhostStampSlack) {
+    // Stamped ahead of the count by a call whose evictions aren't all in it
+    // yet (see GhostNow), so it keeps its lead, in the new step and within
+    // the slack.
+    const uint64_t lead = shift > old_shift
+                              ? ahead >> (shift - old_shift)
+                              : uint64_t{ahead} << (old_shift - shift);
+    return (c & 0xffff0000) | ((now + static_cast<uint32_t>(std::min(
+                                          lead, uint64_t{kGhostStampSlack}))) &
+                               0xffff);
+  }
   const uint64_t old_age = GhostAge(c, old_now);
   const uint64_t age = shift > old_shift ? old_age >> (shift - old_shift)
                                          : old_age << (old_shift - shift);
@@ -4245,7 +4280,8 @@ void AutoHyperClockTable::SetCapacity(size_t capacity) {
   // growth has claimed (a Grow fills the new slot's group before the used
   // length counts it), with its age in the new step (rounded down),
   // dropping the tags too old to count in it, so a capacity that moves back
-  // and forth across a step keeps the ghost.
+  // and forth across a step keeps the ghost. A tag stamped ahead of the
+  // count keeps its lead (see GhostRestamp).
   const size_t end = std::min(grow_frontier_.LoadRelaxed(), array_.Count());
   for (size_t group = 0; group < end; group += kGhostWays) {
     for (size_t i = 0; i < kGhostWays; ++i) {
@@ -4692,8 +4728,11 @@ void AutoHyperClockTable::CountProbationEviction(EvictionData* data) {
   ++data->probation_freed_count;
   const size_t pending = PendingProbationEvictions(*data);
   if (pending >= kMaxPendingProbationEvictions) {
-    probation_evictions_.FetchAddRelaxed(pending);
+    const uint64_t evictions =
+        probation_evictions_.FetchAddRelaxed(pending) + pending;
     data->probation_freed_published = data->probation_freed_count;
+    // A call can add more than 2^30 evictions before the next Evict starts.
+    EndClockRestIfOver(clock_laps_.LoadRelaxed(), evictions);
   }
 }
 
