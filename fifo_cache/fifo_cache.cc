@@ -106,6 +106,14 @@ bool FIFOCache::TEST_InGhost(const Slice& key) const {
   return const_cast<FIFOCache*>(this)->GetShard(hash).GetTable().InGhost(hash);
 }
 
+bool FIFOCache::TEST_ClockResting() const {
+  bool resting = false;
+  ForEachShard([&resting](const Shard* shard) {
+    resting |= shard->GetTable().ClockResting();
+  });
+  return resting;
+}
+
 #ifndef NDEBUG
 void FIFOCache::TEST_SetOccupancyLimit(size_t limit) {
   ForEachShard([limit](Shard* shard) {

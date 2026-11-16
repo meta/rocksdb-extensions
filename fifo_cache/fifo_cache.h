@@ -71,6 +71,9 @@ class FIFOCache
   uint32_t TEST_GetHits(const Slice& key);
   // Whether an insert of the key would find it in the ghost.
   bool TEST_InGhost(const Slice& key) const;
+  // Whether any shard's resident clock is resting (see
+  // AutoHyperClockTable::clock_rest_until_).
+  bool TEST_ClockResting() const;
 #ifndef NDEBUG
   // Sets each shard's occupancy limit, past which an insert grows the
   // table, until the table's own next update of it.

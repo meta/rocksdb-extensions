@@ -546,7 +546,13 @@ class BaseClockTable {
     return metadata_charge_policy_;
   }
 
-  void SetCapacity(size_t capacity) { capacity_.StoreRelaxed(capacity); }
+  // FIFOCache: and orders the store with strict inserts' charges (see
+  // ChargeUsageMaybeEvictStrict), by a release-acquire read-modify-write of
+  // usage_ that changes nothing.
+  void SetCapacity(size_t capacity) {
+    capacity_.StoreRelaxed(capacity);
+    usage_.FetchAdd(0);
+  }
 
   void SetStrictCapacityLimit(bool strict_capacity_limit) {
     if (strict_capacity_limit) {
@@ -569,8 +575,11 @@ class BaseClockTable {
     size_t freed_count = 0;
     size_t seen_pinned_count = 0;
     // FIFOCache: of freed_count, the entries freed from the probation
-    // queue; and the entries probation promoted.
+    // queue, and how many of those the call has added to
+    // probation_evictions_ (see CountProbationEviction); and the entries
+    // probation promoted.
     size_t probation_freed_count = 0;
+    size_t probation_freed_published = 0;
     size_t promoted_count = 0;
     // FIFOCache: what the call's evictions take off probation usage, off its
     // seen-pinned part and off the resident count, and the probation charge
@@ -589,10 +598,12 @@ class BaseClockTable {
     // FIFOCache: heads the call moved to the resident queue for being pinned
     // again a lap after a step rotated them for it.
     size_t pinned_twice_count = 0;
-    // FIFOCache: countdowns the resident clock ran down, and the laps whose
-    // end set the clock to rest (see clock_rest_until_).
+    // FIFOCache: countdowns the resident clock ran down, the laps whose end
+    // set the clock to rest, and the rests the call's steps called off (see
+    // clock_laps_).
     size_t clock_countdowns = 0;
     size_t clock_rests = 0;
+    size_t clock_rests_called_off = 0;
     // FIFOCache: whether Evict gave up at the effort cap, which its caller
     // counts.
     bool effort_cap_reached = false;
@@ -602,17 +613,22 @@ class BaseClockTable {
 
   bool IsEvictionEffortExceeded(const BaseClockTable::EvictionData& data) const;
 
-  // FIFOCache: whether usage can take charge without passing half of
+  // FIFOCache: whether usage can take charge and stay under half of
   // size_t, which HyperClockCache's accounting assumes it stays under. An
   // insert that can't is refused under either limit (MemoryLimit with a
   // handle, dropped with OK without one), and a standalone entry is refused,
   // or made uncharged with allow_uncharged, as FIFOCache did before this
-  // table. It checks usage as loaded and reserves nothing, so inserts
-  // racing with charges of over a quarter of size_t each could pass it
-  // together.
-  bool UsageCanTake(size_t charge) const {
+  // table. It checks usage as loaded and reserves nothing. Under
+  // strict_capacity_limit the charge checks again on the usage it adds to
+  // (see ChargeUsageMaybeEvictStrict); without it, inserts racing with
+  // charges of over a quarter of size_t each could pass it together, as
+  // HyperClockCache, which has no such check, lets a single insert do.
+  static bool UsageCanTake(size_t usage, size_t charge) {
     constexpr size_t kMaxUsage = SIZE_MAX / 2;
-    return charge <= kMaxUsage - std::min(usage_.LoadRelaxed(), kMaxUsage);
+    return charge < kMaxUsage - std::min(usage, kMaxUsage);
+  }
+  bool UsageCanTake(size_t charge) const {
+    return UsageCanTake(usage_.LoadRelaxed(), charge);
   }
   // FIFOCache: adds bytes of table metadata (a slot the table grows by, or
   // a probation ring) to usage under kFullChargeCacheMetadata. Under
@@ -816,7 +832,12 @@ class ProbationQueue {
   // never finds it filled and returns empty once it rereads the position
   // and finds it unmoved. A push finds it free at every other lap, where its
   // claim fails against the closed enqueue position, and otherwise rereads
-  // the position and sees the close.
+  // the position and sees the close. A pop that claimed the ring's last
+  // positions can still be writing its cell's next phase (empty, at an even
+  // lap) when the ring is dropped, which those reads take as a zeroed cell.
+  // On Linux that write maps a page of the ring back in, after its bytes
+  // left the metadata charge: at most a page per such pop, for each ring's
+  // single drop, held until the cache goes.
   static void DropRing(const Ring& r);
 
   const NoReserveTypedMemMapping<Cell> cells_;
@@ -1196,6 +1217,10 @@ class AutoHyperClockTable : public BaseClockTable {
   void UndoProbationPrecharge(const InsertState& state);
   // FIFOCache: whether the key is in the ghost.
   bool InGhost(const UniqueId64x2& hashed_key) const;
+  // FIFOCache: whether the resident clock is resting (see clock_laps_),
+  // and whether the latest rest set lasts, called off or not.
+  bool ClockResting() const;
+  bool ClockRestLasts() const;
   // FIFOCache: whether the entry in a table slot is in the probation queue.
   bool IsInProbation(const HandleImpl* h) const;
   // FIFOCache: whether the entry's counters still include the reference
@@ -1379,15 +1404,19 @@ class AutoHyperClockTable : public BaseClockTable {
   // cells of the aligned group holding the home the key has when the tag is
   // written or read. A cell holds the tag, 16 bits of the hash the home
   // doesn't use and never 0 (an empty cell), above a 16-bit stamp: the
-  // count of probation evictions when the key was evicted, in steps of
-  // 2^ghost_stamp_shift_. A tag counts while its age, the steps since its
-  // stamp, is under the resident queue's share of the shard's entries (all
-  // but probation's kProbationPercent, rounded down) rounded up to steps:
+  // count of probation evictions before the key's own, its call's included,
+  // in steps of 2^ghost_stamp_shift_. A tag counts while its age, the steps
+  // since its stamp, is under the resident queue's share of the shard's entries
+  // (all but probation's kProbationPercent, rounded down) rounded up to steps:
   // S3-FIFO's ghost holds as many keys as its main queue holds entries. A
   // stamp up to kGhostStampSlack steps ahead of the count a reader loaded is
-  // age 0.
+  // age 0. An Evict call adds its probation evictions to the count every
+  // kMaxPendingProbationEvictions, so that the stamps of one that evicts
+  // many stay within that of what other threads load.
   static constexpr size_t kGhostWays = 8;
   static constexpr uint32_t kGhostStampSlack = 256;
+  static constexpr size_t kMaxPendingProbationEvictions = 64;
+  static_assert(kMaxPendingProbationEvictions < kGhostStampSlack);
   // In ghost_stamp_shift_ above the shift while a SetCapacity restamps the
   // ghost, when its cells are in either step: GhostFind finds nothing, and
   // GhostPut, GhostPutBack and GhostMerge write nothing, meanwhile.
@@ -1395,9 +1424,10 @@ class AutoHyperClockTable : public BaseClockTable {
   static constexpr int kGhostShiftMask = kGhostRestamping - 1;
   size_t GhostGroup(const UniqueId64x2& hashed_key) const;
   static uint32_t GhostTag(const UniqueId64x2& hashed_key);
-  // The count now, and the age under which a tag counts, in the steps of
-  // shift_word, a value of ghost_stamp_shift_.
-  uint32_t GhostNow(int shift_word) const;
+  // The count now, with pending more evictions not yet added to it, and the
+  // age under which a tag counts, in the steps of shift_word, a value of
+  // ghost_stamp_shift_.
+  uint32_t GhostNow(int shift_word, size_t pending = 0) const;
   uint32_t GhostReach(int shift_word) const;
   static uint32_t GhostAge(uint32_t cell, uint32_t now);
   // Cell c, stamped in steps of 2^old_shift and read at old_now, with its
@@ -1414,8 +1444,10 @@ class AutoHyperClockTable : public BaseClockTable {
   // Writes value in an empty cell of group, or else over its oldest cell if
   // that is older than value. Returns whether it wrote it.
   bool GhostPlace(size_t group, uint32_t value, uint32_t now);
-  // Writes the tag of an entry evicted from probation in its group.
-  void GhostPut(const UniqueId64x2& hashed_key);
+  // Writes the tag of an entry evicted from probation in its group, stamped
+  // with the count and the pending probation evictions of its call (see
+  // PendingProbationEvictions).
+  void GhostPut(const UniqueId64x2& hashed_key, size_t pending);
   // Copies to group `to` the tags in group `from` that count and that `to`
   // doesn't have as young, keeping their stamps, for a table split.
   void GhostMerge(size_t from, size_t to);
@@ -1447,6 +1479,21 @@ class AutoHyperClockTable : public BaseClockTable {
   // counts, and applies the call's pending changes to probation usage, its
   // seen-pinned part and the resident count.
   void CountEvictions(const EvictionData& data);
+  // Counts a probation eviction in data, adding the call's pending ones to
+  // probation_evictions_ once there are kMaxPendingProbationEvictions.
+  void CountProbationEviction(EvictionData* data);
+  // At the return to the start of the table that ends lap `lap` (see
+  // clock_laps_): sets a rest and returns true if no step has credited that
+  // lap or a later one.
+  bool RestClockAfterLap(uint32_t lap);
+  // Credits lap `lap` for a step that evicted or ran down a countdown,
+  // calling off a standing rest that judged it. Returns whether it called
+  // one off.
+  bool CreditClockLap(uint32_t lap);
+  // The call's probation evictions not yet in probation_evictions_.
+  static size_t PendingProbationEvictions(const EvictionData& data) {
+    return data.probation_freed_count - data.probation_freed_published;
+  }
   // Runs fn(entry) holding a reference to the entry in slot idx, as Lookup
   // takes one, so its charge can be read, unless the slot is empty or under
   // (de)construction. Dropping the reference frees an entry erased
@@ -1584,27 +1631,55 @@ class AutoHyperClockTable : public BaseClockTable {
   RelaxedAtomic<uint64_t> probation_full_{};
   RelaxedAtomic<uint64_t> pinned_twice_{};
   RelaxedAtomic<uint64_t> resident_all_pinned_{};
+  // FIFOCache: rests counted in resident_all_pinned_ that a step still under
+  // way at the end of the lap they judged called off (see clock_laps_),
+  // which GetFIFOCacheStats takes out.
+  RelaxedAtomic<uint64_t> clock_rests_called_off_{};
 
-  // FIFOCache: the clock's rest. clock_lap_useful_ is whether a resident
-  // step since the clock last returned to the start of the table evicted an
-  // entry or ran down a countdown. A lap that did neither found nothing in
-  // the resident queue but pinned entries, so the return that ends it sets
-  // clock_rest_until_ to as many probation evictions ahead as the shard has
-  // entries, and until probation_evictions_ reaches it Evict sends
-  // probation first, as for a resident queue of cache reservations alone,
-  // the rest of that call included. A resident queue of entries held for
-  // good, such as pinned index and filter blocks in a cache they nearly
+  // FIFOCache: the clock's rest. A lap is the clock's steps from one
+  // return to the start of the table to the next, named by the number of
+  // its first step (the clock pointer over the step size, mod 2^32). A lap
+  // none of whose steps evicted an entry or ran down a countdown found
+  // nothing in the resident queue but pinned entries, so the return that
+  // ends it sets clock_rest_until_ to as many probation evictions ahead as
+  // the shard has entries, and until probation_evictions_ reaches it Evict
+  // sends probation first, as for a resident queue of cache reservations
+  // alone, the rest of that call included. A resident queue of entries held
+  // for good, such as pinned index and filter blocks in a cache they nearly
   // fill, then costs a lap of the clock about once per turnover of the
   // shard, not a sweep on every insert, and an entry released meanwhile
   // waits for the clock until the rest is over. A call whose probation has
-  // nothing to pop still steps the clock. A step still under way when
-  // another thread's step ends the lap counts for the next one, so a lap
-  // whose only finds came in its last steps can rest the clock, when the
-  // resident queue had next to nothing to give. True at first, so the first
-  // lap isn't judged before it starts. The two sit on a line of their own:
-  // every eviction reads clock_rest_until_ and every useful step the flag,
-  // and each is written about twice a lap at most.
-  ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<bool> clock_lap_useful_ { true };
+  // nothing to pop still steps the clock.
+  //
+  // clock_laps_ holds, in its low 32 bits, the latest lap credited by a step
+  // that evicted or ran down a countdown, and above them a bit set while a rest
+  // stands and the lap that rest judged, mod 2^31. On a small shard, a lap's
+  // steps can still be under way when another thread's step ends it, as many
+  // laps of them as threads stepping the clock cover. So a return rests the
+  // clock only if no step has credited the lap it ends (or a later one), and a
+  // step crediting the lap a standing rest judged calls the rest off while it
+  // lasts, which takes it out of resident_all_pinned (see
+  // clock_rests_called_off_). A step still under way when a later lap rests the
+  // clock finds that lap's rest in the word, so its own lap stays counted. Both
+  // go by compare-and-swap on the one word, so a step either credits its lap
+  // before the return reads the word or finds the rest the return set there. A
+  // useful step writes the word only for a lap's first credit or to call a rest
+  // off, and a return only to set a rest, which also credits the word up to the
+  // step before the lap it judged. So at each return the credited lap is within
+  // a lap of the clock, and comparing step numbers mod 2^32 holds between
+  // returns, which are at most 2^30 steps apart. A rest that is over keeps its
+  // bit, and only a rest that lasts is called off, so a lap 2^31 steps on, with
+  // the judged number mod 2^31, calls one off only if the clock took that many
+  // steps while it lasted, as it does only for calls whose probation has
+  // nothing to pop. The word starts with lap 0 credited, so the first lap isn't
+  // judged before it starts. The two sit on a line of their own: every eviction
+  // reads clock_rest_until_ and every useful step clock_laps_, and each is
+  // written about twice a lap at most.
+  static constexpr uint64_t kClockLapMask = 0xffffffff;
+  static constexpr uint64_t kClockRestSet = uint64_t{1} << 32;
+  static constexpr int kClockRestLapShift = 33;
+  static constexpr uint32_t kClockRestLapMask = 0x7fffffff;
+  ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<uint64_t> clock_laps_ {};
   // Zero when not resting.
   RelaxedAtomic<uint64_t> clock_rest_until_{};
 };  // class AutoHyperClockTable

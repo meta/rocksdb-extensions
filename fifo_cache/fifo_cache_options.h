@@ -89,9 +89,14 @@ namespace ROCKSDB_NAMESPACE {
 // strict_capacity_limit, an insert that cannot make room fails with
 // MemoryLimit, or without a handle is dropped and returns OK, as if
 // inserted and evicted at once; either way an entry already cached under
-// the key stays. Under either limit, an insert whose charge would take
-// usage past half of size_t is refused the same way, and one whose key
-// can't be copied (see below) fails with MemoryLimit.
+// the key stays. A strict insert that charges usage after a SetCapacity
+// goes by the new capacity; one that charged it before can still land after
+// the cut, over the new capacity until the next insert evicts. Under either
+// limit, an insert whose charge would take usage to half of size_t or past
+// it is refused the same way (without strict_capacity_limit, racing inserts
+// of over a quarter of size_t each can pass together, as HyperClockCache
+// lets a single insert do), and one whose key can't be copied (see below)
+// fails with MemoryLimit.
 //
 // Remembered keys take a 4-byte cell per slot of the table, holding 16 bits
 // of the key's hash and the count of probation evictions when it was
@@ -119,12 +124,14 @@ namespace ROCKSDB_NAMESPACE {
 // a shard of 4 KiB or less, and growing with the entries; 8 bytes per cell of
 // the probation queue, which adds a larger ring as the table grows and stops
 // counting an older one, returning its whole pages to the OS on Linux, once
-// evictions have taken all it held; and for a key that isn't 16 bytes long,
+// evictions have taken all it held (a pop still finishing as it goes can
+// map one page back, uncharged); and for a key that isn't 16 bytes long,
 // 24 bytes plus the key, which is copied to the heap. The table never
 // shrinks. With strict_capacity_limit, the table grows only if the slot
 // fits within capacity beside the entry being inserted, and the probation queue
 // grows only if it fits within capacity, so after a capacity cut below what the
-// table already takes, the shard holds no entries.
+// table already takes, the shard holds no entries but those whose inserts
+// charged usage before the cut.
 //
 // Each shard reserves address space for max(2048, shard capacity / 64)
 // slots up front, using max_capacity instead of capacity when it is larger,
@@ -230,7 +237,9 @@ struct FIFOCacheStats {
   // visit added its charge to pinned_allowance then.
   uint64_t pinned_twice = 0;
   // Laps of the resident clock that evicted nothing and took no hit off
-  // any entry, having found nothing but pinned entries. After each,
+  // any entry, having found nothing but pinned entries, less those a step
+  // still under way when the lap ended found something in, while the rest
+  // lasted and before a later lap rested the clock again. After each,
   // eviction takes probation's head first, from the rest of that eviction
   // on, for as many probation evictions as the shard has entries before
   // the clock looks again, so a resident entry released meanwhile stays
