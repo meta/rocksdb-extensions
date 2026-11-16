@@ -589,10 +589,10 @@ class BaseClockTable {
     // FIFOCache: heads the call moved to the resident queue for being pinned
     // again a lap after a step rotated them for it.
     size_t pinned_twice_count = 0;
-    // FIFOCache: countdowns the resident clock ran down, and whether the
-    // call set the clock to rest (see clock_rest_until_).
+    // FIFOCache: countdowns the resident clock ran down, and the laps whose
+    // end set the clock to rest (see clock_rest_until_).
     size_t clock_countdowns = 0;
-    bool clock_rested = false;
+    size_t clock_rests = 0;
     // FIFOCache: whether Evict gave up at the effort cap, which its caller
     // counts.
     bool effort_cap_reached = false;
@@ -1031,6 +1031,9 @@ class AutoHyperClockTable : public BaseClockTable {
     size_t probation_charge = 0;
     bool ghost_hit = false;
     uint32_t ghost_value = 0;
+    // FIFOCache: ghost_stamp_shift_ when the insert took its tag, the step
+    // ghost_value's stamp is in.
+    int ghost_shift = 0;
     // FIFOCache: whether the entry is a cache reservation (see
     // IsReservation), which goes to the resident queue without a ghost tag.
     bool reservation = false;
@@ -1100,12 +1103,14 @@ class AutoHyperClockTable : public BaseClockTable {
   // Erase does, for an insert of proto replacing them: after keep is linked
   // and while the insert holds its reference, or with keep nullptr when the
   // insert is accepted without a slot. Stops once keep isn't visible, or at
-  // an entry not found linked after keep: one linked before it is a newer
-  // insert's, which replaces keep in turn, so of two inserts of one key
-  // racing, the one linked last stays, and neither erases the other's entry
-  // while that one erases its own.
+  // an entry found linked before keep: that one is a newer insert's, which
+  // replaces keep in turn, so of two inserts of one key racing, the one
+  // linked last stays, and neither erases the other's entry while that one
+  // erases its own. At an entry it can't place (see FirstLinked), it erases
+  // keep as well as every other entry with the key, which leaves the key
+  // absent and never with an older value.
   // Returns whether it erased any, and records them in *replaced if given.
-  bool EraseReplaced(const ClockHandleBasicData& proto, const HandleImpl* keep,
+  bool EraseReplaced(const ClockHandleBasicData& proto, HandleImpl* keep,
                      ReplacedEntries* replaced = nullptr);
   // FIFOCache: which of a and b, both referenced entries with hashed_key,
   // comes first in their key's chain walked from its head, where inserts
@@ -1153,20 +1158,24 @@ class AutoHyperClockTable : public BaseClockTable {
   }
 
   // FIFOCache: a cache reservation, an entry with no value and a helper of
-  // its own with nothing to delete, as CacheReservationManager inserts to
-  // charge memtables, filter construction and the like to the cache, and a
-  // table reader to charge a block it reads without filling the cache. (The
-  // no-op helper with no value stands in for data in RocksDB's cache
-  // simulators, and an entry whose helper deletes its value holds data, even
-  // if the value is nullptr.) Held through its insert's handle while the
+  // its own with nothing to delete, inserted with a handle, as
+  // CacheReservationManager inserts to charge memtables, filter
+  // construction and the like to the cache, and a table reader to charge a
+  // block it reads without filling the cache. (The no-op helper with no
+  // value stands in for data in RocksDB's cache simulators, an entry whose
+  // helper deletes its value holds data, even if the value is nullptr, and
+  // one inserted without a handle, as a cache of absent keys would insert
+  // it, is there for lookups.) Held through its insert's handle while the
   // memory is in use and never looked up, it goes to the resident queue,
   // where the clock passes it among the other entries as HyperClockCache's
   // does: in probation, a run of them at the head would cost each insert
   // reaching it the effort cap, and their pins would widen probation's
-  // share. resident_count_ leaves them out, so a resident queue of nothing
-  // else doesn't send the clock round them on every insert.
-  static bool IsReservation(const ClockHandleBasicData& entry) {
-    return entry.value == nullptr &&
+  // share. Its probation word has kReservation, and resident_count_ leaves
+  // it out, so a resident queue of nothing else doesn't send the clock
+  // round them on every insert.
+  static bool IsReservation(const ClockHandleBasicData& entry,
+                            bool with_handle) {
+    return with_handle && entry.value == nullptr &&
            entry.GetHelper() != &kNoopCacheItemHelper &&
            entry.GetHelper()->del_cb == nullptr;
   }
@@ -1177,7 +1186,8 @@ class AutoHyperClockTable : public BaseClockTable {
   // the resident queue. A placeholder never takes one (see IsPlaceholder),
   // so the real entry gets the credit. An insert that took the tag and
   // doesn't put the entry in the table puts it back in the key's group, with
-  // the stamp it had, in an empty cell or over an older tag.
+  // the stamp it had, in an empty cell or over an older tag, converted to
+  // the step of a SetCapacity that restamped the ghost meanwhile.
   void GhostTake(const ClockHandleBasicData& proto, InsertState& state);
   void GhostPutBack(const ClockHandleBasicData& proto,
                     const InsertState& state);
@@ -1188,6 +1198,10 @@ class AutoHyperClockTable : public BaseClockTable {
   bool InGhost(const UniqueId64x2& hashed_key) const;
   // FIFOCache: whether the entry in a table slot is in the probation queue.
   bool IsInProbation(const HandleImpl* h) const;
+  // FIFOCache: whether the entry's counters still include the reference
+  // Insert returned with it (see kCountsInsertRef), for a caller holding a
+  // reference to it.
+  bool CountsInsertRef(const HandleImpl* h) const;
   // FIFOCache: the hits on the entry in a table slot, for a caller holding a
   // reference to it: its acquires, less that reference and less the
   // reference Insert returned with it while that still counts.
@@ -1210,32 +1224,37 @@ class AutoHyperClockTable : public BaseClockTable {
   static constexpr size_t kMaxRingPopsPerPush = 8;
 
   // FIFOCache: each slot has a 32-bit probation word beside it, since
-  // HandleImpl has no spare bits. kInProbation is set while the entry is in the
-  // probation queue. kCountsInsertRef is set while an entry's counters still
-  // include the reference Insert returned with it, whose Release adds one to
-  // them without being a hit. Promotion resets the counters and clears the
-  // bit. An entry that reaches the resident queue any other way (the ghost
-  // sent it there, or a replaced resident entry did, or probation had no room
-  // for it) keeps the bit until the clock takes that count out
+  // HandleImpl has no spare bits. kInProbation is set while the entry is in
+  // the probation queue. kCountsInsertRef is set while an entry's counters
+  // still include the reference Insert returned with it, whose Release adds
+  // one to them without being a hit. Promotion resets the counters and
+  // clears the bit. An entry that reaches the resident queue any other way
+  // (the ghost sent it there, or a replaced resident entry did, or probation
+  // had no room for it) keeps the bit until the clock takes that count out
   // (DropInsertRefCount), so its hits there are the same with a handle or
-  // without. Released with useful=false, that reference comes back out of
-  // the counters and the bit stays, so the entry reads one hit short until
-  // promotion or the clock clears it; Release can't tell that reference
-  // from a lookup's.
-  // RocksDB releases every handle as useful. kSeenPinned is set on a probation
-  // entry last seen pinned by a probation step or the resident sweep, and takes
-  // its charge out of probation's share (see Evict). The bits above count
-  // inserts into the slot, so that a queue cell naming a slot and word can tell
-  // a later entry in the slot from the one it was pushed for; with kInProbation
-  // they are the word's identity, which the other two bits can change under
-  // without invalidating the cell. The slot's owner writes the word before
-  // publishing the entry. Whoever takes the entry out of the probation queue
-  // clears kInProbation and kSeenPinned, and kCountsInsertRef too if it reset
-  // the counters.
+  // without. Release can't tell that reference from a lookup's, so
+  // FIFOCache::Release counts a reference released with useful=false as
+  // useful while the bit is set: the insert's then stays out of the hits,
+  // and a lookup's released so meanwhile counts as a hit. RocksDB releases
+  // every handle as useful. kSeenPinned is set on a probation entry last
+  // seen pinned by a probation step or the resident sweep, and takes its
+  // charge out of probation's share (see Evict). kReservation is set from
+  // the insert of a cache reservation (see IsReservation) until the slot's
+  // next insert, so that counting one out of the resident queue needn't
+  // read its helper, which an erase frees with the key first. The bits
+  // above count inserts into the slot, so that a queue cell naming a slot
+  // and word can tell a later entry in the slot from the one it was pushed
+  // for; with kInProbation and kReservation (which a queued entry never
+  // has) they are the word's identity, which kCountsInsertRef and
+  // kSeenPinned can change under without invalidating the cell. The slot's
+  // owner writes the word before publishing the entry. Whoever takes the
+  // entry out of the probation queue clears kInProbation and kSeenPinned,
+  // and kCountsInsertRef too if it reset the counters.
   static constexpr uint32_t kInProbation = 1;
   static constexpr uint32_t kCountsInsertRef = 2;
   static constexpr uint32_t kSeenPinned = 4;
-  static constexpr int kProbationFlagBits = 3;
+  static constexpr uint32_t kReservation = 8;
+  static constexpr int kProbationFlagBits = 4;
   static constexpr int kProbationGenerationBits = 32 - kProbationFlagBits;
   static constexpr uint32_t kProbationGenerationOne = uint32_t{1}
                                                       << kProbationFlagBits;
@@ -1331,9 +1350,9 @@ class AutoHyperClockTable : public BaseClockTable {
                      bool rotated = false);
   // A probation queue value: slot idx above the generation of its word,
   // which with kInProbation, set on every word queued, is the word's
-  // identity. The slot index takes 32 bits and the generation 29, inside
+  // identity. The slot index takes 32 bits and the generation 28, inside
   // the queue's 62, and the bit above them is kRotatedCell. A cell still
-  // queued after 2^29 more inserts into its slot could name a later
+  // queued after 2^28 more inserts into its slot could name a later
   // probation entry there, which a step would then take out of turn.
   static uint64_t ProbationCell(size_t idx, uint32_t word) {
     assert(word & kInProbation);
@@ -1369,15 +1388,29 @@ class AutoHyperClockTable : public BaseClockTable {
   // age 0.
   static constexpr size_t kGhostWays = 8;
   static constexpr uint32_t kGhostStampSlack = 256;
+  // In ghost_stamp_shift_ above the shift while a SetCapacity restamps the
+  // ghost, when its cells are in either step: GhostFind finds nothing, and
+  // GhostPut, GhostPutBack and GhostMerge write nothing, meanwhile.
+  static constexpr int kGhostRestamping = 1 << 8;
+  static constexpr int kGhostShiftMask = kGhostRestamping - 1;
   size_t GhostGroup(const UniqueId64x2& hashed_key) const;
   static uint32_t GhostTag(const UniqueId64x2& hashed_key);
-  uint32_t GhostNow() const;
-  uint32_t GhostReach() const;
+  // The count now, and the age under which a tag counts, in the steps of
+  // shift_word, a value of ghost_stamp_shift_.
+  uint32_t GhostNow(int shift_word) const;
+  uint32_t GhostReach(int shift_word) const;
   static uint32_t GhostAge(uint32_t cell, uint32_t now);
+  // Cell c, stamped in steps of 2^old_shift and read at old_now, with its
+  // age converted to steps of 2^shift (rounded down) and stamped from now,
+  // or 0 if that age is too old to count in any step (2^15 steps or more).
+  static uint32_t GhostRestamp(uint32_t c, uint32_t old_now, int old_shift,
+                               uint32_t now, int shift);
   // The index in group, from `from` on, of the first cell with tag that
-  // still counts, setting *cell to it, or kGhostWays.
-  size_t GhostFind(size_t group, uint32_t tag, size_t from,
-                   uint32_t* cell) const;
+  // still counts, setting *cell to it, or kGhostWays, and none while a
+  // restamp is under way. Ages are read in the step of *shift_word, which,
+  // if it is -1, is set to ghost_stamp_shift_ at the first cell with tag.
+  size_t GhostFind(size_t group, uint32_t tag, size_t from, uint32_t* cell,
+                   int* shift_word) const;
   // Writes value in an empty cell of group, or else over its oldest cell if
   // that is older than value. Returns whether it wrote it.
   bool GhostPlace(size_t group, uint32_t value, uint32_t now);
@@ -1496,10 +1529,14 @@ class AutoHyperClockTable : public BaseClockTable {
   const NoReserveTypedMemMapping<RelaxedAtomic<uint32_t>> ghost_;
   // FIFOCache: the smallest shift that fits into 15 bits of ghost stamp
   // steps the occupancy limit of a table reserved for the shard's capacity,
-  // which max_capacity doesn't change. A SetCapacity that changes it
-  // restamps the ghost's cells with their ages in the new step; a tag
-  // stamped by a racing eviction or carried by a racing split can miss the
-  // restamp, reading as another age until it is replaced.
+  // which max_capacity doesn't change, with kGhostRestamping while a
+  // SetCapacity that changes it restamps the ghost's cells with their ages
+  // in the new step, up to the slots growth has claimed. Inserts neither
+  // read nor write the ghost meanwhile. A tag an eviction or a split read
+  // the old step for just before the flag, and writes after the restamp
+  // passed its cell, stays in the old step, reading as another age until it
+  // is replaced: one tag per thread caught between the two, in a ghost
+  // whose tags already match other keys 1 time in 8,192.
   RelaxedAtomic<int> ghost_stamp_shift_;
 
   // FIFOCache: the probation queue's order, as ProbationCell values.
@@ -1548,22 +1585,26 @@ class AutoHyperClockTable : public BaseClockTable {
   RelaxedAtomic<uint64_t> pinned_twice_{};
   RelaxedAtomic<uint64_t> resident_all_pinned_{};
 
-  // FIFOCache: the clock's rest. clock_laps_ counts the clock's returns to
-  // the start of the table, and clock_useful_lap_ is the last lap in which
-  // a resident step ran down a countdown. A lap that ran down none found
-  // only pinned entries and entries it evicted, since it evicts each
-  // unpinned entry it finds at zero, so the return that ends it sets
+  // FIFOCache: the clock's rest. clock_lap_useful_ is whether a resident
+  // step since the clock last returned to the start of the table evicted an
+  // entry or ran down a countdown. A lap that did neither found nothing in
+  // the resident queue but pinned entries, so the return that ends it sets
   // clock_rest_until_ to as many probation evictions ahead as the shard has
   // entries, and until probation_evictions_ reaches it Evict sends
-  // probation first, as for a resident queue of cache reservations alone.
-  // A resident queue of entries held for good, such as pinned index and
-  // filter blocks in a cache they nearly fill, then costs a lap of the
-  // clock about once per turnover of the shard, not a sweep on every
-  // insert, and an entry released meanwhile waits for the clock until the
-  // rest is over. A call whose probation has nothing to pop still steps the
-  // clock. On a line of their own, which steps read and laps write.
-  ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<uint64_t> clock_laps_ {};
-  RelaxedAtomic<uint64_t> clock_useful_lap_{};
+  // probation first, as for a resident queue of cache reservations alone,
+  // the rest of that call included. A resident queue of entries held for
+  // good, such as pinned index and filter blocks in a cache they nearly
+  // fill, then costs a lap of the clock about once per turnover of the
+  // shard, not a sweep on every insert, and an entry released meanwhile
+  // waits for the clock until the rest is over. A call whose probation has
+  // nothing to pop still steps the clock. A step still under way when
+  // another thread's step ends the lap counts for the next one, so a lap
+  // whose only finds came in its last steps can rest the clock, when the
+  // resident queue had next to nothing to give. True at first, so the first
+  // lap isn't judged before it starts. The two sit on a line of their own:
+  // every eviction reads clock_rest_until_ and every useful step the flag,
+  // and each is written about twice a lap at most.
+  ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<bool> clock_lap_useful_ { true };
   // Zero when not resting.
   RelaxedAtomic<uint64_t> clock_rest_until_{};
 };  // class AutoHyperClockTable

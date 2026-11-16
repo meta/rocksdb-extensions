@@ -69,6 +69,14 @@ size_t FIFOCache::TEST_GetProbationTarget() const {
       [](Shard& shard) { return shard.GetTable().ProbationTarget(); });
 }
 
+bool FIFOCache::Release(Handle* handle, bool useful, bool erase_if_last_ref) {
+  if (!useful) {
+    auto* impl = reinterpret_cast<Shard::HandleImpl*>(handle);
+    useful = GetShard(impl->GetHash()).GetTable().CountsInsertRef(impl);
+  }
+  return AutoHyperClockCache::Release(handle, useful, erase_if_last_ref);
+}
+
 bool FIFOCache::TEST_InProbation(const Slice& key) {
   Cache::Handle* h = Lookup(key);
   if (h == nullptr) {
@@ -76,7 +84,8 @@ bool FIFOCache::TEST_InProbation(const Slice& key) {
   }
   auto* impl = reinterpret_cast<Shard::HandleImpl*>(h);
   const bool in = GetShard(impl->GetHash()).GetTable().IsInProbation(impl);
-  Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
+  AutoHyperClockCache::Release(h, /*useful=*/false,
+                               /*erase_if_last_ref=*/false);
   return in;
 }
 
@@ -87,7 +96,8 @@ uint32_t FIFOCache::TEST_GetHits(const Slice& key) {
   }
   auto* impl = reinterpret_cast<Shard::HandleImpl*>(h);
   const uint32_t hits = GetShard(impl->GetHash()).GetTable().HitsUnderRef(impl);
-  Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
+  AutoHyperClockCache::Release(h, /*useful=*/false,
+                               /*erase_if_last_ref=*/false);
   return hits;
 }
 

@@ -30,6 +30,14 @@ class FIFOCache
   explicit FIFOCache(const FIFOCacheOptions& opts);
   const char* Name() const override { return "FIFOCache"; }
 
+  // A reference released with useful=false while the entry's counters still
+  // hold the one Insert returned with it is released as useful, so that
+  // Insert's reference stays out of the entry's hits, as it does released
+  // as useful. Release can't tell it from a lookup's, which then counts as
+  // a hit; RocksDB releases every handle as useful.
+  using AutoHyperClockCache::Release;
+  bool Release(Handle* handle, bool useful, bool erase_if_last_ref) override;
+
   // The shards' FIFOCacheStats summed, as GetFIFOCacheStats returns them.
   FIFOCacheStats GetStats() const;
 

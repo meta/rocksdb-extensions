@@ -32,12 +32,13 @@ namespace ROCKSDB_NAMESPACE {
 // three hits per entry and visits entries in the table's order rather than
 // the order they arrived. Keys (not values) recently evicted from probation
 // are remembered, and inserting one again puts it straight into the
-// resident queue. So does inserting an entry with no value and a helper
-// other than kNoopCacheItemHelper that has no deleter, as RocksDB's cache
-// reservations are, which is never remembered either. Placement comes from hits
-// alone: Cache::Priority is ignored. GetFIFOCacheStats (below) reports what the
-// queues did, and Cache::ReportProblems, which RocksDB calls at each stats
-// dump, logs the same at INFO level.
+// resident queue. So does a cache reservation, an entry with no value and a
+// helper other than kNoopCacheItemHelper that has no deleter, inserted with
+// a handle as RocksDB inserts them, and its key is never remembered either;
+// such an entry inserted without a handle goes through probation. Placement
+// comes from hits alone: Cache::Priority is ignored. GetFIFOCacheStats
+// (below) reports what the queues did, and Cache::ReportProblems, which
+// RocksDB calls at each stats dump, logs the same at INFO level.
 //
 // A negative num_shard_bits (the default) gives each shard at least 4 MiB, up
 // to 64 shards, so a cache under 8 MiB has one. LRUCache defaults to 512 KiB
@@ -63,7 +64,12 @@ namespace ROCKSDB_NAMESPACE {
 // entry instead and drops the new value.) The new entry keeps the old one's
 // place: it goes to the resident queue if the old one was there, and
 // otherwise wherever a new entry would go, and it starts with the old one's
-// hits plus one, up to 3, counting the insert as a hit.
+// hits plus one, up to 3, counting the insert as a hit. Of two inserts of
+// one key that race, the one linked last stays. One that can't tell which
+// that is, because a table split is under way or more than 64 entries are
+// linked ahead of both, erases every entry with the key, its own included,
+// so the key is missing until it is inserted again, never left with the
+// older value.
 //
 // Pinned entries are never evicted. A probation entry still pinned when
 // the queue's head reaches it again, a lap after it went to the tail for
@@ -104,7 +110,9 @@ namespace ROCKSDB_NAMESPACE {
 // an insert of a key that isn't remembered matches one of them 1 time in 8,192.
 // A cell that stopped counting counts again if the shard later holds enough
 // entries for that count to cover the evictions since its key's, or 65,280
-// steps on.
+// steps on. While a SetCapacity converts the stamps to a new step, inserts
+// find no remembered keys and remember none, and a key evicted as the
+// conversion begins can keep its age in the old step.
 // Under kFullChargeCacheMetadata (the default) the table counts against
 // capacity: 72 bytes per slot the table has grown to (the 64-byte slot, its
 // probation word and its ghost cell), starting at 64 slots per shard, or 4 for
@@ -221,11 +229,12 @@ struct FIFOCacheStats {
   // HyperClockCache's does. Each one its inserter alone held on its first
   // visit added its charge to pinned_allowance then.
   uint64_t pinned_twice = 0;
-  // Laps of the resident clock that left it nothing but pinned entries,
-  // having evicted the rest and found none it could evict later. After
-  // each, eviction takes probation's head first for as many probation
-  // evictions as the shard has entries before the clock looks again, so a
-  // resident entry released meanwhile stays until then.
+  // Laps of the resident clock that evicted nothing and took no hit off
+  // any entry, having found nothing but pinned entries. After each,
+  // eviction takes probation's head first, from the rest of that eviction
+  // on, for as many probation evictions as the shard has entries before
+  // the clock looks again, so a resident entry released meanwhile stays
+  // until then.
   uint64_t resident_all_pinned = 0;
 };
 

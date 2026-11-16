@@ -693,9 +693,12 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   // queue, where its charge counts toward probation's share. The tag is
   // taken before eviction, which could replace it, and put back on each
   // path below that doesn't put the entry in the table.
-  state.reservation = Table::IsReservation(proto);
+  state.reservation = Table::IsReservation(proto, handle != nullptr);
   if (!state.reservation) {
     derived.GhostTake(proto, state);
+    if (state.ghost_hit) {
+      TEST_SYNC_POINT("FIFOCache::Insert:TookGhostTag");
+    }
   }
   state.probation_charge =
       state.ghost_hit || state.reservation ? 0 : proto.GetTotalCharge();
@@ -1630,7 +1633,7 @@ AutoHyperClockTable::~AutoHyperClockTable() {
       }
     } else {
       assert((word & kSeenPinned) == 0);
-      if (shareable && !IsReservation(h)) {
+      if (shareable && !(word & kReservation)) {
         resident_sum++;
       }
     }
@@ -1853,10 +1856,13 @@ bool AutoHyperClockTable::Grow(InsertState& state, size_t entry_charge) {
   // lacks (tags match only their own keys), before length_info_ lets
   // lookups use grow_home. An eviction that found old_home's group before
   // the update and writes its tag after the merge leaves it where the key
-  // may no longer look, so the key's next insert can miss the ghost.
+  // may no longer look, so the key's next insert can miss the ghost, as
+  // can the keys of a group split while a SetCapacity restamps the ghost,
+  // when there is no merge.
   if (grow_home >= kGhostWays) {
     GhostMerge(old_home & ~(kGhostWays - 1), grow_home & ~(kGhostWays - 1));
   }
+  TEST_SYNC_POINT("FIFOCache::Grow:Merged");
 
   // Do the dirty work of splitting the chain, including updating heads and
   // chain nexts for new shift amounts.
@@ -2562,10 +2568,11 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
   // FIFOCache: the entry goes into the probation queue, unless Insert took
   // its key's ghost tag or it is a cache reservation, when it goes to the
   // resident queue. Its probation word records whether the caller gets a
-  // reference.
+  // reference, and whether it is a reservation.
   const uint32_t word_flags =
       (state.ghost_hit || state.reservation ? uint32_t{0} : kInProbation) |
-      (take_ref ? kCountsInsertRef : uint32_t{0});
+      (take_ref ? kCountsInsertRef : uint32_t{0}) |
+      (state.reservation ? kReservation : uint32_t{0});
   uint32_t word = 0;
 
   size_t used_length = LengthInfoToUsedLength(state.saved_length_info);
@@ -3255,7 +3262,7 @@ const AutoHyperClockTable::HandleImpl* AutoHyperClockTable::FirstLinked(
 }
 
 bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
-                                        const HandleImpl* keep,
+                                        HandleImpl* keep,
                                         ReplacedEntries* replaced_entries) {
   Slice heap_key;
   const Slice* key = nullptr;
@@ -3268,15 +3275,26 @@ bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
   // replacing it, that erases the rest, which may include the newer entry.
   // An entry linked after keep is a newer insert's, which replaces keep and
   // the rest: erasing it here could erase both while the newer insert erases
-  // keep, leaving the key absent or an older entry visible. So h goes only
-  // if keep is found ahead of it; when the walk can't tell, the rest stays
-  // for a newer insert to erase, or as an older duplicate behind keep, which
-  // lookups reach first, until eviction takes it.
+  // keep, leaving an older entry visible. So h goes only if keep is found
+  // ahead of it. When the walk can't tell, keep is hidden first, so a newer
+  // insert finds nothing to erase and stops, and then h and any other entry
+  // with the key go: the key is absent until its next insert, which is a
+  // miss, never an older value.
+  bool unsure = false;
   while (HandleImpl* h = Lookup(proto.hashed_key, key, keep)) {
-    if (keep != nullptr && (!keep->meta.Load().IsVisible() ||
-                            FirstLinked(h, keep, proto.hashed_key) != keep)) {
-      Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
-      break;
+    if (keep != nullptr && !unsure) {
+      const HandleImpl* first = keep->meta.Load().IsVisible()
+                                    ? FirstLinked(h, keep, proto.hashed_key)
+                                    : h;
+      if (first == h) {
+        Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
+        break;
+      }
+      if (first == nullptr) {
+        unsure = true;
+        // Our reference keeps it in its slot; the last release frees it.
+        keep->meta.Apply(SlotMeta::VisibleFlag::ClearTransform());
+      }
     }
     TEST_SYNC_POINT("FIFOCache::EraseReplaced:Checked");
     replaced = true;
@@ -3501,6 +3519,7 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
       return;
     }
     const size_t resident_pinned_before = data->seen_pinned_count;
+    const size_t resident_freed_before = data->freed_count;
     const size_t countdowns_before = data->clock_countdowns;
 
     TEST_SYNC_POINT("FIFOCache::Evict:ResidentStep");
@@ -3515,11 +3534,12 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
         clock_pointer_mask = static_cast<size_t>(mask);
         clock_pointer_mask_.StoreRelaxed(clock_pointer_mask);
       }
-      // FIFOCache: a lap whose steps ran down no countdown rests the clock
-      // (see clock_rest_until_).
-      const uint64_t lap = clock_laps_.FetchAddRelaxed(1) + 1;
-      if (clock_useful_lap_.LoadRelaxed() + 1 < lap) {
-        data->clock_rested = true;
+      // FIFOCache: a lap whose steps neither evicted nor ran down a
+      // countdown rests the clock, from the rest of this call on (see
+      // clock_lap_useful_).
+      if (!clock_lap_useful_.ExchangeRelaxed(false)) {
+        ++data->clock_rests;
+        clock_resting = true;
         clock_rest_until_.StoreRelaxed(probation_evictions_.LoadRelaxed() +
                                        data->probation_freed_count +
                                        occupancy_.LoadRelaxed());
@@ -3552,6 +3572,14 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
     }
     to_finish_eviction.clear();
 
+    // FIFOCache: a step that evicted or ran down a countdown makes its lap
+    // useful, before any return (see clock_lap_useful_).
+    if ((data->freed_count != resident_freed_before ||
+         data->clock_countdowns != countdowns_before) &&
+        !clock_lap_useful_.LoadRelaxed()) {
+      clock_lap_useful_.StoreRelaxed(true);
+    }
+
     // Loop exit conditions
     // FIFOCache: with an entry freed if one is needed.
     if (data->freed_charge >= requested_charge &&
@@ -3578,13 +3606,6 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
     }
 
     resident_seen_pinned += data->seen_pinned_count - resident_pinned_before;
-    if (data->clock_countdowns != countdowns_before) {
-      // FIFOCache: a step that ran down a countdown (see clock_rest_until_).
-      const uint64_t lap = clock_laps_.LoadRelaxed();
-      if (clock_useful_lap_.LoadRelaxed() < lap) {
-        clock_useful_lap_.StoreRelaxed(lap);
-      }
-    }
     if (resident_capped() && probation_capped()) {
       // FIFOCache: counted by the caller.
       data->effort_cap_reached = true;
@@ -3835,7 +3856,7 @@ bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
     }
   } else {
     assert(!probation_precharged);
-    if (!IsReservation(proto)) {
+    if (!(word_flags & kReservation)) {
       resident_count_.FetchAddRelaxed(1);
     }
   }
@@ -3944,14 +3965,14 @@ uint32_t AutoHyperClockTable::GhostTag(const UniqueId64x2& hashed_key) {
   return tag == 0 ? 1 : tag;
 }
 
-uint32_t AutoHyperClockTable::GhostNow() const {
+uint32_t AutoHyperClockTable::GhostNow(int shift_word) const {
   return static_cast<uint32_t>(probation_evictions_.LoadRelaxed() >>
-                               ghost_stamp_shift_.LoadRelaxed()) &
+                               (shift_word & kGhostShiftMask)) &
          0xffff;
 }
 
-uint32_t AutoHyperClockTable::GhostReach() const {
-  const int shift = ghost_stamp_shift_.LoadRelaxed();
+uint32_t AutoHyperClockTable::GhostReach(int shift_word) const {
+  const int shift = shift_word & kGhostShiftMask;
   const size_t step = size_t{1} << shift;
   // As many keys as the resident queue's share of the entries: all but
   // probation's, rounded down as ProbationTarget rounds it.
@@ -3971,8 +3992,19 @@ uint32_t AutoHyperClockTable::GhostAge(uint32_t cell, uint32_t now) {
   return age > 0xffff - kGhostStampSlack ? 0 : age;
 }
 
+uint32_t AutoHyperClockTable::GhostRestamp(uint32_t c, uint32_t old_now,
+                                           int old_shift, uint32_t now,
+                                           int shift) {
+  const uint64_t old_age = GhostAge(c, old_now);
+  const uint64_t age = shift > old_shift ? old_age >> (shift - old_shift)
+                                         : old_age << (old_shift - shift);
+  return age >= (uint64_t{1} << 15)
+             ? 0
+             : (c & 0xffff0000) | ((now - static_cast<uint32_t>(age)) & 0xffff);
+}
+
 size_t AutoHyperClockTable::GhostFind(size_t group, uint32_t tag, size_t from,
-                                      uint32_t* cell) const {
+                                      uint32_t* cell, int* shift_word) const {
   uint32_t now = 0;
   uint32_t reach = 0;
   bool loaded = false;
@@ -3983,8 +4015,14 @@ size_t AutoHyperClockTable::GhostFind(size_t group, uint32_t tag, size_t from,
     }
     // Only for a matching tag, which most lookups don't find.
     if (!loaded) {
-      now = GhostNow();
-      reach = GhostReach();
+      if (*shift_word < 0) {
+        *shift_word = ghost_stamp_shift_.LoadRelaxed();
+      }
+      if (*shift_word & kGhostRestamping) {
+        return kGhostWays;
+      }
+      now = GhostNow(*shift_word);
+      reach = GhostReach(*shift_word);
       loaded = true;
     }
     if (GhostAge(c, now) < reach) {
@@ -4030,10 +4068,13 @@ void AutoHyperClockTable::GhostTake(const ClockHandleBasicData& proto,
   const uint32_t tag = GhostTag(proto.hashed_key);
   const size_t group = GhostGroup(proto.hashed_key);
   uint32_t cell;
-  for (size_t i = 0; (i = GhostFind(group, tag, i, &cell)) < kGhostWays; ++i) {
+  int shift_word = -1;
+  for (size_t i = 0;
+       (i = GhostFind(group, tag, i, &cell, &shift_word)) < kGhostWays; ++i) {
     if (ghost_[group + i].CasStrongRelaxed(cell, 0)) {
       state.ghost_hit = true;
       state.ghost_value = cell;
+      state.ghost_shift = shift_word;
       return;
     }
   }
@@ -4041,22 +4082,46 @@ void AutoHyperClockTable::GhostTake(const ClockHandleBasicData& proto,
 
 void AutoHyperClockTable::GhostPutBack(const ClockHandleBasicData& proto,
                                        const InsertState& state) {
-  if (state.ghost_hit) {
-    // In the key's group now, which growth may have changed, with the stamp
-    // it had.
-    GhostPlace(GhostGroup(proto.hashed_key), state.ghost_value, GhostNow());
+  if (!state.ghost_hit) {
+    return;
   }
+  const int shift_word = ghost_stamp_shift_.LoadRelaxed();
+  if (shift_word & kGhostRestamping) {
+    // In either step to the restamp, so dropped.
+    return;
+  }
+  const uint32_t now = GhostNow(shift_word);
+  uint32_t value = state.ghost_value;
+  if (shift_word != state.ghost_shift) {
+    // Restamped meanwhile, so converted as the restamp would have.
+    value = GhostRestamp(value, GhostNow(state.ghost_shift), state.ghost_shift,
+                         now, shift_word);
+    if (value == 0) {
+      return;
+    }
+  }
+  // In the key's group now, which growth may have changed, with the stamp
+  // it had.
+  GhostPlace(GhostGroup(proto.hashed_key), value, now);
 }
 
 void AutoHyperClockTable::GhostPut(const UniqueId64x2& hashed_key) {
-  const uint32_t now = GhostNow();
+  const int shift_word = ghost_stamp_shift_.LoadRelaxed();
+  if (shift_word & kGhostRestamping) {
+    return;
+  }
+  const uint32_t now = GhostNow(shift_word);
   TEST_SYNC_POINT("FIFOCache::GhostPut:Loaded");
   GhostPlace(GhostGroup(hashed_key), (GhostTag(hashed_key) << 16) | now, now);
 }
 
 void AutoHyperClockTable::GhostMerge(size_t from, size_t to) {
-  const uint32_t now = GhostNow();
-  const uint32_t reach = GhostReach();
+  const int shift_word = ghost_stamp_shift_.LoadRelaxed();
+  if (shift_word & kGhostRestamping) {
+    return;
+  }
+  const uint32_t now = GhostNow(shift_word);
+  const uint32_t reach = GhostReach(shift_word);
   for (size_t i = 0; i < kGhostWays; ++i) {
     const uint32_t c = ghost_[from + i].LoadRelaxed();
     const uint32_t age = GhostAge(c, now);
@@ -4078,42 +4143,44 @@ void AutoHyperClockTable::SetCapacity(size_t capacity) {
   BaseClockTable::SetCapacity(capacity);
   const int shift =
       GhostStampShift(CalcOccupancyLimit(CalcMaxUsableLength(capacity)));
+  // SetCapacity calls are serialized (ShardedCache's config_mutex_), so
+  // the word has no kGhostRestamping here.
   const int old_shift = ghost_stamp_shift_.LoadRelaxed();
   if (shift == old_shift) {
     return;
   }
-  const uint32_t old_now = GhostNow();
-  ghost_stamp_shift_.StoreRelaxed(shift);
-  const uint32_t now = GhostNow();
-  // Restamps every cell of every group a home can be in with its age in the
-  // new step (rounded down), dropping the tags too old to count in it, so a
-  // capacity that moves back and forth across a step keeps the ghost.
-  const size_t used = LengthInfoToUsedLength(length_info_.Load());
-  for (size_t group = 0; group < used; group += kGhostWays) {
+  ghost_stamp_shift_.StoreRelaxed(shift | kGhostRestamping);
+  TEST_SYNC_POINT("FIFOCache::SetCapacity:Restamping");
+  const uint64_t evictions = probation_evictions_.LoadRelaxed();
+  const uint32_t old_now =
+      static_cast<uint32_t>(evictions >> old_shift) & 0xffff;
+  const uint32_t now = static_cast<uint32_t>(evictions >> shift) & 0xffff;
+  // Restamps every cell of every group a home can be in, up to the slots
+  // growth has claimed (a Grow fills the new slot's group before the used
+  // length counts it), with its age in the new step (rounded down),
+  // dropping the tags too old to count in it, so a capacity that moves back
+  // and forth across a step keeps the ghost.
+  const size_t end = std::min(grow_frontier_.LoadRelaxed(), array_.Count());
+  for (size_t group = 0; group < end; group += kGhostWays) {
     for (size_t i = 0; i < kGhostWays; ++i) {
       RelaxedAtomic<uint32_t>& cell = ghost_[group + i];
       uint32_t c = cell.LoadRelaxed();
       if (c == 0) {
         continue;
       }
-      const uint64_t old_age = GhostAge(c, old_now);
-      const uint64_t age = shift > old_shift ? old_age >> (shift - old_shift)
-                                             : old_age << (old_shift - shift);
-      const uint32_t restamped =
-          age >= (uint64_t{1} << 15)
-              ? 0
-              : (c & 0xffff0000) |
-                    ((now - static_cast<uint32_t>(age)) & 0xffff);
-      // A racing eviction's tag, written over c, stays as written.
-      cell.CasStrongRelaxed(c, restamped);
+      // A write that read the old step before the flag and lands over c
+      // stays as written.
+      cell.CasStrongRelaxed(c, GhostRestamp(c, old_now, old_shift, now, shift));
     }
   }
+  ghost_stamp_shift_.StoreRelaxed(shift);
 }
 
 bool AutoHyperClockTable::InGhost(const UniqueId64x2& hashed_key) const {
   uint32_t cell;
-  return GhostFind(GhostGroup(hashed_key), GhostTag(hashed_key), 0, &cell) <
-         kGhostWays;
+  int shift_word = -1;
+  return GhostFind(GhostGroup(hashed_key), GhostTag(hashed_key), 0, &cell,
+                   &shift_word) < kGhostWays;
 }
 
 bool AutoHyperClockTable::IsInProbation(const HandleImpl* h) const {
@@ -4123,6 +4190,15 @@ bool AutoHyperClockTable::IsInProbation(const HandleImpl* h) const {
   return (probation_words_[static_cast<size_t>(h - array_.Get())]
               .LoadRelaxed() &
           kInProbation) != 0;
+}
+
+bool AutoHyperClockTable::CountsInsertRef(const HandleImpl* h) const {
+  if (h->IsStandalone()) {
+    return false;
+  }
+  return (probation_words_[static_cast<size_t>(h - array_.Get())]
+              .LoadRelaxed() &
+          kCountsInsertRef) != 0;
 }
 
 uint32_t AutoHyperClockTable::HitsUnderRef(const HandleImpl* h) const {
@@ -4195,6 +4271,8 @@ uint32_t AutoHyperClockTable::TakeReplacedPlace(size_t idx, uint32_t word,
 }
 
 void AutoHyperClockTable::TrackRemoval(size_t idx, size_t total_charge) {
+  // The word, not the entry's helper, which an erase has freed with a key
+  // kept on the heap.
   const uint32_t old_word =
       probation_words_[idx].FetchAndRelaxed(~(kInProbation | kSeenPinned));
   if (old_word & kInProbation) {
@@ -4202,7 +4280,7 @@ void AutoHyperClockTable::TrackRemoval(size_t idx, size_t total_charge) {
     if (old_word & kSeenPinned) {
       probation_pinned_usage_.FetchSubRelaxed(total_charge);
     }
-  } else if (!IsReservation(array_[idx])) {
+  } else if (!(old_word & kReservation)) {
     resident_count_.FetchSubRelaxed(1);
   }
 }
@@ -4220,7 +4298,7 @@ bool AutoHyperClockTable::TrackEvictionRemoval(size_t idx, size_t total_charge,
     }
     return true;
   }
-  if (!IsReservation(array_[idx])) {
+  if (!(old_word & kReservation)) {
     data->resident_removed += 1;
   }
   return false;
@@ -4509,8 +4587,8 @@ void AutoHyperClockTable::CountEvictions(const EvictionData& data) {
   if (data.pinned_twice_count > 0) {
     pinned_twice_.FetchAddRelaxed(data.pinned_twice_count);
   }
-  if (data.clock_rested) {
-    resident_all_pinned_.FetchAddRelaxed(1);
+  if (data.clock_rests > 0) {
+    resident_all_pinned_.FetchAddRelaxed(data.clock_rests);
   }
   if (data.freed_count > data.probation_freed_count) {
     resident_evictions_.FetchAddRelaxed(data.freed_count -
