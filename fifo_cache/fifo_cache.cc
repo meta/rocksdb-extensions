@@ -96,6 +96,14 @@ bool FIFOCache::TEST_InGhost(const Slice& key) const {
   return const_cast<FIFOCache*>(this)->GetShard(hash).GetTable().InGhost(hash);
 }
 
+#ifndef NDEBUG
+void FIFOCache::TEST_SetOccupancyLimit(size_t limit) {
+  ForEachShard([limit](Shard* shard) {
+    shard->GetTable().TEST_MutableOccupancyLimit() = limit;
+  });
+}
+#endif  // !NDEBUG
+
 size_t FIFOCache::TEST_GetMetadataCharge() const {
   return SumOverShards(
       [](Shard& shard) { return shard.GetTable().GetMetadataCharge(); });
@@ -121,10 +129,11 @@ void FIFOCache::ReportProblems(const std::shared_ptr<Logger>& info_log) const {
       "promotions %" PRIu64 ", ghost returns %" PRIu64
       ", probation evictions %" PRIu64 ", resident evictions %" PRIu64
       ", effort cap stops %" PRIu64 ", probation full %" PRIu64
-      ", pinned twice %" PRIu64,
+      ", pinned twice %" PRIu64 ", resident all pinned %" PRIu64,
       stats.probation_usage, stats.pinned_allowance, stats.promotions,
       stats.ghost_returns, stats.probation_evictions, stats.resident_evictions,
-      stats.effort_cap_stops, stats.probation_full, stats.pinned_twice);
+      stats.effort_cap_stops, stats.probation_full, stats.pinned_twice,
+      stats.resident_all_pinned);
 }
 
 const void* FIFOCache::GetOptionsPtr(const std::string& name) const {

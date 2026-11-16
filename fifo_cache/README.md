@@ -16,8 +16,12 @@ Eviction*](https://jasony.me/publication/sosp23-s3fifo.pdf) (SOSP '23):
   to resident.
 - Cache reservations, the entries with no value that `WriteBufferManager`
   and `CacheReservationManager` insert to account memory, go straight to the
-  resident queue and are never remembered. A probation entry still held
-  through a handle when it reaches the head a second time goes there too.
+  resident queue and are never remembered. The clock doesn't count them as
+  something to evict, so a shard whose resident queue holds nothing else
+  evicts from probation. A probation entry still held through a handle when
+  it reaches the head a second time goes there too, and a lap of the clock
+  that finds nothing there but held entries sends evictions to probation
+  for as many evictions as the shard has entries.
 - There is no shard mutex. Each shard is HyperClockCache's hash table: a
   lookup takes no lock, bumps a per-entry counter and moves nothing, an
   insert links its entry without a lock, and erasing, evicting (for an
@@ -182,7 +186,7 @@ rocksdb::FIFOCacheStats stats;
 if (rocksdb::GetFIFOCacheStats(*table_options.block_cache, &stats)) {
   // stats.probation_usage, pinned_allowance, promotions, ghost_returns,
   // probation_evictions, resident_evictions, effort_cap_stops, probation_full,
-  // pinned_twice
+  // pinned_twice, resident_all_pinned
 }
 ```
 
@@ -211,7 +215,13 @@ still held a lap after a step first found them held, such as the index and
 filter blocks a table reader pins: those are passed over by the resident
 clock as HyperClockCache's would, and each one adds its charge to
 `pinned_allowance` once, which unpinned entries reaching the head then take
-back a sixteenth at a time.
+back a sixteenth at a time. `resident_all_pinned` counts laps of the
+resident clock that left it nothing but held entries. After each, eviction
+takes probation's head first for as many evictions as the shard has
+entries, so an insert doesn't send the clock round entries it can't evict,
+and an entry released meanwhile waits until then. One that keeps rising
+means entries held for good fill the resident queue, nearly the whole
+cache, so look at `rocksdb.block-cache-pinned-usage`.
 
 ## Limitations
 

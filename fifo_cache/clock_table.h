@@ -589,6 +589,10 @@ class BaseClockTable {
     // FIFOCache: heads the call moved to the resident queue for being pinned
     // again a lap after a step rotated them for it.
     size_t pinned_twice_count = 0;
+    // FIFOCache: countdowns the resident clock ran down, and whether the
+    // call set the clock to rest (see clock_rest_until_).
+    size_t clock_countdowns = 0;
+    bool clock_rested = false;
     // FIFOCache: whether Evict gave up at the effort cap, which its caller
     // counts.
     bool effort_cap_reached = false;
@@ -794,8 +798,8 @@ class ProbationQueue {
     uint64_t mask = 0;
     // log2 of the ring's cells, which turns a position into its lap.
     int shift = 0;
-    ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> enqueue{0};
-    ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> dequeue{0};
+    ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> enqueue { 0 };
+    ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> dequeue { 0 };
   };
   // Set on a ring's enqueue position once a newer ring takes its pushes.
   static constexpr uint64_t kClosed = uint64_t{1} << 63;
@@ -821,7 +825,7 @@ class ProbationQueue {
   const std::unique_ptr<Ring[]> rings_;
   // The ring pops take from, the ring pushes go to, and how many rings have
   // been claimed (tail_ + 2 while a ring is being added, else tail_ + 1).
-  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint32_t> head_{0};
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint32_t> head_ { 0 };
   std::atomic<uint32_t> tail_{0};
   std::atomic<uint32_t> rings_claimed_{1};
 };
@@ -1096,18 +1100,20 @@ class AutoHyperClockTable : public BaseClockTable {
   // Erase does, for an insert of proto replacing them: after keep is linked
   // and while the insert holds its reference, or with keep nullptr when the
   // insert is accepted without a slot. Stops once keep isn't visible, or at
-  // an entry linked after keep, whose insert replaces keep in turn: so of
-  // two inserts of one key racing, the one linked last stays, and neither
-  // erases the other's entry while that one erases its own.
+  // an entry not found linked after keep: one linked before it is a newer
+  // insert's, which replaces keep in turn, so of two inserts of one key
+  // racing, the one linked last stays, and neither erases the other's entry
+  // while that one erases its own.
   // Returns whether it erased any, and records them in *replaced if given.
   bool EraseReplaced(const ClockHandleBasicData& proto, const HandleImpl* keep,
                      ReplacedEntries* replaced = nullptr);
-  // FIFOCache: whether a newer comes before older in their key's chain,
-  // walked from its head, as inserts link entries there. Both must be
-  // referenced. A walk that runs off the chain (a concurrent Grow, or a
-  // slot reused mid-walk) or past kMaxChainWalk entries says false.
-  bool LinkedBefore(const HandleImpl* newer, const HandleImpl* older,
-                    const UniqueId64x2& hashed_key) const;
+  // FIFOCache: which of a and b, both referenced entries with hashed_key,
+  // comes first in their key's chain walked from its head, where inserts
+  // link entries, or nullptr if the walk can't tell: it ran off the chain (a
+  // slot reused mid-walk, or a split under it) or past kMaxChainWalk
+  // entries.
+  const HandleImpl* FirstLinked(const HandleImpl* a, const HandleImpl* b,
+                                const UniqueId64x2& hashed_key) const;
   // FIFOCache: far longer than chains get at the table's load factor.
   static constexpr size_t kMaxChainWalk = 64;
 
@@ -1147,16 +1153,22 @@ class AutoHyperClockTable : public BaseClockTable {
   }
 
   // FIFOCache: a cache reservation, an entry with no value and a helper of
-  // its own (the no-op helper with no value stands in for data in RocksDB's
-  // cache simulators), as CacheReservationManager inserts to charge
-  // memtables, filter construction and the like to the cache. Held through
-  // its insert's handle while the memory is in use and never looked up, it
-  // goes to the resident queue, where the clock passes it among the other
-  // entries as HyperClockCache's does: in probation, a run of them at the
-  // head would cost each insert reaching it the effort cap, and their pins
-  // would widen probation's share.
+  // its own with nothing to delete, as CacheReservationManager inserts to
+  // charge memtables, filter construction and the like to the cache, and a
+  // table reader to charge a block it reads without filling the cache. (The
+  // no-op helper with no value stands in for data in RocksDB's cache
+  // simulators, and an entry whose helper deletes its value holds data, even
+  // if the value is nullptr.) Held through its insert's handle while the
+  // memory is in use and never looked up, it goes to the resident queue,
+  // where the clock passes it among the other entries as HyperClockCache's
+  // does: in probation, a run of them at the head would cost each insert
+  // reaching it the effort cap, and their pins would widen probation's
+  // share. resident_count_ leaves them out, so a resident queue of nothing
+  // else doesn't send the clock round them on every insert.
   static bool IsReservation(const ClockHandleBasicData& entry) {
-    return entry.value == nullptr && entry.GetHelper() != &kNoopCacheItemHelper;
+    return entry.value == nullptr &&
+           entry.GetHelper() != &kNoopCacheItemHelper &&
+           entry.GetHelper()->del_cb == nullptr;
   }
 
   // FIFOCache: takes the tag of the key of an entry about to be inserted
@@ -1484,10 +1496,10 @@ class AutoHyperClockTable : public BaseClockTable {
   const NoReserveTypedMemMapping<RelaxedAtomic<uint32_t>> ghost_;
   // FIFOCache: the smallest shift that fits into 15 bits of ghost stamp
   // steps the occupancy limit of a table reserved for the shard's capacity,
-  // which max_capacity doesn't change. A SetCapacity that changes it clears
-  // the ghost, whose stamps would read as other ages in the new step; a tag
-  // stamped by a racing eviction or carried by a racing split can survive
-  // it, reading as another age until it is replaced.
+  // which max_capacity doesn't change. A SetCapacity that changes it
+  // restamps the ghost's cells with their ages in the new step; a tag
+  // stamped by a racing eviction or carried by a racing split can miss the
+  // restamp, reading as another age until it is replaced.
   RelaxedAtomic<int> ghost_stamp_shift_;
 
   // FIFOCache: the probation queue's order, as ProbationCell values.
@@ -1497,12 +1509,14 @@ class AutoHyperClockTable : public BaseClockTable {
   // that also have kSeenPinned set. An Evict call's removals come off, and
   // its insert's probation charge goes on, when the call returns (see
   // CountEvictions).
-  ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<size_t> probation_usage_{};
+  ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<size_t> probation_usage_ {};
   RelaxedAtomic<size_t> probation_pinned_usage_{};
 
-  // FIFOCache: entries in the table that are in the resident queue. Signed
-  // because racing updates can take it below zero for a moment; Evict reads
-  // zero or less as an empty resident queue.
+  // FIFOCache: entries in the table that are in the resident queue, less
+  // cache reservations (see IsReservation), which the clock can't evict while
+  // their memory is in use. Signed because racing updates can take it below
+  // zero for a moment; Evict reads zero or less as a resident queue with
+  // nothing for the clock to take.
   RelaxedAtomic<int64_t> resident_count_{};
 
   // FIFOCache: room in probation's share for entries their inserter still
@@ -1532,6 +1546,26 @@ class AutoHyperClockTable : public BaseClockTable {
   RelaxedAtomic<uint64_t> resident_evictions_{};
   RelaxedAtomic<uint64_t> probation_full_{};
   RelaxedAtomic<uint64_t> pinned_twice_{};
+  RelaxedAtomic<uint64_t> resident_all_pinned_{};
+
+  // FIFOCache: the clock's rest. clock_laps_ counts the clock's returns to
+  // the start of the table, and clock_useful_lap_ is the last lap in which
+  // a resident step ran down a countdown. A lap that ran down none found
+  // only pinned entries and entries it evicted, since it evicts each
+  // unpinned entry it finds at zero, so the return that ends it sets
+  // clock_rest_until_ to as many probation evictions ahead as the shard has
+  // entries, and until probation_evictions_ reaches it Evict sends
+  // probation first, as for a resident queue of cache reservations alone.
+  // A resident queue of entries held for good, such as pinned index and
+  // filter blocks in a cache they nearly fill, then costs a lap of the
+  // clock about once per turnover of the shard, not a sweep on every
+  // insert, and an entry released meanwhile waits for the clock until the
+  // rest is over. A call whose probation has nothing to pop still steps the
+  // clock. On a line of their own, which steps read and laps write.
+  ALIGN_AS(CACHE_LINE_SIZE) RelaxedAtomic<uint64_t> clock_laps_ {};
+  RelaxedAtomic<uint64_t> clock_useful_lap_{};
+  // Zero when not resting.
+  RelaxedAtomic<uint64_t> clock_rest_until_{};
 };  // class AutoHyperClockTable
 
 // A single shard of sharded cache.
@@ -1680,8 +1714,7 @@ class BaseHyperClockCache : public ShardedCache<ClockCacheShard<Table>> {
       const std::shared_ptr<Logger>& /*info_log*/) const override;
 };
 
-class AutoHyperClockCache
-    : public BaseHyperClockCache<AutoHyperClockTable> {
+class AutoHyperClockCache : public BaseHyperClockCache<AutoHyperClockTable> {
  public:
   using BaseHyperClockCache::BaseHyperClockCache;
 

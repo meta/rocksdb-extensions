@@ -33,11 +33,11 @@ namespace ROCKSDB_NAMESPACE {
 // the order they arrived. Keys (not values) recently evicted from probation
 // are remembered, and inserting one again puts it straight into the
 // resident queue. So does inserting an entry with no value and a helper
-// other than kNoopCacheItemHelper, as RocksDB's cache reservations are,
-// which is never remembered either. Placement comes from hits alone:
-// Cache::Priority is ignored. GetFIFOCacheStats (below) reports what the queues
-// did, and Cache::ReportProblems, which RocksDB calls at each stats dump, logs
-// the same at INFO level.
+// other than kNoopCacheItemHelper that has no deleter, as RocksDB's cache
+// reservations are, which is never remembered either. Placement comes from hits
+// alone: Cache::Priority is ignored. GetFIFOCacheStats (below) reports what the
+// queues did, and Cache::ReportProblems, which RocksDB calls at each stats
+// dump, logs the same at INFO level.
 //
 // A negative num_shard_bits (the default) gives each shard at least 4 MiB, up
 // to 64 shards, so a cache under 8 MiB has one. LRUCache defaults to 512 KiB
@@ -68,7 +68,11 @@ namespace ROCKSDB_NAMESPACE {
 // Pinned entries are never evicted. A probation entry still pinned when
 // the queue's head reaches it again, a lap after it went to the tail for
 // being pinned, goes to the resident queue, whose clock passes over it
-// while it stays pinned, as HyperClockCache's does. Without
+// while it stays pinned, as HyperClockCache's does. A lap of the clock that
+// finds nothing in the resident queue but pinned entries (and entries it
+// evicts) sends eviction to probation's head first for as many evictions
+// as the shard has entries, so a resident entry released meanwhile stays
+// until the clock looks again. Without
 // strict_capacity_limit, an insert's eviction stops stepping a queue once
 // those steps have passed 30 pinned entries for each entry it freed, plus
 // 30 (the clock counting the pinned probation entries it passes), and
@@ -91,12 +95,13 @@ namespace ROCKSDB_NAMESPACE {
 // S3-FIFO's ghost, rounded up to the count's step: one eviction for a shard
 // of up to about 2.6 MB capacity, 2^n for one of 2^n times that, whatever
 // max_capacity (see below) reserves. A SetCapacity that changes the step
-// forgets the remembered keys. A cell counts for at most 32,768 steps, which
-// falls short of that share only for entries averaging under 70 bytes of
-// charge, under kDontChargeCacheMetadata with max_capacity above capacity.
-// A victim whose group has no empty cell replaces the oldest, unless all
-// eight are from its own step, and while a group's eight cells all count, an
-// insert of a key that isn't remembered matches one of them 1 time in 8,192.
+// keeps the remembered keys, with their ages in the new step rounded down,
+// and forgets the ones too old to count in it. A cell counts for at most 32,768
+// steps, which falls short of that share only for entries averaging under 70
+// bytes of charge, under kDontChargeCacheMetadata with max_capacity above
+// capacity. A victim whose group has no empty cell replaces the oldest, unless
+// all eight are from its own step, and while a group's eight cells all count,
+// an insert of a key that isn't remembered matches one of them 1 time in 8,192.
 // A cell that stopped counting counts again if the shard later holds enough
 // entries for that count to cover the evictions since its key's, or 65,280
 // steps on.
@@ -216,6 +221,12 @@ struct FIFOCacheStats {
   // HyperClockCache's does. Each one its inserter alone held on its first
   // visit added its charge to pinned_allowance then.
   uint64_t pinned_twice = 0;
+  // Laps of the resident clock that left it nothing but pinned entries,
+  // having evicted the rest and found none it could evict later. After
+  // each, eviction takes probation's head first for as many probation
+  // evictions as the shard has entries before the clock looks again, so a
+  // resident entry released meanwhile stays until then.
+  uint64_t resident_all_pinned = 0;
 };
 
 // Sets *stats to the FIFOCacheStats of the FIFOCache that cache is, or that

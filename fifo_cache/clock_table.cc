@@ -127,6 +127,8 @@ inline bool ClockUpdate(ClockHandle& h, BaseClockTable::EvictionData* data,
     return false;
   }
   if (meta.IsVisible() && acquire_count > 0) {
+    // FIFOCache: an entry the clock can take once its countdown runs out.
+    data->clock_countdowns++;
     // Decrement clock
     uint32_t new_count =
         std::min(acquire_count - 1, uint32_t{ClockHandle::kMaxCountdown} - 1);
@@ -1536,8 +1538,7 @@ AutoHyperClockTable::AutoHyperClockTable(
   // FIFOCache: and the probation words' and ghost's mappings.
   if (array_.Get() == nullptr || probation_words_.Get() == nullptr ||
       ghost_.Get() == nullptr) {
-    fprintf(stderr,
-            "Anonymous mmap for RocksDB FIFOCache failed. Aborting.\n");
+    fprintf(stderr, "Anonymous mmap for RocksDB FIFOCache failed. Aborting.\n");
     std::terminate();
   }
   if (metadata_charge_policy ==
@@ -1629,7 +1630,7 @@ AutoHyperClockTable::~AutoHyperClockTable() {
       }
     } else {
       assert((word & kSeenPinned) == 0);
-      if (shareable) {
+      if (shareable && !IsReservation(h)) {
         resident_sum++;
       }
     }
@@ -1812,6 +1813,7 @@ bool AutoHyperClockTable::Grow(InsertState& state, size_t entry_charge) {
   if (metadata_charge_policy_ == kFullChargeCacheMetadata) {
     state.slot_charge += kSlotMetadata;
   }
+  TEST_SYNC_POINT_CALLBACK("FIFOCache::Grow:Claimed", &grow_home);
 #ifdef COERCE_CONTEXT_SWITCH
   // This is useful in reproducing concurrency issues in Grow()
   while (Random::GetTLSInstance()->OneIn(2)) {
@@ -2257,6 +2259,7 @@ void AutoHyperClockTable::SplitForGrow(size_t grow_home, size_t old_home,
                              new_shift);
         // Swap which is marked as first
         chain_frontier_first = 1 - chain_frontier_first;
+        TEST_SYNC_POINT("FIFOCache::SplitForGrow:Skipped");
       } else {
         // Nothing to do yet, as we need to keep old generation pointers in
         // place for lookups
@@ -3212,29 +3215,43 @@ void AutoHyperClockTable::Erase(const UniqueId64x2& hashed_key,
   }
 }
 
-bool AutoHyperClockTable::LinkedBefore(const HandleImpl* newer,
-                                       const HandleImpl* older,
-                                       const UniqueId64x2& hashed_key) const {
+const AutoHyperClockTable::HandleImpl* AutoHyperClockTable::FirstLinked(
+    const HandleImpl* a, const HandleImpl* b,
+    const UniqueId64x2& hashed_key) const {
   // As Lookup's first, naive pass: references keep both entries linked, and
-  // a chain keeps its entries' order through purges and splits, so newer
-  // comes first unless the walk leaves the chain.
+  // a chain keeps its entries' order through purges and splits, so the one
+  // the walk reaches first comes first, as long as the walk stays on the
+  // key's chain. A head with a newer shift than length_info_ gives (a split
+  // whose length isn't published yet, as Insert and Lookup find) moves the
+  // walk to the key's home under that shift, one bit at a time. Past the
+  // head, a link with the older shift is the tail a split in progress still
+  // shares between its two chains, in order. One with a newer shift is from
+  // a split of the chain since the walk read its head, and the split's new
+  // links skip the entries bound for its other chain, which may be the
+  // key's, so as at an end before either entry, or past kMaxChainWalk, the
+  // walk can't tell.
   size_t home;
   int home_shift;
-  GetHomeIndexAndShift(length_info_.LoadRelaxed(), hashed_key[1], &home,
-                       &home_shift);
+  GetHomeIndexAndShift(length_info_.Load(), hashed_key[1], &home, &home_shift);
   const HandleImpl* const arr = array_.Get();
-  NextWithShift next_with_shift = arr[home].head_next_with_shift.LoadRelaxed();
-  for (size_t i = 0; !next_with_shift.IsEnd() && i < kMaxChainWalk; ++i) {
-    const HandleImpl* h = &arr[next_with_shift.GetNext()];
-    if (h == newer) {
-      return true;
-    }
-    if (h == older) {
-      return false;
-    }
-    next_with_shift = h->chain_next_with_shift.LoadRelaxed();
+  NextWithShift next_with_shift = arr[home].head_next_with_shift.Load();
+  while (next_with_shift.GetShift() > home_shift) {
+    ++home_shift;
+    home = GetHomeIndex(hashed_key[1], home_shift);
+    next_with_shift = arr[home].head_next_with_shift.Load();
   }
-  return false;
+  TEST_SYNC_POINT("FIFOCache::FirstLinked:Head");
+  for (size_t i = 0; i < kMaxChainWalk; ++i) {
+    if (next_with_shift.IsEnd() || next_with_shift.GetShift() > home_shift) {
+      return nullptr;
+    }
+    const HandleImpl* h = &arr[next_with_shift.GetNext()];
+    if (h == a || h == b) {
+      return h;
+    }
+    next_with_shift = h->chain_next_with_shift.Load();
+  }
+  return nullptr;
 }
 
 bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
@@ -3251,10 +3268,13 @@ bool AutoHyperClockTable::EraseReplaced(const ClockHandleBasicData& proto,
   // replacing it, that erases the rest, which may include the newer entry.
   // An entry linked after keep is a newer insert's, which replaces keep and
   // the rest: erasing it here could erase both while the newer insert erases
-  // keep, leaving the key absent or an older entry visible.
+  // keep, leaving the key absent or an older entry visible. So h goes only
+  // if keep is found ahead of it; when the walk can't tell, the rest stays
+  // for a newer insert to erase, or as an older duplicate behind keep, which
+  // lookups reach first, until eviction takes it.
   while (HandleImpl* h = Lookup(proto.hashed_key, key, keep)) {
     if (keep != nullptr && (!keep->meta.Load().IsVisible() ||
-                            LinkedBefore(h, keep, proto.hashed_key))) {
+                            FirstLinked(h, keep, proto.hashed_key) != keep)) {
       Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
       break;
     }
@@ -3361,16 +3381,18 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
 
   // FIFOCache: S3-FIFO's choice of queue, made before each step. Probation
   // goes first while its entries not last seen pinned hold more than its
-  // share, counting the entry being inserted, or when the resident queue is
-  // empty; otherwise the resident clock does. (Long-lived pins in
-  // probation, such as cache reservations, would otherwise keep it over its
-  // share and leave resident entries unevictable.) Once probation has
-  // promoted an entry it keeps going until it evicts one, as S3-FIFO does,
-  // even if the promotions took it under its share: otherwise the resident
-  // clock would go next and could take the entry just promoted, which has no
-  // hits there yet. Once the resident clock has given up (the limit below),
-  // probation goes regardless of its share, and an entry it promotes gets
-  // the resident clock one more lap, since at no hits it is evictable there.
+  // share, counting the entry being inserted, or when the resident queue
+  // holds nothing but cache reservations; otherwise the resident clock does.
+  // (Long-lived pins in probation, such as blocks held through the handle
+  // their insert returned, would otherwise keep it over its share and leave
+  // resident entries unevictable.) Once probation has promoted an entry it
+  // keeps going until it evicts one, as S3-FIFO does, even if the promotions
+  // took it under its share: otherwise the resident clock would go next and
+  // could take the entry just promoted, which has no hits there yet. Once the
+  // resident clock has given up (the limit below, or its effort cap),
+  // probation goes regardless of its share, and an entry it promotes gets the
+  // resident clock one more lap if the clock is under its effort cap, since
+  // at no hits it is evictable there.
   // A probation step that finds nothing to pop falls through to a resident
   // step. Probation steps per call are capped at the cells the queue's rings
   // have, a lap of the queue, so heads that keep rotating (losing every claim
@@ -3379,35 +3401,48 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
   // The effort cap applies to each queue's steps apart: pinned heads in
   // probation say nothing of the resident queue, nor a resident queue of
   // pinned entries of probation's. A queue whose steps have seen too many
-  // pinned entries for the entries this call freed (the probation entries
-  // the resident clock passes among them) gets no more steps, and the call
-  // gives up when both have none.
+  // pinned entries for the entries this call has freed so far, from either
+  // queue (the probation entries the resident clock passes among them),
+  // gets no more steps until a free raises its allowance, and the call gives
+  // up when both have none.
+  //
+  // While the clock rests (see clock_rest_until_), probation goes first, as
+  // for a resident queue of reservations alone.
   const size_t probation_target = ProbationTarget();
+  bool clock_resting = false;
+  if (uint64_t rest_until = clock_rest_until_.LoadRelaxed(); rest_until != 0) {
+    clock_resting = probation_evictions_.LoadRelaxed() < rest_until;
+    if (!clock_resting) {
+      clock_rest_until_.CasStrongRelaxed(rest_until, 0);
+    }
+  }
   // Read once, the first time probation is over its target.
   size_t pinned_allowance = SIZE_MAX;
   const size_t max_probation_steps = probation_.CellCount();
   size_t probation_steps = 0;
-  bool resident_exhausted = false;
+  // The resident clock went round its laps (see max_clock_pointer).
+  bool resident_lapped = false;
   bool promoting = false;
   uint64_t resident_laps = uint64_t{ClockHandle::kMaxCountdown + 1};
   size_t probation_seen_pinned = 0;
   size_t resident_seen_pinned = 0;
-  bool probation_capped = false;
-  bool resident_capped = false;
   auto effort_exceeded = [&](size_t seen_pinned) {
     const uint64_t effort_cap =
         eec_and_scl_.LoadRelaxed().GetEffectiveEvictionEffortCap();
     return (data->freed_count + 1U) * effort_cap <= seen_pinned;
   };
+  auto probation_capped = [&] {
+    return effort_exceeded(probation_seen_pinned);
+  };
+  auto resident_capped = [&] { return effort_exceeded(resident_seen_pinned); };
 
   // Loop until enough freed, or limit reached (see bottom of loop)
   for (;;) {
     // The counters less this call's removals, which CountEvictions takes
     // off on return. (The insert's precharge isn't in them either, and is
     // state.probation_charge here.)
-    const size_t probation_usage =
-        SubtractPending(probation_usage_.LoadRelaxed(),
-                        data->probation_removed_charge);
+    const size_t probation_usage = SubtractPending(
+        probation_usage_.LoadRelaxed(), data->probation_removed_charge);
     const size_t probation_pinned =
         SubtractPending(probation_pinned_usage_.LoadRelaxed(),
                         data->probation_pinned_removed_charge);
@@ -3427,17 +3462,19 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
         resident_count_.LoadRelaxed() -
             static_cast<int64_t>(data->resident_removed) <=
         0;
+    const bool resident_out = resident_lapped || resident_capped();
     const bool probation_first =
-        !probation_capped &&
-        (promoting || resident_exhausted || probation_over || resident_empty);
+        !probation_capped() && (promoting || resident_out || probation_over ||
+                                resident_empty || clock_resting);
     bool promoted = false;
     const size_t freed_before = data->freed_count;
     const size_t pinned_before = data->seen_pinned_count;
     if (probation_first && probation_steps < max_probation_steps &&
         (++probation_steps, ProbationStep(data, state, &promoted))) {
       probation_seen_pinned += data->seen_pinned_count - pinned_before;
-      if (promoted && resident_exhausted) {
-        resident_exhausted = false;
+      if (promoted && resident_lapped) {
+        // A lap more, while the clock is under its effort cap.
+        resident_lapped = false;
         max_clock_pointer = 0;
         resident_laps = 1;
       }
@@ -3450,22 +3487,21 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
           (!need_entry || data->freed_count > 0)) {
         return;
       }
-      if (effort_exceeded(probation_seen_pinned)) {
-        probation_capped = true;
-        if (resident_exhausted || resident_empty) {
-          // FIFOCache: counted by the caller.
-          data->effort_cap_reached = true;
-          return;
-        }
+      if (probation_capped() &&
+          (resident_lapped || resident_capped() || resident_empty)) {
+        // FIFOCache: counted by the caller.
+        data->effort_cap_reached = true;
+        return;
       }
       continue;
     }
     promoting = false;
-    if (resident_exhausted) {
-      data->effort_cap_reached |= probation_capped || resident_capped;
+    if (resident_lapped || resident_capped()) {
+      data->effort_cap_reached |= probation_capped() || resident_capped();
       return;
     }
     const size_t resident_pinned_before = data->seen_pinned_count;
+    const size_t countdowns_before = data->clock_countdowns;
 
     TEST_SYNC_POINT("FIFOCache::Evict:ResidentStep");
     // First (concurrent) increment clock pointer
@@ -3478,6 +3514,15 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
       if (clock_pointer_mask != mask) {
         clock_pointer_mask = static_cast<size_t>(mask);
         clock_pointer_mask_.StoreRelaxed(clock_pointer_mask);
+      }
+      // FIFOCache: a lap whose steps ran down no countdown rests the clock
+      // (see clock_rest_until_).
+      const uint64_t lap = clock_laps_.FetchAddRelaxed(1) + 1;
+      if (clock_useful_lap_.LoadRelaxed() + 1 < lap) {
+        data->clock_rested = true;
+        clock_rest_until_.StoreRelaxed(probation_evictions_.LoadRelaxed() +
+                                       data->probation_freed_count +
+                                       occupancy_.LoadRelaxed());
       }
     }
 
@@ -3529,18 +3574,21 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
     if (old_clock_pointer + step_size >= max_clock_pointer) {
       // FIFOCache: fall back on probation, which returns when it has
       // nothing either.
-      resident_exhausted = true;
+      resident_lapped = true;
     }
 
     resident_seen_pinned += data->seen_pinned_count - resident_pinned_before;
-    if (effort_exceeded(resident_seen_pinned)) {
-      resident_capped = true;
-      resident_exhausted = true;
-      if (probation_capped) {
-        // FIFOCache: counted by the caller.
-        data->effort_cap_reached = true;
-        return;
+    if (data->clock_countdowns != countdowns_before) {
+      // FIFOCache: a step that ran down a countdown (see clock_rest_until_).
+      const uint64_t lap = clock_laps_.LoadRelaxed();
+      if (clock_useful_lap_.LoadRelaxed() < lap) {
+        clock_useful_lap_.StoreRelaxed(lap);
       }
+    }
+    if (resident_capped() && probation_capped()) {
+      // FIFOCache: counted by the caller.
+      data->effort_cap_reached = true;
+      return;
     }
   }
 }
@@ -3787,7 +3835,9 @@ bool AutoHyperClockTable::TryInsertSlot(const ClockHandleBasicData& proto,
     }
   } else {
     assert(!probation_precharged);
-    resident_count_.FetchAddRelaxed(1);
+    if (!IsReservation(proto)) {
+      resident_count_.FetchAddRelaxed(1);
+    }
   }
   // Publishes the word with the entry (a release store).
   FinishSlotInsert(proto, h, initial_countdown, /*keep_ref=*/true);
@@ -4028,15 +4078,34 @@ void AutoHyperClockTable::SetCapacity(size_t capacity) {
   BaseClockTable::SetCapacity(capacity);
   const int shift =
       GhostStampShift(CalcOccupancyLimit(CalcMaxUsableLength(capacity)));
-  if (shift == ghost_stamp_shift_.LoadRelaxed()) {
+  const int old_shift = ghost_stamp_shift_.LoadRelaxed();
+  if (shift == old_shift) {
     return;
   }
+  const uint32_t old_now = GhostNow();
   ghost_stamp_shift_.StoreRelaxed(shift);
-  // Every cell of every group a home can be in.
+  const uint32_t now = GhostNow();
+  // Restamps every cell of every group a home can be in with its age in the
+  // new step (rounded down), dropping the tags too old to count in it, so a
+  // capacity that moves back and forth across a step keeps the ghost.
   const size_t used = LengthInfoToUsedLength(length_info_.Load());
   for (size_t group = 0; group < used; group += kGhostWays) {
     for (size_t i = 0; i < kGhostWays; ++i) {
-      ghost_[group + i].StoreRelaxed(0);
+      RelaxedAtomic<uint32_t>& cell = ghost_[group + i];
+      uint32_t c = cell.LoadRelaxed();
+      if (c == 0) {
+        continue;
+      }
+      const uint64_t old_age = GhostAge(c, old_now);
+      const uint64_t age = shift > old_shift ? old_age >> (shift - old_shift)
+                                             : old_age << (old_shift - shift);
+      const uint32_t restamped =
+          age >= (uint64_t{1} << 15)
+              ? 0
+              : (c & 0xffff0000) |
+                    ((now - static_cast<uint32_t>(age)) & 0xffff);
+      // A racing eviction's tag, written over c, stays as written.
+      cell.CasStrongRelaxed(c, restamped);
     }
   }
 }
@@ -4133,7 +4202,7 @@ void AutoHyperClockTable::TrackRemoval(size_t idx, size_t total_charge) {
     if (old_word & kSeenPinned) {
       probation_pinned_usage_.FetchSubRelaxed(total_charge);
     }
-  } else {
+  } else if (!IsReservation(array_[idx])) {
     resident_count_.FetchSubRelaxed(1);
   }
 }
@@ -4151,7 +4220,9 @@ bool AutoHyperClockTable::TrackEvictionRemoval(size_t idx, size_t total_charge,
     }
     return true;
   }
-  data->resident_removed += 1;
+  if (!IsReservation(array_[idx])) {
+    data->resident_removed += 1;
+  }
   return false;
 }
 
@@ -4438,6 +4509,9 @@ void AutoHyperClockTable::CountEvictions(const EvictionData& data) {
   if (data.pinned_twice_count > 0) {
     pinned_twice_.FetchAddRelaxed(data.pinned_twice_count);
   }
+  if (data.clock_rested) {
+    resident_all_pinned_.FetchAddRelaxed(1);
+  }
   if (data.freed_count > data.probation_freed_count) {
     resident_evictions_.FetchAddRelaxed(data.freed_count -
                                         data.probation_freed_count);
@@ -4454,6 +4528,7 @@ void AutoHyperClockTable::AddStats(FIFOCacheStats* stats) const {
   stats->effort_cap_stops += GetEvictionEffortExceededCount();
   stats->probation_full += probation_full_.LoadRelaxed();
   stats->pinned_twice += pinned_twice_.LoadRelaxed();
+  stats->resident_all_pinned += resident_all_pinned_.LoadRelaxed();
 }
 
 size_t AutoHyperClockTable::CalcMaxUsableLength(size_t reserved_capacity) {

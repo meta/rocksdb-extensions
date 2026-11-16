@@ -63,6 +63,11 @@ class FIFOCache
   uint32_t TEST_GetHits(const Slice& key);
   // Whether an insert of the key would find it in the ghost.
   bool TEST_InGhost(const Slice& key) const;
+#ifndef NDEBUG
+  // Sets each shard's occupancy limit, past which an insert grows the
+  // table, until the table's own next update of it.
+  void TEST_SetOccupancyLimit(size_t limit);
+#endif  // !NDEBUG
   // The start of each shard's table mappings (see
   // AutoHyperClockTable::TEST_GetMappings).
   std::vector<const void*> TEST_GetMappings() const;
