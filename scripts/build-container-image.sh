@@ -18,7 +18,7 @@
 #   scripts/build-container-image.sh all --validate
 #
 # Useful overrides:
-#   IMAGE_REGISTRY=ghcr.io/facebook
+#   IMAGE_REGISTRY=ghcr.io/meta
 #   IMAGE_PREFIX=rocksdb-extensions
 #   UBUNTU_BASE_IMAGE=ubuntu:24.04
 #   CENTOS_BASE_IMAGE=quay.io/centos/centos:stream9
@@ -33,7 +33,7 @@ REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 readonly REPOSITORY_ROOT
 
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"
-IMAGE_REGISTRY="${IMAGE_REGISTRY:-ghcr.io/facebook}"
+IMAGE_REGISTRY="${IMAGE_REGISTRY:-ghcr.io/meta}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-rocksdb-extensions}"
 UBUNTU_BASE_IMAGE="${UBUNTU_BASE_IMAGE:-ubuntu:24.04}"
 CENTOS_BASE_IMAGE="${CENTOS_BASE_IMAGE:-quay.io/centos/centos:stream9}"

@@ -37,11 +37,11 @@ jobs:
           - compiler: gcc
             cc: gcc
             cxx: g++
-            container_image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+            container_image: ghcr.io/meta/rocksdb-extensions_ubuntu:24.0
           - compiler: clang
             cc: clang
             cxx: clang++
-            container_image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+            container_image: ghcr.io/meta/rocksdb-extensions_ubuntu:24.0
 
     steps:
       - uses: actions/checkout@v4

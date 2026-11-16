@@ -161,7 +161,7 @@ if [[ "${use_locked_revisions}" != "0" ]]; then
 else
   rocksdb_ref="${ROCKSDB_REVISION:-${ROCKSDB_RELEASE_TAG:-}}"
   if [[ -z "${rocksdb_ref}" ]]; then
-    rocksdb_ref="$(resolve_latest_stable_revision facebook/rocksdb)"
+    rocksdb_ref="$(resolve_latest_stable_revision meta/rocksdb)"
   fi
   rocksdb_version="${ROCKSDB_VERSION:-${rocksdb_ref}}"
 
@@ -172,7 +172,7 @@ else
 
   if [[ "${resolve_only}" != "0" ]]; then
     rocksdb_revision="$(
-      resolve_revision_to_commit facebook/rocksdb "${rocksdb_ref}"
+      resolve_revision_to_commit meta/rocksdb "${rocksdb_ref}"
     )"
     nimble_revision="$(
       resolve_revision_to_commit facebookincubator/nimble "${nimble_ref}"

@@ -67,7 +67,7 @@ echo "Work directory:   ${work}"
 # plugin/fifo_cache.
 mkdir -p "${rocksdb_source}"
 curl -fsSL --retry 3 \
-  "https://github.com/facebook/rocksdb/archive/${rocksdb_revision}.tar.gz" |
+  "https://github.com/meta/rocksdb/archive/${rocksdb_revision}.tar.gz" |
   tar -xz --strip-components=1 -C "${rocksdb_source}"
 ln -s "${REPOSITORY_ROOT}/fifo_cache" "${rocksdb_source}/plugin/fifo_cache"
 

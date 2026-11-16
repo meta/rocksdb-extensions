@@ -1,7 +1,7 @@
 # RocksDB Extensions
 
 `rocksdb-extensions` is a companion repository to
-[RocksDB](https://github.com/facebook/rocksdb/) — a persistent key-value store
+[RocksDB](https://github.com/meta/rocksdb/) — a persistent key-value store
 for fast storage environments. It hosts extensions, plugins, and integrations
 that build on top of RocksDB's public APIs but live outside of the core RocksDB
 codebase.
@@ -29,7 +29,7 @@ for build instructions.
 Clone the repository:
 
 ```bash
-git clone https://github.com/facebook/rocksdb-extensions.git
+git clone https://github.com/meta/rocksdb-extensions.git
 cd rocksdb-extensions
 ```
 

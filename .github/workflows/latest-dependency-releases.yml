@@ -37,7 +37,7 @@ jobs:
     runs-on:
       labels: 32-core-ubuntu
     container:
-      image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+      image: ghcr.io/meta/rocksdb-extensions_ubuntu:24.0
     outputs:
       current_rocksdb_version: ${{ steps.current.outputs.rocksdb_version }}
       current_rocksdb: ${{ steps.current.outputs.rocksdb_revision }}
@@ -133,11 +133,11 @@ jobs:
           - compiler: gcc
             cc: gcc
             cxx: g++
-            container_image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+            container_image: ghcr.io/meta/rocksdb-extensions_ubuntu:24.0
           - compiler: clang
             cc: clang
             cxx: clang++
-            container_image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+            container_image: ghcr.io/meta/rocksdb-extensions_ubuntu:24.0
     env:
       http_proxy: ""
       https_proxy: ""
@@ -184,11 +184,11 @@ jobs:
           - compiler: gcc
             cc: gcc
             cxx: g++
-            container_image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+            container_image: ghcr.io/meta/rocksdb-extensions_ubuntu:24.0
           - compiler: clang
             cc: clang
             cxx: clang++
-            container_image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+            container_image: ghcr.io/meta/rocksdb-extensions_ubuntu:24.0
     env:
       http_proxy: ""
       https_proxy: ""
@@ -234,7 +234,7 @@ jobs:
     runs-on:
       labels: 32-core-ubuntu
     container:
-      image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+      image: ghcr.io/meta/rocksdb-extensions_ubuntu:24.0
     timeout-minutes: 180
     permissions:
       contents: write

@@ -19,7 +19,7 @@ accounting and how to choose `num_shard_bits`. The API is experimental and
 may change.
 
 This directory is a [RocksDB
-plugin](https://github.com/facebook/rocksdb/blob/main/plugin/README.md): it is
+plugin](https://github.com/meta/rocksdb/blob/main/plugin/README.md): it is
 compiled into RocksDB itself, so it uses RocksDB's sharded-cache framework and
 utilities directly. It is built and tested against the RocksDB release pinned
 in [`dependencies.lock`](../dependencies.lock) (v11.8.1).
@@ -32,7 +32,7 @@ builds RocksDB with the plugin, installs it, and runs a short `db_bench`
 comparison of FIFOCache, LRUCache and HyperClockCache:
 
 ```bash
-git clone https://github.com/facebook/rocksdb-extensions.git
+git clone https://github.com/meta/rocksdb-extensions.git
 cd rocksdb-extensions
 ./scripts/fifo-cache-quick-start.sh /path/to/new-dir
 ```
@@ -57,7 +57,7 @@ flags, warnings as errors included.
 With CMake:
 
 ```bash
-git clone --depth 1 --branch v11.8.1 https://github.com/facebook/rocksdb.git
+git clone --depth 1 --branch v11.8.1 https://github.com/meta/rocksdb.git
 cd rocksdb
 ln -s /path/to/rocksdb-extensions/fifo_cache plugin/fifo_cache
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DROCKSDB_PLUGINS=fifo_cache
@@ -69,7 +69,7 @@ With make, copy the directory instead of linking it, since make writes its
 objects next to the sources:
 
 ```bash
-git clone --depth 1 --branch v11.8.1 https://github.com/facebook/rocksdb.git
+git clone --depth 1 --branch v11.8.1 https://github.com/meta/rocksdb.git
 cd rocksdb
 cp -R /path/to/rocksdb-extensions/fifo_cache plugin/fifo_cache
 make -j"$(nproc)" ROCKSDB_PLUGINS=fifo_cache static_lib db_bench
