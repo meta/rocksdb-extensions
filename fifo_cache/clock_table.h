@@ -618,11 +618,11 @@ class BaseClockTable {
   // insert that can't is refused under either limit (MemoryLimit with a
   // handle, dropped with OK without one), and a standalone entry is refused,
   // or made uncharged with allow_uncharged, as FIFOCache did before this
-  // table. It checks usage as loaded and reserves nothing. Under
-  // strict_capacity_limit the charge checks again on the usage it adds to
-  // (see ChargeUsageMaybeEvictStrict); without it, inserts racing with
-  // charges of over a quarter of size_t each could pass it together, as
-  // HyperClockCache, which has no such check, lets a single insert do.
+  // table. This checks usage as loaded and reserves nothing; the charge is
+  // checked again as it is added to usage, by ChargeUsageMaybeEvictStrict
+  // under strict_capacity_limit and by AddUsage without it, so racing
+  // inserts can't pass it together, where HyperClockCache has no such check
+  // and lets a single insert pass it.
   static bool UsageCanTake(size_t usage, size_t charge) {
     constexpr size_t kMaxUsage = SIZE_MAX / 2;
     return charge < kMaxUsage - std::min(usage, kMaxUsage);
@@ -630,6 +630,15 @@ class BaseClockTable {
   bool UsageCanTake(size_t charge) const {
     return UsageCanTake(usage_.LoadRelaxed(), charge);
   }
+  // FIFOCache: adds add less sub (an insert's charge less what its eviction
+  // freed) to usage, if usage can take it (see UsageCanTake), and otherwise
+  // takes off sub alone and returns false. An add of at most kPlainAddMax is
+  // a fetch-add, as in HyperClockCache, checked on the usage it returns and
+  // taken back if that couldn't take it, so racing adds can pass half of
+  // size_t only for the moment, by their own charges; a bigger add is a
+  // compare-and-swap that checks usage as it changes and never passes it.
+  static constexpr size_t kPlainAddMax = SIZE_MAX >> 16;
+  bool AddUsage(size_t add, size_t sub);
   // FIFOCache: adds bytes of table metadata (a slot the table grows by, or
   // a probation ring) to usage under kFullChargeCacheMetadata, only if
   // usage can take them and keep, the charge of the entry being inserted
@@ -1073,6 +1082,10 @@ class AutoHyperClockTable : public BaseClockTable {
     // its eviction for a ring it charged counts none (see
     // EvictForChargedRing).
     bool effort_cap_counted = false;
+    // FIFOCache: whether ChargeUsageMaybeEvictNonStrict refused the insert
+    // because usage couldn't take its charge (see AddUsage), rather than
+    // for want of a slot.
+    bool usage_refused = false;
   };
 
   void StartInsert(InsertState& state);

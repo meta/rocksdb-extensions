@@ -7465,6 +7465,283 @@ TEST_F(FIFOCacheTest, StrictInsertOverCapacityKeepsUsageWhileItEvicts) {
   EXPECT_EQ(0, cache->GetUsage());
 }
 
+// Without strict_capacity_limit, an insert with a charge too big to add
+// unchecked adds it with a compare-and-swap that checks usage as it changes
+// (see AddUsage), so of two racing with charges of over a quarter of size_t
+// only one passes: the one parked after loading usage, with a handle and the
+// key of a held entry, is refused once the other has added its charge, and
+// the entry under its key stays. The shard isn't left refusing inserts: one
+// of an ordinary charge evicts the big entry, which nothing holds.
+TEST_F(FIFOCacheTest, NonStrictInsertsRacingWithBigChargesCantBothPass) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 20);
+  Cache::Handle* a = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("a"), 10, &a));
+  const size_t big = SIZE_MAX / 4 + 10;
+  Parker loaded("FIFOCache::ChargeUsageMaybeEvictNonStrict:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  Cache::Handle* h = nullptr;
+  port::Thread inserting(
+      [&] { status = Insert(cache.get(), K("a"), big, &h); });
+  loaded.WaitParked();
+  ASSERT_OK(Insert(cache.get(), K("b"), big));
+  EXPECT_EQ(10 + big, cache->GetUsage());
+  loaded.Resume();
+  inserting.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(10 + big, cache->GetUsage());
+  Cache::Handle* again = cache->Lookup(K("a"));
+  EXPECT_EQ(a, again);
+  if (again != nullptr) {
+    cache->Release(again);
+  }
+  ASSERT_OK(Insert(cache.get(), K("c"), 1));
+  EXPECT_FALSE(Holds(cache.get(), K("b")));
+  EXPECT_TRUE(Holds(cache.get(), K("c")));
+  EXPECT_EQ(11, cache->GetUsage());
+  EXPECT_FALSE(cache->Release(a));
+}
+
+// The same holds for inserts of ordinary charges, which add theirs with a
+// fetch-add and take it back if the usage it returns couldn't take it:
+// with held entries leaving 10 short of half of size_t, and an unheld one
+// of 5 after them, the insert of 10 parked after loading usage, without a
+// handle and with the key of a held entry, evicts the 5 and is refused
+// (dropped). The held entry under its key stays, and usage is less the 5.
+TEST_F(FIFOCacheTest, NonStrictInsertsRacingNearHalfOfSizeTCantBothPass) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 20);
+  Cache::Handle* big = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("big"), SIZE_MAX / 2 - 20, &big));
+  Parker loaded("FIFOCache::ChargeUsageMaybeEvictNonStrict:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  port::Thread inserting([&] { status = Insert(cache.get(), K("big"), 10); });
+  loaded.WaitParked();
+  Cache::Handle* y = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("y"), 10, &y));
+  ASSERT_OK(Insert(cache.get(), K("z"), 5));
+  EXPECT_EQ(SIZE_MAX / 2 - 5, cache->GetUsage());
+  loaded.Resume();
+  inserting.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_OK(status);
+  EXPECT_FALSE(Holds(cache.get(), K("z")));
+  EXPECT_EQ(SIZE_MAX / 2 - 10, cache->GetUsage());
+  Cache::Handle* again = cache->Lookup(K("big"));
+  EXPECT_EQ(big, again);
+  if (again != nullptr) {
+    cache->Release(again);
+  }
+  EXPECT_FALSE(cache->Release(y));
+  EXPECT_TRUE(cache->Release(big, /*erase_if_last_ref*/ true));
+  EXPECT_EQ(10, cache->GetUsage());
+}
+
+// A bigger charge, added with a compare-and-swap, takes off what the insert
+// evicted when it is refused all the same: in units u just over the largest
+// fetch-add, with held entries leaving 3u short of half of size_t and an
+// unheld one of 2u after them, the insert of 3u parked after loading usage
+// evicts the 2u and is refused, and usage is less the 2u.
+TEST_F(FIFOCacheTest,
+       NonStrictBigInsertRefusedAfterEvictingTakesOffItsEviction) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 20);
+  const size_t u = (SIZE_MAX >> 16) + 1;
+  Cache::Handle* big = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("big"), SIZE_MAX / 2 - 6 * u, &big));
+  Parker loaded("FIFOCache::ChargeUsageMaybeEvictNonStrict:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  Cache::Handle* h = nullptr;
+  port::Thread inserting(
+      [&] { status = Insert(cache.get(), K("a"), 3 * u, &h); });
+  loaded.WaitParked();
+  Cache::Handle* y = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("y"), 3 * u, &y));
+  ASSERT_OK(Insert(cache.get(), K("z"), 2 * u));
+  EXPECT_EQ(SIZE_MAX / 2 - u, cache->GetUsage());
+  loaded.Resume();
+  inserting.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_FALSE(Holds(cache.get(), K("z")));
+  EXPECT_EQ(SIZE_MAX / 2 - 3 * u, cache->GetUsage());
+  EXPECT_FALSE(cache->Release(y));
+  EXPECT_TRUE(cache->Release(big, /*erase_if_last_ref*/ true));
+  EXPECT_EQ(3 * u, cache->GetUsage());
+}
+
+// A big charge is added with a compare-and-swap, not a fetch-add taken back
+// if usage can't take it, so an insert racing one that is refused never
+// finds usage over half of size_t for that moment: an insert of 1 made at
+// the point where a fetch-add of the parked insert's 3u would be taken back
+// (or after it) is let in. Fetch-adds of three big charges refused at once
+// could wrap usage, and an insert reading it would keep its charge.
+TEST_F(FIFOCacheTest, NonStrictInsertRacingABigRefusalIsLetIn) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 20);
+  const size_t u = (SIZE_MAX >> 16) + 1;
+  Cache::Handle* big = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("big"), SIZE_MAX / 2 - 4 * u, &big));
+  Parker loaded("FIFOCache::ChargeUsageMaybeEvictNonStrict:Loaded");
+  bool e_tried = false;
+  Status e_status;
+  Cache::Handle* e = nullptr;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FIFOCache::AddUsage:TakingBack", [&](void*) {
+        if (!e_tried) {
+          e_tried = true;
+          e_status = Insert(cache.get(), K("e"), 1, &e);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  Cache::Handle* h = nullptr;
+  port::Thread inserting(
+      [&] { status = Insert(cache.get(), K("a"), 3 * u, &h); });
+  loaded.WaitParked();
+  Cache::Handle* y = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("y"), 2 * u, &y));
+  loaded.Resume();
+  inserting.join();
+  if (!e_tried) {
+    e_tried = true;
+    e_status = Insert(cache.get(), K("e"), 1, &e);
+  }
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_OK(e_status);
+  EXPECT_EQ(SIZE_MAX / 2 - 2 * u + 1, cache->GetUsage());
+  if (e != nullptr) {
+    EXPECT_FALSE(cache->Release(e));
+  }
+  EXPECT_FALSE(cache->Release(y));
+  EXPECT_TRUE(cache->Release(big, /*erase_if_last_ref*/ true));
+}
+
+// Table metadata is added the same way: an insert that grows the table,
+// parked after checking the new slot's charge against usage, is refused the
+// slot once a racing standalone entry has taken usage within it of half of
+// size_t, and the table doesn't grow.
+TEST_F(FIFOCacheTest, NonStrictSlotChargeRacingNearHalfOfSizeTIsRefused) {
+  std::shared_ptr<Cache> cache = NewCache(
+      /*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  FIFOCache* fifo = Fifo(cache.get());
+  cache->SetCapacity(SIZE_MAX);
+  Cache::Handle* big = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("big"),
+                   SIZE_MAX / 2 - cache->GetUsage() - 200, &big));
+  const size_t table = cache->GetTableAddressCount();
+  fifo->TEST_SetOccupancyLimit(cache->GetOccupancyCount());
+  Parker checked("FIFOCache::ChargeMetadata:Checked");
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  port::Thread inserting(
+      [&] { status = Insert(cache.get(), K("a"), /*charge*/ 0); });
+  checked.WaitParked();
+  Cache::Handle* s = cache->CreateStandalone(
+      K("s"), nullptr, &kNoopCacheItemHelper, 150, /*allow_uncharged*/ false);
+  ASSERT_NE(nullptr, s);
+  EXPECT_EQ(SIZE_MAX / 2 - 50, cache->GetUsage());
+  checked.Resume();
+  inserting.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_OK(status);
+  EXPECT_EQ(table, cache->GetTableAddressCount());
+  EXPECT_EQ(SIZE_MAX / 2 - 50, cache->GetUsage());
+  EXPECT_TRUE(cache->Release(s));
+  EXPECT_TRUE(cache->Release(big, /*erase_if_last_ref*/ true));
+}
+
+// An insert with a handle that finds no slot to take (the table full of
+// held entries) falls back on a standalone entry, whose big charge is
+// checked the same way: the one parked after loading usage is refused once
+// another standalone has added a charge of over a quarter of size_t, where
+// HyperClockCache adds it unchecked.
+TEST_F(FIFOCacheTest, NonStrictStandaloneFallbacksWithBigChargesCantBothPass) {
+  // The table's smallest reservation, 2048 slots.
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 16);
+  // Held entries until one is a standalone: the table can't grow further.
+  std::vector<Cache::Handle*> held;
+  for (uint32_t i = 0;; ++i) {
+    ASSERT_LT(i, 2048U);
+    Cache::Handle* hh = nullptr;
+    Status s = Insert(cache.get(), K(i), 1, &hh);
+    ASSERT_TRUE(s.ok() || s.IsOkOverwritten()) << s.ToString();
+    held.push_back(hh);
+    if (s.IsOkOverwritten()) {
+      break;
+    }
+  }
+  const size_t base = cache->GetUsage();
+  const size_t big = SIZE_MAX / 4 + 10;
+  Parker loaded("FIFOCache::ChargeUsageMaybeEvictNonStrict:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  Cache::Handle* h = nullptr;
+  port::Thread inserting(
+      [&] { status = Insert(cache.get(), K("a"), big, &h); });
+  loaded.WaitParked();
+  Cache::Handle* b = nullptr;
+  Status b_status = Insert(cache.get(), K("b"), big, &b);
+  EXPECT_TRUE(b_status.IsOkOverwritten()) << b_status.ToString();
+  EXPECT_EQ(base + big, cache->GetUsage());
+  loaded.Resume();
+  inserting.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(base + big, cache->GetUsage());
+  if (b != nullptr) {
+    EXPECT_TRUE(cache->Release(b));
+  }
+  EXPECT_EQ(base, cache->GetUsage());
+  for (Cache::Handle* held_handle : held) {
+    cache->Release(held_handle);
+  }
+}
+
+// CreateStandalone checks a big charge the same way: parked after loading
+// usage while an insert adds a charge of over a quarter of size_t, it is
+// refused, or creates the entry without a charge where that's allowed.
+TEST_F(FIFOCacheTest, NonStrictCreateStandaloneRacingABigChargeIsRefused) {
+  for (bool allow_uncharged : {false, true}) {
+    SCOPED_TRACE(allow_uncharged);
+    std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 20);
+    const size_t big = SIZE_MAX / 4 + 10;
+    Parker loaded("FIFOCache::ChargeUsageMaybeEvictNonStrict:Loaded");
+    SyncPoint::GetInstance()->EnableProcessing();
+    Cache::Handle* s = nullptr;
+    port::Thread creating([&] {
+      s = cache->CreateStandalone(K("s"), nullptr, &kNoopCacheItemHelper, big,
+                                  allow_uncharged);
+    });
+    loaded.WaitParked();
+    ASSERT_OK(Insert(cache.get(), K("b"), big));
+    loaded.Resume();
+    creating.join();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_EQ(big, cache->GetUsage());
+    if (allow_uncharged) {
+      ASSERT_NE(nullptr, s);
+      EXPECT_EQ(0, cache->GetCharge(s));
+      EXPECT_TRUE(cache->Release(s));
+    } else {
+      EXPECT_EQ(nullptr, s);
+    }
+    EXPECT_EQ(big, cache->GetUsage());
+  }
+}
+
 // Under strict_capacity_limit, a slot's metadata goes by a SetCapacity cut
 // that lands after the charge loaded the capacity, as an entry's charge
 // does: every entry is held, so the cut evicts nothing and leaves usage at

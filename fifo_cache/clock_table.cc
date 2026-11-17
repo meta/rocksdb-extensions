@@ -486,9 +486,14 @@ typename Table::HandleImpl* BaseClockTable::CreateStandalone(
     bool success = ChargeUsageMaybeEvictNonStrict<Table>(
         total_charge,
         /*need_evict_for_occupancy=*/false, state);
+    // FIFOCache: with no eviction for occupancy, it fails only when usage
+    // can't take the charge, which is refused as above.
     if (!success) {
-      // Force the issue
-      usage_.FetchAddRelaxed(total_charge);
+      assert(state.usage_refused);
+      if (!allow_uncharged) {
+        return nullptr;
+      }
+      proto.ClearCharge();
     }
   }
 
@@ -619,6 +624,7 @@ inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
   // portion of the shard capacity. This can have the side benefit of
   // involving fewer threads in eviction.
   const size_t old_usage = usage_.LoadRelaxed();
+  TEST_SYNC_POINT("FIFOCache::ChargeUsageMaybeEvictNonStrict:Loaded");
   const size_t capacity = capacity_.LoadRelaxed();
   size_t need_evict_charge;
   // NOTE: if total_charge > old_usage, there isn't yet enough to evict
@@ -670,12 +676,40 @@ inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
       occupancy_.FetchSub(data.freed_count);
     }
   }
-  // Track new usage even if we weren't able to evict enough
-  usage_.FetchAddRelaxed(total_charge - data.freed_charge);
-  // No underflow
-  assert(usage_.LoadRelaxed() < SIZE_MAX / 2);
+  // Track new usage even if we weren't able to evict enough. FIFOCache:
+  // unless usage can't take the charge (see AddUsage), which refuses the
+  // insert; what it evicted is gone either way.
+  if (UNLIKELY(!AddUsage(total_charge, data.freed_charge))) {
+    state.usage_refused = true;
+    return false;
+  }
   // Success
   return true;
+}
+
+inline bool BaseClockTable::AddUsage(size_t add, size_t sub) {
+  if (LIKELY(add <= kPlainAddMax)) {
+    const size_t old_usage = usage_.FetchAddRelaxed(add - sub);
+    if (add <= sub) {
+      // No underflow
+      assert(old_usage >= sub - add);
+      return true;
+    }
+    if (LIKELY(UsageCanTake(old_usage, add - sub))) {
+      return true;
+    }
+    TEST_SYNC_POINT("FIFOCache::AddUsage:TakingBack");
+    usage_.FetchSubRelaxed(add);
+    return false;
+  }
+  size_t old_usage = usage_.LoadRelaxed();
+  for (;;) {
+    const bool fits = add <= sub || UsageCanTake(old_usage, add - sub);
+    if (usage_.CasWeakRelaxed(old_usage,
+                              fits ? old_usage + add - sub : old_usage - sub)) {
+      return fits;
+    }
+  }
 }
 
 void BaseClockTable::TrackAndReleaseEvictedEntry(ClockHandle* h) {
@@ -767,29 +801,42 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   // NOTE: we can use eec_and_scl as eviction_effort_cap below because
   // strict_capacity_limit=true is supposed to disable the limit on eviction
   // effort, and a large value effectively does that.
+  // Reverts occupancy, the probation charge and the ghost tag for an insert
+  // refused.
+  auto refuse = [&](Status s) {
+    occupancy_.FetchSubRelaxed(1);
+    derived.UndoProbationPrecharge(state);
+    derived.GhostPutBack(proto, state);
+    // FIFOCache: without a handle, dropped as if inserted and evicted at
+    // once, as FIFOCache and LRUCache do, where HyperClockCache returns
+    // MemoryLimit. Either way the cache is as it was, an entry with the
+    // key included, as in both of them.
+    if (handle == nullptr) {
+      proto.FreeData(allocator_);
+      return Status::OK();
+    }
+    return s;
+  };
   if (eec_and_scl_.LoadRelaxed().Get<StrictCapacityLimit>()) {
     Status s = ChargeUsageMaybeEvictStrict<Table>(
         total_charge, need_evict_for_occupancy, state);
     if (!s.ok()) {
-      // Revert occupancy
-      occupancy_.FetchSubRelaxed(1);
-      derived.UndoProbationPrecharge(state);
-      derived.GhostPutBack(proto, state);
-      // FIFOCache: without a handle, dropped as if inserted and evicted at
-      // once, as FIFOCache and LRUCache do, where HyperClockCache returns
-      // MemoryLimit. Either way the cache is as it was, an entry with the
-      // key included, as in both of them.
-      if (handle == nullptr) {
-        proto.FreeData(allocator_);
-        return Status::OK();
-      }
-      return s;
+      return refuse(s);
     }
   } else {
     // Case strict_capacity_limit == false
     bool success = ChargeUsageMaybeEvictNonStrict<Table>(
         total_charge, need_evict_for_occupancy, state);
     if (!success) {
+      // FIFOCache: refused as with the strict limit if usage can't take the
+      // charge, of the entry or of the standalone one with a handle, before
+      // accept_without_slot erases an entry with the key.
+      if (UNLIKELY(state.usage_refused) ||
+          (handle != nullptr && UNLIKELY(!AddUsage(total_charge, 0)))) {
+        return refuse(
+            Status::MemoryLimit("Cache entry too large to account for: " +
+                                std::to_string(total_charge)));
+      }
       const bool replaced = accept_without_slot();
       if (handle == nullptr) {
         // Don't insert the entry but still return ok, as if the entry
@@ -797,8 +844,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
         proto.FreeData(allocator_);
         return replaced ? Status::OkOverwritten() : Status::OK();
       } else {
-        // Need to track usage of fallback standalone insert
-        usage_.FetchAddRelaxed(total_charge);
+        // Usage of fallback standalone insert, added above
         use_standalone_insert = true;
       }
     }
@@ -858,13 +904,13 @@ bool BaseClockTable::ChargeMetadata(size_t bytes, size_t keep) {
     return true;
   }
   if (!eec_and_scl_.LoadRelaxed().Get<StrictCapacityLimit>()) {
-    // Checked as loaded and not reserved, as an entry's charge is without
-    // the strict limit (see UsageCanTake).
+    // Checked as loaded with the entry's charge, and added as an entry's
+    // charge is without the strict limit (see AddUsage).
     if (!UsageCanTake(bytes + keep)) {
       return false;
     }
-    usage_.FetchAddRelaxed(bytes);
-    return true;
+    TEST_SYNC_POINT("FIFOCache::ChargeMetadata:Checked");
+    return AddUsage(bytes, 0);
   }
   for (;;) {
     const size_t capacity = capacity_.LoadRelaxed();
@@ -2410,7 +2456,8 @@ void AutoHyperClockTable::PurgeImplLocked(OpData* op_data,
       // allows us to access the hashed_keys without holding a read ref.
       assert(home == BottomNBits(h->hashed_key[1], home_shift));
       if constexpr (kIsClockUpdateChain) {
-        RelaxedAtomic<uint32_t>& word = probation_words_[h - arr];
+        RelaxedAtomic<uint32_t>& word =
+            probation_words_[static_cast<size_t>(h - arr)];
         const uint32_t w = word.LoadRelaxed();
         if (w & kInProbation) {
           // FIFOCache: the resident clock skips probation entries, and

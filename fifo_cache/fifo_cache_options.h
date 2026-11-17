@@ -96,10 +96,9 @@ namespace ROCKSDB_NAMESPACE {
 // capacity evicts the excess with its own charge, and inserts racing it may
 // each do so, taking usage below capacity once. Under either limit, an
 // insert whose charge would take usage to half of size_t or past it is
-// refused the same way (without strict_capacity_limit, racing inserts
-// of over a quarter of size_t each can pass together, as HyperClockCache
-// lets a single insert do), and one whose key can't be copied (see below)
-// fails with MemoryLimit.
+// refused the same way, racing inserts included, where HyperClockCache
+// lets one pass, and one whose key can't be copied (see below) fails with
+// MemoryLimit.
 //
 // Remembered keys take a 4-byte cell per slot of the table, holding 16 bits
 // of the key's hash and the count of probation evictions when it was
