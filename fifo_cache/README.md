@@ -203,14 +203,15 @@ rising `effort_cap_stops` means inserts and capacity cuts are finding mostly
 pinned entries and leaving usage over capacity, so look at what holds
 handles (`rocksdb.block-cache-pinned-usage`). `probation_full` counts
 entries that skipped probation because its queue had no room. A shard sends
-some there as it first fills if entries are erased meanwhile, as RocksDB
-erases the dummy entry it inserts for each block a compaction reads; one
-that keeps rising after the cache has filled means the queue is full of
-entries still queued or, with `strict_capacity_limit`, that the queue can't
-grow within capacity. `pinned_allowance` is how far probation's share has
-grown past 12% of capacity because entries reached the head of the queue
-still held through the handle their insert returned. It stays near zero
-unless those handles are kept for about as long as new entries take to
+some there as it first fills if entries are erased meanwhile, as an insert
+replacing an entry under its key erases it, and a secondary cache's adapter
+erases the placeholder it inserts on a block's first hit there at the next
+lookup; one that keeps rising after the cache has filled means the queue is
+full of entries still queued or, with `strict_capacity_limit`, that the
+queue can't grow within capacity. `pinned_allowance` is how far probation's
+share has grown past 12% of capacity because entries reached the head of the
+queue still held through the handle their insert returned. It stays near
+zero unless those handles are kept for about as long as new entries take to
 reach the head, and it is at most four times that 12%. `pinned_twice` counts
 entries that went from probation to the resident queue because they were
 still held a lap after a step first found them held, such as the index and
@@ -220,20 +221,18 @@ clock as HyperClockCache's would, and each one adds its charge to
 back a sixteenth at a time. `resident_all_pinned` counts laps of the
 resident clock that evicted nothing and took no hit off any entry, having
 found nothing but held entries. A lap is judged when the clock gets back to
-the start of the table, and if a step of it still under way then (on a
-small shard with many threads evicting) turns out to have found something
-while the rest the lap set still stands, the rest is called off and the lap
-isn't counted, nor is a lap whose rest would already be over, as when the
-shard has no entries left. After each, eviction takes probation's head
-first, from the rest of that eviction on, for as many evictions as the
-shard has entries, so an insert doesn't send the clock round entries it
-can't evict. A step of
-the clock that finds something meanwhile, from an eviction already under
-way or one with nothing in probation to evict, ends the rest early, and an
-entry released meanwhile otherwise waits until then. One that keeps rising
-means entries held for good fill the
-resident queue, nearly the whole cache, so look at
-`rocksdb.block-cache-pinned-usage`.
+the start of the table, and if a step of it still under way then (on a small
+shard with many threads evicting) turns out to have found something while
+the rest the lap set still stands, the rest is called off and the lap isn't
+counted, nor is a lap whose rest would already be over, as when the shard
+has no entries left. After each, eviction takes probation's head first, from
+the rest of that eviction on, for as many evictions as the shard has
+entries, so an insert doesn't send the clock round entries it can't evict. A
+step of the clock that finds something meanwhile, from an eviction already
+under way or one with nothing in probation to evict, ends the rest early,
+and an entry released meanwhile otherwise waits until then. One that keeps
+rising means entries held for good fill the resident queue, nearly the whole
+cache, so look at `rocksdb.block-cache-pinned-usage`.
 
 ## Limitations
 

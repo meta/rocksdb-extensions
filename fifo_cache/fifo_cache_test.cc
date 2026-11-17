@@ -963,6 +963,36 @@ TEST_F(FIFOCacheTest, StrictInsertWithoutHandleDropped) {
   EXPECT_LE(cache->GetUsage(), 10);
 }
 
+// Under strict_capacity_limit, an insert into a shard over capacity (held
+// entries kept usage past a cut, and were released after it) evicts the
+// excess as well as its own charge: here two of three released entries, 60
+// for an excess of 50 and a charge of 10, exactly what it needs, so usage
+// ends at the new capacity, 190, the charges of what stays.
+TEST_F(FIFOCacheTest, StrictInsertOverCapacityEvictsTheExcessAndItsCharge) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 300, /*strict*/ true);
+  Cache::Handle* p = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("p"), 150, &p));
+  std::vector<Cache::Handle*> q(3, nullptr);
+  for (uint32_t i = 0; i < q.size(); ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), 30, &q[i]));
+  }
+  // All held, so the cut evicts nothing.
+  cache->SetCapacity(190);
+  EXPECT_EQ(240, cache->GetUsage());
+  for (Cache::Handle* h : q) {
+    EXPECT_FALSE(cache->Release(h));
+  }
+  ASSERT_OK(Insert(cache.get(), K("x"), 10));
+  EXPECT_TRUE(Holds(cache.get(), K("x")));
+  uint32_t left = 0;
+  for (uint32_t i = 0; i < q.size(); ++i) {
+    left += Holds(cache.get(), K(i)) ? 1 : 0;
+  }
+  EXPECT_EQ(1, left);
+  EXPECT_EQ(190, cache->GetUsage());
+  EXPECT_FALSE(cache->Release(p));
+}
+
 // Under strict_capacity_limit with the table charged, the table grows only
 // while the growth fits beside the entry. At the occupancy limit (52
 // entries in the first 64 slots) an insert needs two slots, 65 and 66, to
@@ -7395,6 +7425,44 @@ TEST_F(FIFOCacheTest, StrictInsertAtFullUsageRacingACapacityCutGoesByIt) {
   EXPECT_TRUE(Contains(cache.get(), K("u")));
   EXPECT_EQ(100, cache->GetUsage());
   EXPECT_FALSE(cache->Release(p));
+}
+
+// Under strict_capacity_limit, an insert into a shard over capacity keeps
+// usage as it is while it evicts, rather than taking it down to capacity
+// first: an insert meanwhile, after a SetCapacity that would leave it room
+// at that lower usage, sees usage still over capacity and fails like the
+// first, and erasing the held entry takes its charge off usage that still
+// has it. The first insert then finds nothing to evict for the excess it
+// saw and fails, leaving usage at 0.
+TEST_F(FIFOCacheTest, StrictInsertOverCapacityKeepsUsageWhileItEvicts) {
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 200, /*strict*/ true);
+  Cache::Handle* p = nullptr;
+  ASSERT_OK(Insert(cache.get(), K("p"), 150, &p));
+  // Held, so the cut evicts nothing.
+  cache->SetCapacity(100);
+  Parker charged("FIFOCache::ChargeUsageMaybeEvictStrict:Charged");
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  Cache::Handle* h = nullptr;
+  port::Thread inserting([&] { status = Insert(cache.get(), K("x"), 10, &h); });
+  charged.WaitParked();
+  EXPECT_EQ(150, cache->GetUsage());
+  cache->SetCapacity(110);
+  Cache::Handle* y = nullptr;
+  Status y_status = Insert(cache.get(), K("y"), 10, &y);
+  EXPECT_TRUE(y_status.IsMemoryLimit()) << y_status.ToString();
+  if (y != nullptr) {
+    cache->Release(y);
+  }
+  EXPECT_TRUE(cache->Release(p, /*erase_if_last_ref*/ true));
+  EXPECT_EQ(0, cache->GetUsage());
+  charged.Resume();
+  inserting.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(0, cache->GetUsage());
 }
 
 // Under strict_capacity_limit, a slot's metadata goes by a SetCapacity cut

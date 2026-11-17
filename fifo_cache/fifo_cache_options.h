@@ -90,11 +90,13 @@ namespace ROCKSDB_NAMESPACE {
 // MemoryLimit, or without a handle is dropped and returns OK, as if
 // inserted and evicted at once; either way an entry already cached under
 // the key stays. A strict insert that charges usage, or finds it full,
-// after a SetCapacity goes by the new capacity; one that charged it before
-// can still land after the cut, over the new capacity until the next insert
-// evicts. Under either
-// limit, an insert whose charge would take usage to half of size_t or past
-// it is refused the same way (without strict_capacity_limit, racing inserts
+// after a SetCapacity goes by the new capacity; one that charged it, or
+// found it full, before can still land after the cut, over the new
+// capacity until the next insert evicts. A strict insert into a shard over
+// capacity evicts the excess with its own charge, and inserts racing it may
+// each do so, taking usage below capacity once. Under either limit, an
+// insert whose charge would take usage to half of size_t or past it is
+// refused the same way (without strict_capacity_limit, racing inserts
 // of over a quarter of size_t each can pass together, as HyperClockCache
 // lets a single insert do), and one whose key can't be copied (see below)
 // fails with MemoryLimit.
@@ -223,11 +225,12 @@ struct FIFOCacheStats {
   // entry erased while queued. If there is none, its entry goes to the
   // resident queue, and so does an entry it took out whose room another
   // push took. That happens in a shard's first ring as the shard first
-  // fills while entries are erased (RocksDB erases the dummy entry it
-  // inserts for each block read without filling the cache). A push also
-  // sends its entry there when the table has outgrown the newest ring and
-  // a new one couldn't be added: under strict_capacity_limit, when it
-  // didn't fit within capacity.
+  // fills while entries are erased (an insert replacing an entry under its
+  // key erases it, and a secondary cache's adapter erases the placeholder it
+  // inserts on a block's first hit there at the next lookup). A push also
+  // sends its entry there when the table has outgrown the newest ring and a
+  // new one couldn't be added: under strict_capacity_limit, when it didn't
+  // fit within capacity.
   uint64_t probation_full = 0;
   // Entries that went to the resident queue because a probation step found
   // them pinned a lap after it had moved them to the tail for being pinned:

@@ -502,6 +502,8 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
   size_t capacity;
   size_t old_usage;
   size_t new_usage;
+  // FIFOCache: what usage comes to once the insert has evicted what it needs.
+  size_t target_usage;
   for (;;) {
     capacity = capacity_.LoadRelaxed();
     TEST_SYNC_POINT("FIFOCache::ChargeUsageMaybeEvictStrict:Loaded");
@@ -521,7 +523,13 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
         return Status::MemoryLimit("Cache entry too large to account for: " +
                                    std::to_string(total_charge));
       }
-      new_usage = std::min(capacity, old_usage + total_charge);
+      target_usage = std::min(capacity, old_usage + total_charge);
+      // FIFOCache: never below usage as it is, over capacity (entries held
+      // through a cut): usage taken down to capacity before the excess is
+      // evicted would leave inserts meanwhile room the entries still take,
+      // and an erase meanwhile taking an entry's charge off it could wrap
+      // it. The insert still evicts the excess with its charge (see below).
+      new_usage = std::max(old_usage, target_usage);
       if (new_usage == old_usage) {
         // No change needed
         break;
@@ -532,12 +540,13 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
     // order of updates is visible here, and the charge goes by it: undone, and
     // made again against the new capacity. A cut that came after it sees the
     // charge in usage (see EvictOverCapacity). An insert with no charge to
-    // add (new_usage == old_usage, so usage is at the capacity it loaded),
-    // which evicts as much as it inserts, checks the capacity again too,
-    // after its acquire load of usage_: one that read usage as SetCapacity's
-    // update left it, or later, sees the cut and goes by it, and one that
-    // read it from before that update comes before the cut in usage_'s
-    // order, as an insert whose charge the cut's eviction sees does.
+    // add (new_usage == old_usage, so usage is at or over the capacity it
+    // loaded), which evicts at least as much as it inserts, checks the
+    // capacity again too, after its acquire load of usage_: one that read
+    // usage as SetCapacity's update left it, or later, sees the cut and goes
+    // by it. One that read it from before that update found usage full
+    // before the cut, in usage_'s order, and like one that charged before
+    // it can land over the new capacity (see fifo_cache_options.h).
     if (capacity_.LoadRelaxed() >= capacity) {
       break;
     }
@@ -545,8 +554,13 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
       usage_.FetchSubRelaxed(new_usage - old_usage);
     }
   }
+  TEST_SYNC_POINT("FIFOCache::ChargeUsageMaybeEvictStrict:Charged");
   // How much do we need to evict then?
-  size_t need_evict_charge = old_usage + total_charge - new_usage;
+  // FIFOCache: down to the target, and what of the entry's charge isn't in
+  // usage yet, which is all of it over capacity, comes out of what it
+  // evicts.
+  size_t need_evict_charge = old_usage + total_charge - target_usage;
+  const size_t uncharged = old_usage + total_charge - new_usage;
   // FIFOCache: an eviction for occupancy alone asks Evict for an entry and
   // no charge, where HyperClockCache asks for a charge of 1.
   if (need_evict_charge > 0 || UNLIKELY(need_evict_for_occupancy)) {
@@ -563,12 +577,15 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
       state.effort_cap_counted = true;  // FIFOCache
     }
     occupancy_.FetchSub(data.freed_count);
-    if (LIKELY(data.freed_charge > need_evict_charge)) {
-      assert(data.freed_count > 0);
-      // Evicted more than enough
-      usage_.FetchSubRelaxed(data.freed_charge - need_evict_charge);
-    } else if (data.freed_charge < need_evict_charge ||
-               (UNLIKELY(need_evict_for_occupancy) && data.freed_count == 0)) {
+    if (LIKELY(data.freed_charge >= need_evict_charge) &&
+        LIKELY(!need_evict_for_occupancy || data.freed_count > 0)) {
+      // FIFOCache: the evicted charge less the part of the entry's it
+      // covers (need_evict_charge, but for an insert over capacity).
+      if (data.freed_charge > uncharged) {
+        assert(data.freed_count > 0);
+        usage_.FetchSubRelaxed(data.freed_charge - uncharged);
+      }
+    } else {
       // Roll back to old usage minus evicted
       usage_.FetchSubRelaxed(data.freed_charge + (new_usage - old_usage));
       if (data.freed_charge < need_evict_charge) {
