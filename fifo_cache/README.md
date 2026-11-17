@@ -223,9 +223,11 @@ found nothing but held entries. A lap is judged when the clock gets back to
 the start of the table, and if a step of it still under way then (on a
 small shard with many threads evicting) turns out to have found something
 while the rest the lap set still stands, the rest is called off and the lap
-isn't counted. After each, eviction takes probation's head first, from the
-rest of that eviction on, for as many evictions as the shard has entries,
-so an insert doesn't send the clock round entries it can't evict. A step of
+isn't counted, nor is a lap whose rest would already be over, as when the
+shard has no entries left. After each, eviction takes probation's head
+first, from the rest of that eviction on, for as many evictions as the
+shard has entries, so an insert doesn't send the clock round entries it
+can't evict. A step of
 the clock that finds something meanwhile, from an eviction already under
 way or one with nothing in probation to evict, ends the rest early, and an
 entry released meanwhile otherwise waits until then. One that keeps rising

@@ -1211,6 +1211,44 @@ TEST_F(FIFOCacheTest, ChargeReachingHalfOfSizeTIsRefused) {
   }
 }
 
+#ifndef NDEBUG
+// Table metadata charged for a slot the table grows by (or a probation
+// ring) keeps usage under half of size_t too, with the charge of the entry
+// it is grown for. Here usage is 100 short of it, room for a slot's 72
+// bytes but not with a 50-byte entry as well: that insert doesn't grow the
+// table, has only a held entry to evict for a slot and is dropped. Entries
+// of no charge then grow the table by one slot and evict for slots, and it
+// grows again once usage falls.
+TEST_F(FIFOCacheTest, MetadataChargeStaysUnderHalfOfSizeT) {
+  for (bool strict : {false, true}) {
+    SCOPED_TRACE(strict);
+    std::shared_ptr<Cache> cache =
+        NewCache(1 << 20, strict, kFullChargeCacheMetadata);
+    FIFOCache* fifo = Fifo(cache.get());
+    cache->SetCapacity(SIZE_MAX);
+    Cache::Handle* big = nullptr;
+    ASSERT_OK(Insert(cache.get(), K("big"),
+                     SIZE_MAX / 2 - cache->GetUsage() - 100, &big));
+    const size_t table = cache->GetTableAddressCount();
+    fifo->TEST_SetOccupancyLimit(cache->GetOccupancyCount());
+    ASSERT_OK(Insert(cache.get(), K("c"), /*charge*/ 50));
+    EXPECT_FALSE(Contains(cache.get(), K("c")));
+    EXPECT_EQ(table, cache->GetTableAddressCount());
+    EXPECT_EQ(SIZE_MAX / 2 - 100, cache->GetUsage());
+    for (uint32_t i = 0; i < 200; ++i) {
+      ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 0));
+      ASSERT_LT(cache->GetUsage(), SIZE_MAX / 2) << i;
+    }
+    EXPECT_EQ(table + 1, cache->GetTableAddressCount());
+    EXPECT_TRUE(cache->Release(big, /*erase_if_last_ref*/ true));
+    for (uint32_t i = 200; i < 400; ++i) {
+      ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 0));
+    }
+    EXPECT_GT(cache->GetTableAddressCount(), table + 1);
+  }
+}
+#endif  // !NDEBUG
+
 TEST_F(FIFOCacheTest, CreateStandalone) {
   std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 5, /*strict*/ true);
   Cache::Handle* h =
@@ -3742,6 +3780,46 @@ TEST_F(FIFOCacheTest, RingChargedDuringEvictionIsEvictedFor) {
       EXPECT_TRUE(cache->Release(h));
     }
     EXPECT_FALSE(cache->Release(pinned));
+  }
+}
+
+// An insert counts one effort cap stop, even when it gives up twice: with
+// every entry held, its eviction gives up at the cap, having rotated held
+// probation heads into a ring it charged, and its eviction for the ring
+// gives up too.
+TEST_F(FIFOCacheTest, InsertGivingUpTwiceCountsOneEffortCapStop) {
+  for (bool standalone : {false, true}) {
+    SCOPED_TRACE(standalone);
+    std::shared_ptr<Cache> cache =
+        NewCache(1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+    FIFOCache* fifo = Fifo(cache.get());
+    std::vector<Cache::Handle*> held(64 + 128, nullptr);
+    for (uint32_t i = 0; i < held.size(); ++i) {
+      ASSERT_OK(Insert(cache.get(), K(i), 100, &held[i]));
+    }
+    cache->SetCapacity(cache->GetUsage());
+    const size_t metadata = fifo->TEST_GetMetadataCharge();
+    const size_t table = cache->GetTableAddressCount();
+    Cache::Handle* h = nullptr;
+    if (standalone) {
+      h = cache->CreateStandalone("s", nullptr, &kNoopCacheItemHelper, 100,
+                                  /*allow_uncharged*/ false);
+      ASSERT_NE(nullptr, h);
+    } else {
+      ASSERT_OK(Insert(cache.get(), K("new"), 100));
+    }
+    // It charged a ring, beyond any slots, and went over capacity, so both
+    // evictions gave up.
+    ASSERT_LT(metadata + (cache->GetTableAddressCount() - table) * kSlotCharge,
+              fifo->TEST_GetMetadataCharge());
+    EXPECT_GT(cache->GetUsage(), cache->GetCapacity());
+    EXPECT_EQ(1, Stats(cache.get()).effort_cap_stops);
+    if (h != nullptr) {
+      EXPECT_TRUE(cache->Release(h));
+    }
+    for (Cache::Handle* held_handle : held) {
+      EXPECT_FALSE(cache->Release(held_handle));
+    }
   }
 }
 
@@ -7319,6 +7397,43 @@ TEST_F(FIFOCacheTest, StrictInsertAtFullUsageRacingACapacityCutGoesByIt) {
   EXPECT_FALSE(cache->Release(p));
 }
 
+// Under strict_capacity_limit, a slot's metadata goes by a SetCapacity cut
+// that lands after the charge loaded the capacity, as an entry's charge
+// does: every entry is held, so the cut evicts nothing and leaves usage at
+// the new capacity, and the insert, parked after loading the old one, can't
+// grow the table past it, can't evict for a slot and fails.
+TEST_F(FIFOCacheTest, StrictSlotChargeRacingACapacityCutGoesByIt) {
+  std::shared_ptr<Cache> cache =
+      NewCache(size_t{1} << 20, /*strict*/ true, kFullChargeCacheMetadata);
+  FIFOCache* fifo = Fifo(cache.get());
+  std::vector<Cache::Handle*> held(20, nullptr);
+  for (uint32_t i = 0; i < 20; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i), /*charge*/ 1, &held[i]));
+  }
+  fifo->TEST_SetOccupancyLimit(cache->GetOccupancyCount());
+  const size_t table = cache->GetTableAddressCount();
+  Parker loaded("FIFOCache::ChargeMetadata:Loaded");
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status status;
+  Cache::Handle* h = nullptr;
+  port::Thread inserting(
+      [&] { status = Insert(cache.get(), K("a"), /*charge*/ 1, &h); });
+  loaded.WaitParked();
+  const size_t cut = cache->GetUsage();
+  cache->SetCapacity(cut);
+  loaded.Resume();
+  inserting.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_TRUE(status.IsMemoryLimit()) << status.ToString();
+  EXPECT_EQ(nullptr, h);
+  EXPECT_EQ(table, cache->GetTableAddressCount());
+  EXPECT_EQ(cut, cache->GetUsage());
+  for (Cache::Handle* held_handle : held) {
+    EXPECT_FALSE(cache->Release(held_handle));
+  }
+}
+
 // A tag an eviction still under way stamped counts for another thread's
 // lookup, as the eviction adds its probation evictions to the count every
 // 64. The 400 unit insert into a full shard of 1000 evicts 400 entries in
@@ -7468,9 +7583,9 @@ TEST_F(FIFOCacheTest, RacingReplacingInsertsDuringASplitKeepTheNewerEntry) {
 // Two Grows that finish out of order, with metadata charged as by default:
 // one claims slot gk and stalls before splitting, the next claims gk + 1,
 // splits and puts its insert's entry there, and the table's length can't
-// take in gk + 1 before gk. With no insert after them to bring the length
-// up, scans still reach gk + 1, and the table charges the slots both
-// claimed, which its destructor checks.
+// take in gk + 1 before gk. While the first stalls, scans still reach
+// gk + 1 and the table charges the slots both claimed, and once it
+// finishes, the length takes in both.
 TEST_F(FIFOCacheTest, GrowsFinishingOutOfOrderLeaveNoSlotUnscanned) {
   std::shared_ptr<Cache> cache =
       NewCache(/*capacity*/ size_t{1} << 20, /*strict_capacity_limit*/ false,
@@ -7500,19 +7615,72 @@ TEST_F(FIFOCacheTest, GrowsFinishingOutOfOrderLeaveNoSlotUnscanned) {
   stalled_reached.get_future().wait();
   const size_t gk = stalled_home.load();
   ASSERT_OK(Insert(cache.get(), K(101)));
-  stalled_resume.set_value();
-  stalled.join();
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
-  ASSERT_EQ(gk + 1, cache->GetTableAddressCount());
-  EXPECT_EQ(22, Keys(cache.get()).size());
+  ASSERT_EQ(gk, cache->GetTableAddressCount());
+  EXPECT_EQ(21, Keys(cache.get()).size());
+  EXPECT_EQ(cache->GetUsage() - 21, fifo->TEST_GetMetadataCharge());
   Cache::Handle* h = cache->Lookup(K(101));
   ASSERT_NE(nullptr, h);
   EXPECT_EQ(cache->GetCharge(h), cache->GetPinnedUsage());
   cache->Release(h);
+  stalled_resume.set_value();
+  stalled.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(gk + 2, cache->GetTableAddressCount());
+  EXPECT_EQ(22, Keys(cache.get()).size());
   cache->EraseUnRefEntries();
   EXPECT_EQ(0, cache->GetOccupancyCount());
   EXPECT_TRUE(Keys(cache.get()).empty());
+}
+
+// While a Grow that claimed slot gk stalls before splitting, the next
+// Grow's slot gk + 1 is ready, holding a key whose chain starts there,
+// though the table's length can't take it in before gk. The resident clock
+// still visits that chain, so a capacity cut evicts the key once probation
+// promotes it, and once the stalled Grow finishes, the length takes in both
+// slots.
+TEST_F(FIFOCacheTest, CapacityCutWhileAGrowStallsReachesTheNextSlotsChain) {
+  std::shared_ptr<Cache> cache = NewCache(size_t{1} << 20);
+  FIFOCache* fifo = Fifo(cache.get());
+  for (uint32_t i = 0; i < 20; ++i) {
+    ASSERT_OK(Insert(cache.get(), K(i)));
+  }
+  const size_t gk = cache->GetTableAddressCount();
+  UniqueId64x2 unhashed;
+  const std::string r = Shard::ReverseHash(UniqueId64x2{0xbeef00, gk + 1},
+                                           &unhashed, cache->GetHashSeed())
+                            .ToString();
+  std::atomic<size_t> stalled_home{SIZE_MAX};
+  std::promise<void> stalled_reached;
+  std::promise<void> stalled_resume;
+  std::shared_future<void> resumed = stalled_resume.get_future().share();
+  SyncPoint::GetInstance()->SetCallBack(
+      "FIFOCache::Grow:Claimed", [&](void* arg) {
+        size_t none = SIZE_MAX;
+        if (stalled_home.compare_exchange_strong(none,
+                                                 *static_cast<size_t*>(arg))) {
+          stalled_reached.set_value();
+          resumed.wait();
+        } else {
+          fifo->TEST_SetOccupancyLimit(SIZE_MAX);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  fifo->TEST_SetOccupancyLimit(cache->GetOccupancyCount());
+  port::Thread stalled([&] { ASSERT_OK(Insert(cache.get(), K(100))); });
+  stalled_reached.get_future().wait();
+  ASSERT_EQ(gk, stalled_home.load());
+  ASSERT_OK(Insert(cache.get(), r));
+  HitNTimes(cache.get(), r, 2);
+  cache->SetCapacity(0);
+  EXPECT_FALSE(Holds(cache.get(), r));
+  EXPECT_EQ(0, cache->GetUsage());
+  EXPECT_EQ(0, Stats(cache.get()).resident_all_pinned);
+  stalled_resume.set_value();
+  stalled.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_EQ(gk + 2, cache->GetTableAddressCount());
 }
 
 // The same race while a split is under way. From its head, k's chain holds
@@ -8893,6 +9061,38 @@ TEST_F(FIFOCacheTest, RestIsOverOnceAnEvictionTakesTheCountPastItsEnd) {
   ASSERT_OK(Insert(cache.get(), K("big2"), 4 * kU));
   ASSERT_EQ(entries + 3, Stats(cache.get()).probation_evictions - after_big);
   ASSERT_EQ(rests, Stats(cache.get()).resident_all_pinned);
+  EXPECT_FALSE(fifo->TEST_ClockResting());
+  for (Cache::Handle* h : held) {
+    EXPECT_FALSE(cache->Release(h));
+  }
+}
+
+// A rest already over when it would be set, its end at or behind the count
+// of probation evictions (as when the shard has no entries and the call
+// nothing pending, or other calls evicted meanwhile), isn't set or
+// counted. Here each lap's end is moved back to the count as it is judged.
+TEST_F(FIFOCacheTest, RestOverBeforeItIsSetIsntCounted) {
+  std::shared_ptr<Cache> cache = NewCache(100 * kU);
+  FIFOCache* fifo = Fifo(cache.get());
+  std::vector<Cache::Handle*> held = FillResidentWithHeldEntries(cache.get());
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < 1000 && fifo->TEST_ClockResting(); ++i) {
+    ASSERT_OK(Insert(cache.get(), "f" + std::to_string(n++), kU));
+  }
+  ASSERT_FALSE(fifo->TEST_ClockResting());
+  const uint64_t rests_before = Stats(cache.get()).resident_all_pinned;
+  size_t judged = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FIFOCache::Evict:RestEnd", [&](void* arg) {
+        ++judged;
+        *static_cast<uint64_t*>(arg) = Stats(cache.get()).probation_evictions;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(Insert(cache.get(), K("big"), 20 * kU));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  EXPECT_GT(judged, 0);
+  EXPECT_EQ(rests_before, Stats(cache.get()).resident_all_pinned);
   EXPECT_FALSE(fifo->TEST_ClockResting());
   for (Cache::Handle* h : held) {
     EXPECT_FALSE(cache->Release(h));

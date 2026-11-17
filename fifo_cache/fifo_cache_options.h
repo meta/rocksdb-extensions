@@ -240,12 +240,15 @@ struct FIFOCacheStats {
   // Laps of the resident clock that evicted nothing and took no hit off
   // any entry, having found nothing but pinned entries, less those a step
   // still under way when the lap ended found something in while the rest
-  // the lap set still stood. After each, eviction takes probation's head
-  // first, from the rest of that eviction on, for as many probation
-  // evictions as the shard has entries (up to 2^29), unless a step of the
-  // clock (from an eviction already under way, or one whose probation has
-  // nothing to pop) finds something to evict or a hit to take off first,
-  // so a resident entry released meanwhile mostly stays until then.
+  // the lap set still stood, and those whose rest would have been over as
+  // it was set (the shard had no entries and the call nothing pending, or
+  // other evictions took the count past its end meanwhile). After each,
+  // eviction takes probation's head first, from the rest of that eviction
+  // on, for as many probation evictions as the shard has entries (up to
+  // 2^29), unless a step of the clock (from an eviction already under way,
+  // or one whose probation has nothing to pop) finds something to evict or
+  // a hit to take off first, so a resident entry released meanwhile mostly
+  // stays until then.
   uint64_t resident_all_pinned = 0;
 };
 

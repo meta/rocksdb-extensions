@@ -439,7 +439,8 @@ class EvictForChargedRing {
       : table_(table), state_(state) {}
   ~EvictForChargedRing() {
     if (UNLIKELY(state_.ring_charge > 0)) {
-      table_.EvictOverCapacity(state_.ring_charge);
+      // One effort cap stop per insert.
+      table_.EvictOverCapacity(state_.ring_charge, !state_.effort_cap_counted);
     }
   }
   EvictForChargedRing(const EvictForChargedRing&) = delete;
@@ -510,7 +511,8 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
           std::to_string(total_charge) + " > " + std::to_string(capacity));
     }
     // Grab any available capacity, and free up any more required.
-    old_usage = usage_.LoadRelaxed();
+    // FIFOCache: acquire, for an insert with no charge to add (see below).
+    old_usage = usage_.Load();
     do {
       // FIFOCache: on the usage it adds to, which inserts racing since
       // Insert's check (UsageCanTake) can have raised, so that they don't
@@ -531,8 +533,11 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
     // made again against the new capacity. A cut that came after it sees the
     // charge in usage (see EvictOverCapacity). An insert with no charge to
     // add (new_usage == old_usage, so usage is at the capacity it loaded),
-    // which evicts as much as it inserts, checks the capacity again too, so
-    // one that comes after a cut goes by it.
+    // which evicts as much as it inserts, checks the capacity again too,
+    // after its acquire load of usage_: one that read usage as SetCapacity's
+    // update left it, or later, sees the cut and goes by it, and one that
+    // read it from before that update comes before the cut in usage_'s
+    // order, as an insert whose charge the cut's eviction sees does.
     if (capacity_.LoadRelaxed() >= capacity) {
       break;
     }
@@ -555,6 +560,7 @@ Status BaseClockTable::ChargeUsageMaybeEvictStrict(
     state.probation_precharged = data.probation_precharge > 0;
     if (UNLIKELY(data.effort_cap_reached)) {
       eviction_effort_exceeded_count_.FetchAddRelaxed(1);
+      state.effort_cap_counted = true;  // FIFOCache
     }
     occupancy_.FetchSub(data.freed_count);
     if (LIKELY(data.freed_charge > need_evict_charge)) {
@@ -635,6 +641,7 @@ inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
     state.probation_precharged = data.probation_precharge > 0;
     if (UNLIKELY(data.effort_cap_reached)) {
       eviction_effort_exceeded_count_.FetchAddRelaxed(1);
+      state.effort_cap_counted = true;  // FIFOCache
     }
     // Deal with potential occupancy deficit
     if (UNLIKELY(need_evict_for_occupancy) && data.freed_count == 0) {
@@ -834,18 +841,33 @@ bool BaseClockTable::ChargeMetadata(size_t bytes, size_t keep) {
     return true;
   }
   if (!eec_and_scl_.LoadRelaxed().Get<StrictCapacityLimit>()) {
+    // Checked as loaded and not reserved, as an entry's charge is without
+    // the strict limit (see UsageCanTake).
+    if (!UsageCanTake(bytes + keep)) {
+      return false;
+    }
     usage_.FetchAddRelaxed(bytes);
     return true;
   }
-  const size_t capacity = capacity_.LoadRelaxed();
-  size_t old_usage = usage_.LoadRelaxed();
-  do {
-    if (old_usage > capacity || capacity - old_usage < bytes ||
-        capacity - old_usage - bytes < keep) {
-      return false;
+  for (;;) {
+    const size_t capacity = capacity_.LoadRelaxed();
+    TEST_SYNC_POINT("FIFOCache::ChargeMetadata:Loaded");
+    size_t old_usage = usage_.Load();
+    do {
+      if (old_usage > capacity || capacity - old_usage < bytes ||
+          capacity - old_usage - bytes < keep ||
+          !UsageCanTake(old_usage, bytes + keep)) {
+        return false;
+      }
+    } while (!usage_.CasWeak(old_usage, old_usage + bytes));
+    // A capacity cut that came before the charge in usage_'s order is
+    // visible here, and the charge goes by it, as an entry's does (see
+    // ChargeUsageMaybeEvictStrict).
+    if (capacity_.LoadRelaxed() >= capacity) {
+      return true;
     }
-  } while (!usage_.CasWeakRelaxed(old_usage, old_usage + bytes));
-  return true;
+    usage_.FetchSubRelaxed(bytes);
+  }
 }
 
 void BaseClockTable::UnchargeMetadata(size_t bytes) {
@@ -1917,6 +1939,11 @@ bool AutoHyperClockTable::Grow(InsertState& state, size_t entry_charge) {
   // much as we can without waiting. It will fall short if a previous Grow
   // is still between reserving the grow slot and making the first big step
   // to publish the new shift amount.
+  // * FIFOCache: and past this grow_home, over the slots later Grows have
+  // claimed and readied, so the Grow that finishes last takes them in,
+  // where HyperClockCache leaves them to the next insert that has to "fall
+  // forward", and until then the resident clock would visit their chains
+  // only while one is out of length_info_'s reach (see Evict).
   // * To avoid length_info_ being perpetually out-of-date (for a small number
   // of heads) after our last Grow, we do the same when Insert has to "fall
   // forward" due to length_info_ being out-of-date.
@@ -1930,26 +1957,31 @@ bool AutoHyperClockTable::Grow(InsertState& state, size_t entry_charge) {
 }
 
 // See call in Grow()
+bool AutoHyperClockTable::GrownSlotReady(size_t grow_home) const {
+  int old_shift = FloorLog2(grow_home);
+  size_t old_home = BottomNBits(grow_home, old_shift);
+  return array_[old_home].head_next_with_shift.Load().GetShift() > old_shift;
+}
+
 void AutoHyperClockTable::CatchUpLengthInfoNoWait(
     size_t known_usable_grow_home) {
   uint64_t current_length_info = length_info_.Load();
   size_t published_usable_size = LengthInfoToUsedLength(current_length_info);
-  while (published_usable_size <= known_usable_grow_home) {
+  // FIFOCache: up to the slots claimed, not only to known_usable_grow_home
+  // (see Grow).
+  const size_t claimed = GetClaimedLength();
+  while (published_usable_size < claimed) {
     // For when published_usable_size was grow_home
     size_t next_usable_size = published_usable_size + 1;
     uint64_t next_length_info = UsedLengthToLengthInfo(next_usable_size);
 
     // known_usable_grow_home is known to be ready for Lookup/Insert with
-    // the new shift amount, but between that and published usable size, we
-    // need to check.
-    if (published_usable_size < known_usable_grow_home) {
-      int old_shift = FloorLog2(next_usable_size - 1);
-      size_t old_home = BottomNBits(published_usable_size, old_shift);
-      int shift = array_[old_home].head_next_with_shift.Load().GetShift();
-      if (shift <= old_shift) {
-        // Not ready
-        break;
-      }
+    // the new shift amount, but other slots, before or after it, we need to
+    // check.
+    if (published_usable_size != known_usable_grow_home &&
+        !GrownSlotReady(published_usable_size)) {
+      // Not ready
+      break;
     }
     // CAS update length_info_. This only moves in one direction, so if CAS
     // fails, someone else made progress like we are trying, and we can just
@@ -2793,7 +2825,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
   }
 }
 
-void AutoHyperClockTable::EvictOverCapacity(size_t up_to) {
+void AutoHyperClockTable::EvictOverCapacity(size_t up_to, bool count_cap_stop) {
   // Only the deficit at the start, as inserts racing this one evict for
   // their own charges. Each Evict call gives up at the effort cap, so call
   // it again while calls free entries or find pins, until the pins found
@@ -2835,7 +2867,7 @@ void AutoHyperClockTable::EvictOverCapacity(size_t up_to) {
   }
   // One effort cap stop for the cut, and only if it ends over capacity:
   // the calls before the last that gave up at the cap were retried.
-  if (deficit > 0 && effort_cap_reached) {
+  if (deficit > 0 && effort_cap_reached && count_cap_stop) {
     eviction_effort_exceeded_count_.FetchAddRelaxed(1);
   }
 }
@@ -3427,6 +3459,11 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
 
   // TODO: consider updating during a long eviction
   size_t used_length = LengthInfoToUsedLength(state.saved_length_info);
+  // FIFOCache: and the slots after it that Grows have claimed, which the
+  // sweep visits once ready (see GrownSlotReady): a Grow that stalls keeps
+  // later slots out of length_info_, chains whose entries the clock would
+  // otherwise never reach until it finishes.
+  const size_t sweep_length = std::max(used_length, GetClaimedLength());
 
   autovector<HandleImpl*> to_finish_eviction;
 
@@ -3582,9 +3619,10 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
       if (judge) {
         uint32_t ended_lap = step - lap_steps;
         TEST_SYNC_POINT_CALLBACK("FIFOCache::Evict:JudgingLap", &ended_lap);
-        const uint64_t end = probation_evictions_.LoadRelaxed() +
-                             PendingProbationEvictions(*data) +
-                             std::min(occupancy_.LoadRelaxed(), kMaxClockRest);
+        uint64_t end = probation_evictions_.LoadRelaxed() +
+                       PendingProbationEvictions(*data) +
+                       std::min(occupancy_.LoadRelaxed(), kMaxClockRest);
+        TEST_SYNC_POINT_CALLBACK("FIFOCache::Evict:RestEnd", &end);
         if (RestClockAfterLap(ended_lap, end)) {
           TEST_SYNC_POINT("FIFOCache::Evict:RestedClock");
           ++data->clock_rests;
@@ -3597,11 +3635,14 @@ void AutoHyperClockTable::Evict(size_t requested_charge, bool need_entry,
     assert((major_step & clock_pointer_mask) == 0);
 
     for (size_t base_home = old_clock_pointer & clock_pointer_mask;
-         base_home < used_length; base_home += major_step) {
+         base_home < sweep_length; base_home += major_step) {
       for (size_t i = 0; i < step_size; i++) {
         size_t home = base_home + i;
-        if (home >= used_length) {
+        if (home >= sweep_length) {
           break;
+        }
+        if (UNLIKELY(home >= used_length) && !GrownSlotReady(home)) {
+          continue;
         }
         PurgeImpl(&to_finish_eviction, home, data);
       }
@@ -4034,17 +4075,22 @@ void AutoHyperClockTable::EndClockRestIfOver(uint64_t laps,
 }
 
 bool AutoHyperClockTable::RestClockAfterLap(uint32_t lap, uint64_t end) {
+  // Credited up to the step before the lap, which it was not.
+  const uint64_t rested =
+      uint64_t{lap - 1} | kClockRestSet |
+      (uint64_t{static_cast<uint32_t>(end) & kClockRestEndMask}
+       << kClockRestEndShift);
+  // Checked before it is set, so that every rest set is counted, and a find
+  // that calls one off takes off a rest that was counted.
+  if (!ClockRestLasts(rested, probation_evictions_.LoadRelaxed())) {
+    return false;
+  }
   uint64_t laps = clock_laps_.LoadRelaxed();
   for (;;) {
     const uint32_t credited = static_cast<uint32_t>(laps & kClockLapMask);
     if (static_cast<int32_t>(credited - lap) >= 0) {
       return false;
     }
-    // Credited up to the step before the lap, which it was not.
-    const uint64_t rested =
-        uint64_t{lap - 1} | kClockRestSet |
-        (uint64_t{static_cast<uint32_t>(end) & kClockRestEndMask}
-         << kClockRestEndShift);
     if (clock_laps_.CasWeakRelaxed(laps, rested)) {
       return true;
     }

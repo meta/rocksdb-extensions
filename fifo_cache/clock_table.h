@@ -631,12 +631,13 @@ class BaseClockTable {
     return UsageCanTake(usage_.LoadRelaxed(), charge);
   }
   // FIFOCache: adds bytes of table metadata (a slot the table grows by, or
-  // a probation ring) to usage under kFullChargeCacheMetadata. Under
-  // strict_capacity_limit only if usage stays within capacity less keep,
-  // the charge of the entry being inserted, so metadata never takes usage
-  // past capacity, as FIFOCache did before this table, where
-  // HyperClockCache charges its growth past it. Returns whether it added
-  // them; UnchargeMetadata takes them back.
+  // a probation ring) to usage under kFullChargeCacheMetadata, only if
+  // usage can take them and keep, the charge of the entry being inserted
+  // (see UsageCanTake). Under strict_capacity_limit, also only if usage
+  // stays within capacity less keep, so metadata never takes usage past
+  // capacity, as FIFOCache did before this table, where HyperClockCache
+  // charges its growth past it. Returns whether it added them;
+  // UnchargeMetadata takes them back.
   bool ChargeMetadata(size_t bytes, size_t keep);
   void UnchargeMetadata(size_t bytes);
 #ifndef NDEBUG
@@ -1068,6 +1069,10 @@ class AutoHyperClockTable : public BaseClockTable {
     bool replaced = false;
     size_t slot_charge = 0;
     size_t ring_charge = 0;
+    // FIFOCache: whether the insert counted an effort cap stop, after which
+    // its eviction for a ring it charged counts none (see
+    // EvictForChargedRing).
+    bool effort_cap_counted = false;
   };
 
   void StartInsert(InsertState& state);
@@ -1097,7 +1102,10 @@ class AutoHyperClockTable : public BaseClockTable {
   // up_to, or nothing more can be evicted. For SetCapacity, which evicts at
   // once where HyperClockCache leaves it to the next insert, and for an
   // insert that charged a probation ring, which evicts only for the ring.
-  void EvictOverCapacity(size_t up_to = SIZE_MAX);
+  // Counts an effort cap stop if it gives up at the cap and ends over
+  // capacity, unless count_cap_stop is false, for an insert that counted
+  // one already.
+  void EvictOverCapacity(size_t up_to = SIZE_MAX, bool count_cap_stop = true);
 
   // FIFOCache: and the ghost's stamp step, which follows capacity (see
   // ghost_stamp_shift_).
@@ -1146,10 +1154,11 @@ class AutoHyperClockTable : public BaseClockTable {
   void EraseUnRefEntries();
 
   size_t GetTableSize() const;
-  // FIFOCache: the slots Grow has claimed, each charged then. Grows that
-  // finish out of order can leave it ahead of GetTableSize() until an
-  // insert brings the length up, with entries in the slots between, so
-  // scans of the table's entries go this far.
+  // FIFOCache: the slots Grow has claimed, each charged then. It is ahead
+  // of GetTableSize() while a Grow that claimed an earlier slot than
+  // another that finished is still splitting (see CatchUpLengthInfoNoWait),
+  // with entries in the slots between, so scans of the table's entries and
+  // the resident clock's sweep go this far.
   size_t GetClaimedLength() const;
 
   size_t GetOccupancyLimit() const;
@@ -1360,6 +1369,11 @@ class AutoHyperClockTable : public BaseClockTable {
   // the corresponding old home.)
   void CatchUpLengthInfoNoWait(size_t known_usable_grow_home);
 
+  // FIFOCache: whether the Grow that claimed grow_home has published the
+  // new shift to the head of the chain it splits, after which inserts and
+  // lookups use grow_home's chain and length_info_ can take it in.
+  bool GrownSlotReady(size_t grow_home) const;
+
   // FIFOCache: the S3-FIFO pieces on top of the table.
 
   // TryInsert for DoInsert that also writes the slot's probation word, with
@@ -1488,7 +1502,12 @@ class AutoHyperClockTable : public BaseClockTable {
   void CountProbationEviction(EvictionData* data);
   // At the return to the start of the table that ends lap `lap` (see
   // clock_laps_): sets a rest lasting until probation_evictions_ reaches
-  // `end` and returns true if no step has credited that lap or a later one.
+  // `end` if no step has credited that lap or a later one, and returns
+  // whether it set one. One whose end the count has already reached, as
+  // when the shard has no entries and the call nothing pending, or other
+  // calls evicted meanwhile, isn't set, as no find of the lap could call it
+  // off. The count can still pass the end between that check and the
+  // compare-and-swap that sets the rest, as it can before a late find.
   bool RestClockAfterLap(uint32_t lap, uint64_t end);
   // Credits lap `lap` for a step that evicted or ran down a countdown,
   // which ends a standing rest if the lap is later than the credited one.
@@ -1674,7 +1693,8 @@ class AutoHyperClockTable : public BaseClockTable {
   // takes it out of resident_all_pinned (see clock_rests_called_off_). A
   // step crediting a later lap ends the rest too, as something in the
   // resident queue isn't pinned, but the lap judged found only pinned
-  // entries, so the rest stays counted. The credit, the rest and its end
+  // entries, so the rest stays counted. A rest that would be over as it is
+  // set isn't set (see RestClockAfterLap). The credit, the rest and its end
   // change only by compare-and-swap of the whole word, so a step either
   // credits its lap before the return reads the word or finds the rest the
   // return set there, and a rest that is over is cleared only if the word
