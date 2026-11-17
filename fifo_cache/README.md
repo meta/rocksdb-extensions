@@ -6,17 +6,33 @@ Eviction*](https://jasony.me/publication/sosp23-s3fifo.pdf) (SOSP '23):
 
 - New entries enter a small probation queue. Entries read only once, and
   scans, leave through it without disturbing the hot set.
-- Probation entries that were hit again are promoted to the resident queue,
-  which evicts with a second-chance clock.
-- Keys recently evicted from probation are remembered (keys only, no
-  values); re-inserting one goes straight to resident.
-- Hits take no lock: a lookup bumps a per-entry counter and moves nothing.
-  Inserts, erases and eviction take a per-shard mutex.
+- Probation entries hit at least twice by the time they reach its head are
+  promoted to the resident queue. That queue is HyperClockCache's clock,
+  which keeps up to three hits per entry and visits entries in the table's
+  order, not in the order they arrived as the paper's main queue does.
+- Keys evicted from probation are remembered (16 bits of each key's hash,
+  no values) for as many probation evictions as the resident queue's share
+  of the shard's entries, as in the paper; re-inserting one goes straight
+  to resident.
+- Cache reservations, the entries with no value that `WriteBufferManager`
+  and `CacheReservationManager` insert and hold through the insert's handle
+  to account memory, go straight to the resident queue and are never
+  remembered. One inserted without a handle, as a cache of absent keys
+  might insert it, goes through probation like any other entry. The clock
+  doesn't count reservations as something to evict, so a shard whose
+  resident queue holds nothing else evicts from probation. A probation entry still held through a handle when
+  it reaches the head a second time goes there too, and a lap of the clock
+  that finds nothing there but held entries sends evictions to probation
+  for as many evictions as the shard has entries.
+- There is no shard mutex. Each shard is HyperClockCache's hash table: a
+  lookup takes no lock, bumps a per-entry counter and moves nothing, an
+  insert links its entry without a lock, and erasing, evicting (for an
+  insert too) and growing the table lock only the hash chains they change.
 
 `Cache::Priority` is ignored: placement follows access frequency.
 [`fifo_cache_options.h`](fifo_cache_options.h) documents the options, memory
-accounting and how to choose `num_shard_bits`. The API is experimental and
-may change.
+accounting and how it differs from HyperClockCache. The API is experimental
+and may change.
 
 This directory is a [RocksDB
 plugin](https://github.com/meta/rocksdb/blob/main/plugin/README.md): it is
@@ -38,7 +54,8 @@ cd rocksdb-extensions
 ```
 
 It fetches the RocksDB release pinned in `dependencies.lock`, builds it with
-CMake (`Release`, `ROCKSDB_PLUGINS=fifo_cache`) and installs it to
+CMake (`Release`, `ROCKSDB_PLUGINS=fifo_cache`, and on an ARMv8.2 Linux
+machine `PORTABLE=armv8.2-a+crc+crypto`, below) and installs it to
 `/path/to/new-dir/prefix`. It then loads a 1M-key DB and runs the same skewed
 `readrandom` with each cache (64 MiB, 8 threads, 10 seconds each), printing
 ops/sec and the data-block miss ratio per cache. `RUN_BENCHMARK=0` only builds;
@@ -81,6 +98,22 @@ installed stops on an unused-parameter warning in RocksDB's
 `util/compression.cc`. Install Snappy, or use CMake, which does not enable that
 warning.)
 
+On 64-bit Arm Linux, RocksDB compiles for any ARMv8 CPU
+(`-march=armv8-a+crc+crypto`), and GCC and Clang then make each atomic
+read-modify-write a call to a helper that checks at run time for the CPU's
+LSE atomic instructions. FIFOCache makes two on every hit and more on every
+insert. On ARMv8.2 or later (AWS Graviton2 and later, Arm Neoverse N1 and
+later, Ampere Altra, Apple M1 and later), add
+`-DPORTABLE=armv8.2-a+crc+crypto` to the CMake configure step, or
+`PORTABLE=armv8.2-a+crc+crypto` to each make command, and they compile to LSE
+instructions in place; the library then runs only on such CPUs. In a Linux
+VM on an Apple M4 Pro, that made `cache_bench`'s default mix 4.5% to 9.7%
+faster at 4, 16 and 64 threads, and moved its miss and hit workloads by less
+than they vary from run to run. It also takes away most of the build's
+sensitivity to where code lands: with the helpers, 624 bytes of padding after
+the plugin's code moved the default mix by up to 19%, and with LSE by up to
+4%.
+
 Installing adds the public header as
 `<prefix>/include/rocksdb/plugin/fifo_cache/fifo_cache_options.h`.
 
@@ -121,11 +154,12 @@ a string:
     --benchmarks=fillseq,readrandom --compression_type=none
   ```
 
-The string options are `capacity` (required, non-zero), `num_shard_bits`
-(below 20; by default chosen from the capacity), `strict_capacity_limit`,
+The string options are `capacity` (required, non-zero), `num_shard_bits` (below
+20; by default the most shards, up to 64 and a power of two, that leave each
+shard 4 MiB or more, and one shard under 8 MiB), `strict_capacity_limit`,
 `metadata_charge_policy` (`kFullChargeCacheMetadata` or
-`kDontChargeCacheMetadata`), `hash_seed`, `use_adaptive_mutex` and
-`max_capacity`. A bad or unknown option fails with `InvalidArgument`.
+`kDontChargeCacheMetadata`), `hash_seed`, `use_adaptive_mutex` (accepted and
+ignored) and `max_capacity`. A bad or unknown option fails with `InvalidArgument`.
 
 ### From C++
 
@@ -156,6 +190,67 @@ configure output. On Debian and Ubuntu, CMake installs the library under
 `FIFOCacheOptions` derives from `ShardedCacheOptions`, so `memory_allocator`
 and `secondary_cache` can be set here as well.
 
+### Monitoring
+
+RocksDB's statistics cover FIFOCache as they cover any block cache: the
+`BLOCK_CACHE_*` tickers count hits, misses and adds, and the
+`rocksdb.block-cache-usage`, `rocksdb.block-cache-pinned-usage` and
+`rocksdb.block-cache-entry-stats` properties give usage and entries. What
+only FIFOCache has, the state of its queues, comes from `GetFIFOCacheStats`,
+which also finds the cache behind the secondary-cache adapter that
+`MakeSharedCache` adds:
+
+```cpp
+rocksdb::FIFOCacheStats stats;
+if (rocksdb::GetFIFOCacheStats(*table_options.block_cache, &stats)) {
+  // stats.probation_usage, pinned_allowance, promotions, ghost_returns,
+  // probation_evictions, resident_evictions, effort_cap_stops, probation_full,
+  // pinned_twice, resident_all_pinned
+}
+```
+
+Apart from `probation_usage` and `pinned_allowance`, the fields count from
+the cache's creation, so export them as counters and watch their rates. The
+DB's `LOG` gets the same numbers at INFO level at each stats dump
+(`stats_dump_period_sec`), on a line starting `FIFOCache stats:`. `ghost_returns` against `probation_evictions` is
+the share of probation's victims that came back while their keys were
+remembered; with a secondary cache, the placeholders its adapter inserts
+are among the victims but never remembered, which lowers the share. A
+rising `effort_cap_stops` means inserts and capacity cuts are finding mostly
+pinned entries and leaving usage over capacity, so look at what holds
+handles (`rocksdb.block-cache-pinned-usage`). `probation_full` counts
+entries that skipped probation because its queue had no room. A shard sends
+some there as it first fills if entries are erased meanwhile, as an insert
+replacing an entry under its key erases it, and a secondary cache's adapter
+erases the placeholder it inserts on a block's first hit there at the next
+lookup; one that keeps rising after the cache has filled means the queue is
+full of entries still queued or, with `strict_capacity_limit`, that the
+queue can't grow within capacity. `pinned_allowance` is how far probation's
+share has grown past 12% of capacity because entries reached the head of the
+queue still held through the handle their insert returned. It stays near
+zero unless those handles are kept for about as long as new entries take to
+reach the head, and it is at most four times that 12%. `pinned_twice` counts
+entries that went from probation to the resident queue because they were
+still held a lap after a step first found them held, such as the index and
+filter blocks a table reader pins: those are passed over by the resident
+clock as HyperClockCache's would, and each one adds its charge to
+`pinned_allowance` once, which unpinned entries reaching the head then take
+back a sixteenth at a time. `resident_all_pinned` counts laps of the
+resident clock that evicted nothing and took no hit off any entry, having
+found nothing but held entries. A lap is judged when the clock gets back to
+the start of the table, and if a step of it still under way then (on a small
+shard with many threads evicting) turns out to have found something while
+the rest the lap set still stands, the rest is called off and the lap isn't
+counted, nor is a lap whose rest would already be over, as when the shard
+has no entries left. After each, eviction takes probation's head first, from
+the rest of that eviction on, for as many evictions as the shard has
+entries, so an insert doesn't send the clock round entries it can't evict. A
+step of the clock that finds something meanwhile, from an eviction already
+under way or one with nothing in probation to evict, ends the rest early,
+and an entry released meanwhile otherwise waits until then. One that keeps
+rising means entries held for good fill the resident queue, nearly the whole
+cache, so look at `rocksdb.block-cache-pinned-usage`.
+
 ## Limitations
 
 - RocksDB has to be built from source with the plugin; there is no
@@ -183,9 +278,10 @@ and `secondary_cache` can be set here as well.
 
 ## Tests
 
-[`fifo_cache_test.cc`](fifo_cache_test.cc) covers the eviction policy, the
-lock-free lookup path and its memory reclamation, capacity and table
-accounting, pinning, the option strings and thread exit. Tests that steer
+[`fifo_cache_test.cc`](fifo_cache_test.cc) covers the eviction policy and the
+ghost, replacing inserts, keys of any length, capacity and table
+accounting, pinning, concurrent use of the table, the counters and the option
+strings. Tests that steer
 interleavings with sync points run only in builds without `NDEBUG`. From the
 RocksDB tree with the plugin in place:
 

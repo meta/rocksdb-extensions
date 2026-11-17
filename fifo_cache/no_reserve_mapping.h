@@ -12,7 +12,8 @@
 namespace ROCKSDB_NAMESPACE {
 namespace fifo_cache {
 
-// The slot table's memory: like TypedMemMapping<T> from
+// The table's memory (its slots, probation words, ghost tags and probation
+// rings): like TypedMemMapping<T> from
 // MemMapping::AllocateLazyZeroed, but on Linux the mapping does not count
 // against the commit limit (MAP_NORESERVE; Linux ignores it under
 // vm.overcommit_memory=2), so a large reservation of which little is
@@ -41,6 +42,7 @@ class NoReserveTypedMemMapping {
 
   // nullptr on failure
   T* Get() const { return static_cast<T*>(addr_); }
+  size_t Count() const { return addr_ != nullptr ? length_ / sizeof(T) : 0; }
 
  private:
   void* addr_ = nullptr;
@@ -51,12 +53,15 @@ class NoReserveTypedMemMapping {
 
   // nullptr on failure
   T* Get() const { return mapping_.Get(); }
+  size_t Count() const { return mapping_.Count(); }
 
  private:
   TypedMemMapping<T> mapping_;
 #endif
 
  public:
+  T& operator[](size_t index) const { return Get()[index]; }
+
   NoReserveTypedMemMapping(const NoReserveTypedMemMapping&) = delete;
   NoReserveTypedMemMapping& operator=(const NoReserveTypedMemMapping&) = delete;
 };
