@@ -37,6 +37,9 @@ class FIFOCache
   // a hit; RocksDB releases every handle as useful.
   using AutoHyperClockCache::Release;
   bool Release(Handle* handle, bool useful, bool erase_if_last_ref) override;
+  // As useful, without the virtual call to the Release above that
+  // ShardedCache's makes.
+  bool Release(Handle* handle, bool erase_if_last_ref = false) override;
 
   // The shards' FIFOCacheStats summed, as GetFIFOCacheStats returns them.
   FIFOCacheStats GetStats() const;

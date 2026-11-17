@@ -54,7 +54,8 @@ cd rocksdb-extensions
 ```
 
 It fetches the RocksDB release pinned in `dependencies.lock`, builds it with
-CMake (`Release`, `ROCKSDB_PLUGINS=fifo_cache`) and installs it to
+CMake (`Release`, `ROCKSDB_PLUGINS=fifo_cache`, and on an ARMv8.2 Linux
+machine `PORTABLE=armv8.2-a+crc+crypto`, below) and installs it to
 `/path/to/new-dir/prefix`. It then loads a 1M-key DB and runs the same skewed
 `readrandom` with each cache (64 MiB, 8 threads, 10 seconds each), printing
 ops/sec and the data-block miss ratio per cache. `RUN_BENCHMARK=0` only builds;
@@ -96,6 +97,22 @@ make ROCKSDB_PLUGINS=fifo_cache PREFIX=/path/to/prefix install-static
 installed stops on an unused-parameter warning in RocksDB's
 `util/compression.cc`. Install Snappy, or use CMake, which does not enable that
 warning.)
+
+On 64-bit Arm Linux, RocksDB compiles for any ARMv8 CPU
+(`-march=armv8-a+crc+crypto`), and GCC and Clang then make each atomic
+read-modify-write a call to a helper that checks at run time for the CPU's
+LSE atomic instructions. FIFOCache makes two on every hit and more on every
+insert. On ARMv8.2 or later (AWS Graviton2 and later, Arm Neoverse N1 and
+later, Ampere Altra, Apple M1 and later), add
+`-DPORTABLE=armv8.2-a+crc+crypto` to the CMake configure step, or
+`PORTABLE=armv8.2-a+crc+crypto` to each make command, and they compile to LSE
+instructions in place; the library then runs only on such CPUs. In a Linux
+VM on an Apple M4 Pro, that made `cache_bench`'s default mix 4.5% to 9.7%
+faster at 4, 16 and 64 threads, and moved its miss and hit workloads by less
+than they vary from run to run. It also takes away most of the build's
+sensitivity to where code lands: with the helpers, 624 bytes of padding after
+the plugin's code moved the default mix by up to 19%, and with LSE by up to
+4%.
 
 Installing adds the public header as
 `<prefix>/include/rocksdb/plugin/fifo_cache/fifo_cache_options.h`.

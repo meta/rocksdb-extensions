@@ -781,6 +781,46 @@ TEST_F(FIFOCacheTest, ReleaseEraseIfLastRef) {
   EXPECT_EQ(0, cache->GetUsage());
 }
 
+#ifndef NDEBUG
+// An entry referenced and released billions of times keeps exact counts:
+// the release that takes the release counter past its top bit clears the
+// top bit of both counters, on an entry in the table and on one erased while
+// referenced, which its last release frees.
+TEST_F(FIFOCacheTest, CountersNearOverflowStayExact) {
+  LoneShard lone(/*capacity*/ 1 << 20);
+  Shard& shard = lone.shard;
+  const UniqueId64x2 hash = Shard::ComputeHash(K("x"), lone.seed);
+  const int64_t live = LiveValues().load();
+  Shard::HandleImpl* h = nullptr;
+  ASSERT_OK(shard.Insert(K("x"), hash, new CountedValue(1), CountedHelper(),
+                         /*charge*/ 1, &h, Cache::Priority::LOW));
+  ASSERT_NE(nullptr, h);
+  auto cycles = [&] {
+    // Many more than the counters hold.
+    for (int i = 0; i < 10000; ++i) {
+      shard.TEST_RefN(h, 1234567);
+      shard.TEST_ReleaseN(h, 1234567);
+    }
+  };
+  // Held many times over meanwhile.
+  shard.TEST_RefN(h, 123456789);
+  cycles();
+  shard.TEST_ReleaseN(h, 123456789);
+  // Just the insert's reference.
+  EXPECT_EQ(1, shard.GetPinnedUsage());
+  shard.TEST_RefN(h, 123456789);
+  shard.Erase(K("x"), hash);
+  cycles();
+  shard.TEST_ReleaseN(h, 123456789);
+  EXPECT_EQ(live + 1, LiveValues().load());
+  EXPECT_EQ(1, shard.GetUsage());
+  // The last reference frees it.
+  EXPECT_TRUE(shard.Release(h));
+  EXPECT_EQ(live, LiveValues().load());
+  EXPECT_EQ(0, shard.GetUsage());
+}
+#endif  // !NDEBUG
+
 // Usage and pinned usage are the entries' charges, plus the table's under
 // kFullChargeCacheMetadata. Pinned usage leaves out the slots of pinned
 // entries under either policy, where HyperClockCache counts them.
@@ -8029,7 +8069,7 @@ TEST_F(FIFOCacheTest, CapacityCutWhileAGrowStallsReachesTheNextSlotsChain) {
 }
 
 // The same race while a split is under way. From its head, k's chain holds
-// z1, k's newer entry, z2 and k's older entry, and the split sends k's
+// z1, k's newer entry, z2, k's older entry and z0, and the split sends k's
 // entries to a new chain. The older insert's walk reads the head and waits
 // while the split points z1's link past k's newer entry to z2, whose old
 // link still leads to k's older entry. Going on, the walk would find the
@@ -8038,7 +8078,8 @@ TEST_F(FIFOCacheTest, CapacityCutWhileAGrowStallsReachesTheNextSlotsChain) {
 // newer, and erases both, so the key is absent until it is inserted again
 // and never has the older value.
 TEST_F(FIFOCacheTest, RacingReplacingInsertsWhileASplitSkipsAnEntryEraseBoth) {
-  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+  // A table with a slot for each of the five entries.
+  std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1 << 20);
   FIFOCache* fifo = Fifo(cache.get());
   fifo->TEST_SetOccupancyLimit(SIZE_MAX);
   // The next Grow splits old_home's chain, and sends the keys with bit
@@ -8056,8 +8097,12 @@ TEST_F(FIFOCacheTest, RacingReplacingInsertsWhileASplitSkipsAnEntryEraseBoth) {
         .ToString();
   };
   const std::string k = key_with(0xaeed00, grow_home);
+  const std::string z0 = key_with(0xaeed03, old_home);
   const std::string z1 = key_with(0xaeed01, old_home);
   const std::string z2 = key_with(0xaeed02, old_home);
+  // So that the first insert of k links onto a chain that isn't empty, and
+  // looks for entries it replaces.
+  ASSERT_OK(Insert(cache.get(), z0));
   Parker first_linked;
   Parker second_linked;
   Parker first_walking;
@@ -8135,8 +8180,68 @@ TEST_F(FIFOCacheTest, RacingReplacingInsertsWhileASplitSkipsAnEntryEraseBoth) {
   EXPECT_OK(status[1]);
   EXPECT_FALSE(status[1].IsOkOverwritten());
   EXPECT_EQ(nullptr, cache->Lookup(k));
-  EXPECT_EQ(3, cache->GetOccupancyCount());
-  EXPECT_EQ(3, cache->GetUsage());
+  EXPECT_EQ(4, cache->GetOccupancyCount());
+  EXPECT_EQ(4, cache->GetUsage());
+}
+
+// An insert linked onto an empty chain doesn't look for entries it
+// replaces, since any entry with its key would be on that chain. Linked
+// onto a chain holding another key, it does. Either way the insert of the
+// key linked after it replaces it.
+TEST_F(FIFOCacheTest, InsertLinkedOntoAnEmptyChainSkipsTheReplaceScan) {
+  for (bool chain_empty : {true, false}) {
+    SCOPED_TRACE(chain_empty);
+    std::shared_ptr<Cache> cache = NewCache(/*capacity*/ 1000);
+    const std::vector<std::string> keys = KeysWithHomeZero(cache.get(), 2);
+    const std::string& k = keys[0];
+    if (!chain_empty) {
+      ASSERT_OK(Insert(cache.get(), keys[1]));
+    }
+    static thread_local int inserter = 0;
+    Parker linked[2];
+    std::atomic<int> first_walks{0};
+    SyncPoint::GetInstance()->SetCallBack("FIFOCache::DoInsert:Linked",
+                                          [&](void*) {
+                                            if (inserter > 0) {
+                                              linked[inserter - 1].Park();
+                                            }
+                                          });
+    SyncPoint::GetInstance()->SetCallBack("FIFOCache::FirstLinked:Head",
+                                          [&](void*) {
+                                            if (inserter == 1) {
+                                              first_walks.fetch_add(1);
+                                            }
+                                          });
+    SyncPoint::GetInstance()->EnableProcessing();
+    Status status[2];
+    port::Thread first([&] {
+      inserter = 1;
+      status[0] = Insert(cache.get(), k, 2);
+    });
+    linked[0].WaitParked();
+    port::Thread second([&] {
+      inserter = 2;
+      status[1] = Insert(cache.get(), k, 3);
+    });
+    linked[1].WaitParked();
+    // The first finds the second's entry linked ahead of its own, if it
+    // looks, and leaves it.
+    linked[0].Resume();
+    first.join();
+    linked[1].Resume();
+    second.join();
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    EXPECT_EQ(chain_empty ? 0 : 1, first_walks.load());
+    EXPECT_OK(status[0]);
+    EXPECT_FALSE(status[0].IsOkOverwritten());
+    EXPECT_TRUE(status[1].IsOkOverwritten()) << status[1].ToString();
+    Cache::Handle* h = cache->Lookup(k);
+    ASSERT_NE(nullptr, h);
+    EXPECT_EQ(3, cache->GetCharge(h));
+    cache->Release(h);
+    EXPECT_EQ(chain_empty ? 3 : 4, cache->GetUsage());
+  }
 }
 
 // The same race when the walk can't tell which insert linked first: 64

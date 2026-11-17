@@ -71,8 +71,20 @@ curl -fsSL --retry 3 \
   tar -xz --strip-components=1 -C "${rocksdb_source}"
 ln -s "${REPOSITORY_ROOT}/fifo_cache" "${rocksdb_source}/plugin/fifo_cache"
 
+# On 64-bit Arm Linux, RocksDB compiles for any ARMv8 CPU, which leaves its
+# atomics as calls to run-time helpers. This build is for this machine, so on
+# an ARMv8.2 CPU (LSE atomics and DC CVAP) it targets ARMv8.2 (see "Build
+# RocksDB with the plugin" in fifo_cache/README.md).
+arch_args=()
+if [[ "$(uname -s)" == Linux && "$(uname -m)" == aarch64 ]] &&
+  grep -m1 '^Features' /proc/cpuinfo | grep -qw atomics &&
+  grep -m1 '^Features' /proc/cpuinfo | grep -qw dcpop; then
+  arch_args=(-DPORTABLE=armv8.2-a+crc+crypto)
+fi
+
 cmake -S "${rocksdb_source}" -B "${rocksdb_source}/build" \
-  -DCMAKE_BUILD_TYPE=Release -DROCKSDB_PLUGINS=fifo_cache
+  -DCMAKE_BUILD_TYPE=Release -DROCKSDB_PLUGINS=fifo_cache \
+  ${arch_args[@]+"${arch_args[@]}"}
 cmake --build "${rocksdb_source}/build" --parallel "${build_jobs}"
 cmake --install "${rocksdb_source}/build" --prefix "${prefix}"
 

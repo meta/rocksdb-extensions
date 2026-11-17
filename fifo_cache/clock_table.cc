@@ -157,79 +157,6 @@ inline bool ClockUpdate(ClockHandle& h, BaseClockTable::EvictionData* data,
   }
 }
 
-// If an entry doesn't receive clock updates but is repeatedly referenced &
-// released, the acquire and release counters could overflow without some
-// intervention. This is that intervention, which should be inexpensive
-// because it only incurs a simple, very predictable check. (Applying a bit
-// mask in addition to an increment to every Release likely would be
-// relatively expensive, because it's an extra atomic update.)
-//
-// We do have to assume that we never have many millions of simultaneous
-// references to a cache handle, because we cannot represent so many
-// references with the difference in counters, masked to the number of
-// counter bits. Similarly, we assume there aren't millions of threads
-// holding transient references (which might be "undone" rather than
-// released by the way).
-//
-// Consider these possible states for each counter:
-// low: less than kMaxCountdown
-// medium: kMaxCountdown to half way to overflow + kMaxCountdown
-// high: half way to overflow + kMaxCountdown, or greater
-//
-// And these possible states for the combination of counters:
-// acquire / release
-// -------   -------
-// low       low       - Normal / common, with caveats (see below)
-// medium    low       - Can happen while holding some refs
-// high      low       - Violates assumptions (too many refs)
-// low       medium    - Violates assumptions (refs underflow, etc.)
-// medium    medium    - Normal (very read heavy cache)
-// high      medium    - Can happen while holding some refs
-// low       high      - This function is supposed to prevent
-// medium    high      - Violates assumptions (refs underflow, etc.)
-// high      high      - Needs CorrectNearOverflow
-//
-// Basically, this function detects (high, high) state (inferred from
-// release alone being high) and bumps it back down to (medium, medium)
-// state with the same refcount and the same logical countdown counter
-// (everything > kMaxCountdown is logically the same). Note that bumping
-// down to (low, low) would modify the countdown counter, so is "reserved"
-// in a sense.
-//
-// If near-overflow correction is triggered here, there's no guarantee
-// that another thread hasn't freed the entry and replaced it with another.
-// Therefore, it must be the case that the correction does not affect
-// entries unless they are very old (many millions of acquire-release cycles).
-// (Our bit manipulation is indeed idempotent and only affects entries in
-// exceptional cases.) We assume a pre-empted thread will not stall that long.
-// If it did, the state could be corrupted in the (unlikely) case that the top
-// bit of the acquire counter is set but not the release counter, and thus
-// we only clear the top bit of the acquire counter on resumption. It would
-// then appear that there are too many refs and the entry would be permanently
-// pinned (which is not terrible for an exceptionally rare occurrence), unless
-// it is referenced enough (at least kMaxCountdown more times) for the release
-// counter to reach "high" state again and bumped back to "medium." (This
-// motivates only checking for release counter in high state, not both in high
-// state.)
-inline void CorrectNearOverflow(SlotMeta old_meta,
-                                BitFieldsAtomic<SlotMeta>& meta) {
-  // We clear both top-most counter bits at the same time.
-  constexpr uint32_t kCounterTopBit = uint32_t{1}
-                                      << (SlotMeta::kCounterNumBits - 1);
-  // The threshold for correcting "near overflow" is to ensure
-  // (a) the value has a top bit set that can be cleared
-  // (b) when we clear the top bit, the eviction state will be preserved
-  //     (everything >= kMaxCountdown is treated equivalently)
-  // As mentioned above, we only check the release count.
-  constexpr uint32_t kThreshold = kCounterTopBit + ClockHandle::kMaxCountdown;
-
-  if (UNLIKELY(old_meta.GetReleaseCounter() > kThreshold)) {
-    auto clear_transform = AcquireCounter::AndTransform(kCounterTopBit - 1) +
-                           ReleaseCounter::AndTransform(kCounterTopBit - 1);
-    meta.ApplyRelaxed(clear_transform);
-  }
-}
-
 // FIFOCache: an occupied slot isn't checked for the key. The insert links
 // its entry and then erases any other with the key (EraseReplaced), where
 // HyperClockCache keeps a visible match it finds here, counting a hit on it,
@@ -1100,15 +1027,6 @@ bool ClockCacheShard<Table>::Ref(HandleImpl* h) {
   return true;
 }
 
-template <class Table>
-bool ClockCacheShard<Table>::Release(HandleImpl* handle, bool useful,
-                                     bool erase_if_last_ref) {
-  if (handle == nullptr) {
-    return false;
-  }
-  return table_.Release(handle, useful, erase_if_last_ref);
-}
-
 #ifndef NDEBUG
 template <class Table>
 void ClockCacheShard<Table>::TEST_RefN(HandleImpl* h, uint32_t n) {
@@ -1120,12 +1038,6 @@ void ClockCacheShard<Table>::TEST_ReleaseN(HandleImpl* h, uint32_t n) {
   table_.TEST_ReleaseN(h, n);
 }
 #endif
-
-template <class Table>
-bool ClockCacheShard<Table>::Release(HandleImpl* handle,
-                                     bool erase_if_last_ref) {
-  return Release(handle, /*useful=*/true, erase_if_last_ref);
-}
 
 template <class Table>
 void ClockCacheShard<Table>::Erase(const Slice& key,
@@ -2862,9 +2774,13 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
         ghost_returns_.FetchAddRelaxed(1);
       }
       // FIFOCache: replaces any other entry with the key, while our
-      // reference keeps this one in the table.
+      // reference keeps this one in the table. Linked onto an empty chain,
+      // there's none: an entry with the key would be on this chain, a grow
+      // gives its new head an entry of the old chain if any belongs there,
+      // and an insert linked after this one is newer and replaces it.
       ReplacedEntries replaced;
-      state.replaced = EraseReplaced(proto, arr + idx, &replaced);
+      state.replaced = !next_with_shift.IsEnd() &&
+                       EraseReplaced(proto, arr + idx, &replaced);
       if (state.replaced) {
         TEST_SYNC_POINT("FIFOCache::DoInsert:BeforeInherit");
         word = TakeReplacedPlace(idx, word, replaced, proto.GetTotalCharge());
@@ -3247,14 +3163,8 @@ bool AutoHyperClockTable::TryEraseHandle(HandleImpl* h, bool holding_ref,
   return true;
 }
 
-bool AutoHyperClockTable::Release(HandleImpl* h, bool useful,
-                                  bool erase_if_last_ref) {
-  // In contrast with LRUCache's Release, this function won't delete the handle
-  // when the cache is above capacity and the reference is the last one. Space
-  // is only freed up by Evict/PurgeImpl (called by Insert when space
-  // is needed) and Erase. We do this to avoid an extra atomic read of the
-  // variable usage_.
-
+bool AutoHyperClockTable::ReleaseSlow(HandleImpl* h, bool useful,
+                                      bool erase_if_last_ref) {
   if (erase_if_last_ref) {
     // FIFOCache: decided while this reference still holds the entry, so the
     // erase can't reach a later entry in a slot emptied and refilled after
@@ -3290,33 +3200,31 @@ bool AutoHyperClockTable::Release(HandleImpl* h, bool useful,
     }
   }
 
+  // Release as useful without erasing is inline (see Release).
+  assert(!useful);
+  (void)useful;
+  // Decrement acquire counter to pretend it never happened
   SlotMeta old_meta;
-  if (useful) {
-    // Increment release counter to indicate was used
-    auto add_release = ReleaseCounter::PlusTransformPromiseNoOverflow(1);
-    h->meta.Apply(add_release, &old_meta);
-    // Correct for possible (but rare) overflow
-    CorrectNearOverflow(old_meta, h->meta);
-  } else {
-    // Decrement acquire counter to pretend it never happened
-    auto sub_acquire = AcquireCounter::MinusTransformPromiseNoUnderflow(1);
-    h->meta.Apply(sub_acquire, &old_meta);
-  }
+  auto sub_acquire = AcquireCounter::MinusTransformPromiseNoUnderflow(1);
+  h->meta.Apply(sub_acquire, &old_meta);
 
   assert(old_meta.IsShareable());
   // No underflow
   assert(old_meta.GetAcquireCounter() != old_meta.GetReleaseCounter());
 
   if (UNLIKELY(old_meta.IsInvisible())) {
-    // FIFOCache: erased while referenced. Frees it if this was the last
-    // reference, and not a new entry in the slot if another release freed
-    // it first.
-    TEST_SYNC_POINT("FIFOCache::Release:BeforeErase");
-    return TryEraseHandle(h, /*holding_ref=*/false, /*mark_invisible=*/false,
-                          /*only_if_invisible=*/true);
-  } else {
-    return false;
+    return ReleaseErased(h);
   }
+  return false;
+}
+
+bool AutoHyperClockTable::ReleaseErased(HandleImpl* h) {
+  // FIFOCache: erased while referenced. Frees it if this was the last
+  // reference, and not a new entry in the slot if another release freed it
+  // first.
+  TEST_SYNC_POINT("FIFOCache::Release:BeforeErase");
+  return TryEraseHandle(h, /*holding_ref=*/false, /*mark_invisible=*/false,
+                        /*only_if_invisible=*/true);
 }
 
 #ifndef NDEBUG

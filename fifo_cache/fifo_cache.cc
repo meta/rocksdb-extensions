@@ -77,6 +77,11 @@ bool FIFOCache::Release(Handle* handle, bool useful, bool erase_if_last_ref) {
   return AutoHyperClockCache::Release(handle, useful, erase_if_last_ref);
 }
 
+bool FIFOCache::Release(Handle* handle, bool erase_if_last_ref) {
+  return AutoHyperClockCache::Release(handle, /*useful=*/true,
+                                      erase_if_last_ref);
+}
+
 bool FIFOCache::TEST_InProbation(const Slice& key) {
   Cache::Handle* h = Lookup(key);
   if (h == nullptr) {

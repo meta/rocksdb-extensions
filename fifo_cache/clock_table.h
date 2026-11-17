@@ -30,6 +30,7 @@
 #include "cache/cache_key.h"
 #include "cache/sharded_cache.h"
 #include "plugin/fifo_cache/no_reserve_mapping.h"
+#include "port/likely.h"
 #include "port/mmap.h"
 #include "rocksdb/cache.h"
 #include "util/atomic.h"
@@ -505,6 +506,81 @@ struct ClockHandle : public ClockHandleBasicData {
   // See above. Mutable for read reference counting.
   mutable BitFieldsAtomic<SlotMeta> meta{};
 };  // struct ClockHandle
+
+// If an entry doesn't receive clock updates but is repeatedly referenced &
+// released, the acquire and release counters could overflow without some
+// intervention. This is that intervention, which should be inexpensive
+// because it only incurs a simple, very predictable check. (Applying a bit
+// mask in addition to an increment to every Release likely would be
+// relatively expensive, because it's an extra atomic update.)
+//
+// We do have to assume that we never have many millions of simultaneous
+// references to a cache handle, because we cannot represent so many
+// references with the difference in counters, masked to the number of
+// counter bits. Similarly, we assume there aren't millions of threads
+// holding transient references (which might be "undone" rather than
+// released by the way).
+//
+// Consider these possible states for each counter:
+// low: less than kMaxCountdown
+// medium: kMaxCountdown to half way to overflow + kMaxCountdown
+// high: half way to overflow + kMaxCountdown, or greater
+//
+// And these possible states for the combination of counters:
+// acquire / release
+// -------   -------
+// low       low       - Normal / common, with caveats (see below)
+// medium    low       - Can happen while holding some refs
+// high      low       - Violates assumptions (too many refs)
+// low       medium    - Violates assumptions (refs underflow, etc.)
+// medium    medium    - Normal (very read heavy cache)
+// high      medium    - Can happen while holding some refs
+// low       high      - This function is supposed to prevent
+// medium    high      - Violates assumptions (refs underflow, etc.)
+// high      high      - Needs CorrectNearOverflow
+//
+// Basically, this function detects (high, high) state (inferred from
+// release alone being high) and bumps it back down to (medium, medium)
+// state with the same refcount and the same logical countdown counter
+// (everything > kMaxCountdown is logically the same). Note that bumping
+// down to (low, low) would modify the countdown counter, so is "reserved"
+// in a sense.
+//
+// If near-overflow correction is triggered here, there's no guarantee
+// that another thread hasn't freed the entry and replaced it with another.
+// Therefore, it must be the case that the correction does not affect
+// entries unless they are very old (many millions of acquire-release cycles).
+// (Our bit manipulation is indeed idempotent and only affects entries in
+// exceptional cases.) We assume a pre-empted thread will not stall that long.
+// If it did, the state could be corrupted in the (unlikely) case that the top
+// bit of the acquire counter is set but not the release counter, and thus
+// we only clear the top bit of the acquire counter on resumption. It would
+// then appear that there are too many refs and the entry would be permanently
+// pinned (which is not terrible for an exceptionally rare occurrence), unless
+// it is referenced enough (at least kMaxCountdown more times) for the release
+// counter to reach "high" state again and bumped back to "medium." (This
+// motivates only checking for release counter in high state, not both in high
+// state.)
+inline void CorrectNearOverflow(ClockHandle::SlotMeta old_meta,
+                                BitFieldsAtomic<ClockHandle::SlotMeta>& meta) {
+  using SlotMeta = ClockHandle::SlotMeta;
+  // We clear both top-most counter bits at the same time.
+  constexpr uint32_t kCounterTopBit = uint32_t{1}
+                                      << (SlotMeta::kCounterNumBits - 1);
+  // The threshold for correcting "near overflow" is to ensure
+  // (a) the value has a top bit set that can be cleared
+  // (b) when we clear the top bit, the eviction state will be preserved
+  //     (everything >= kMaxCountdown is treated equivalently)
+  // As mentioned above, we only check the release count.
+  constexpr uint32_t kThreshold = kCounterTopBit + ClockHandle::kMaxCountdown;
+
+  if (UNLIKELY(old_meta.GetReleaseCounter() > kThreshold)) {
+    auto clear_transform =
+        SlotMeta::AcquireCounter::AndTransform(kCounterTopBit - 1) +
+        SlotMeta::ReleaseCounter::AndTransform(kCounterTopBit - 1);
+    meta.ApplyRelaxed(clear_transform);
+  }
+}
 
 class BaseClockTable {
  public:
@@ -1129,7 +1205,33 @@ class AutoHyperClockTable : public BaseClockTable {
   HandleImpl* Lookup(const UniqueId64x2& hashed_key, const Slice* key,
                      const HandleImpl* skip = nullptr);
 
-  bool Release(HandleImpl* handle, bool useful, bool erase_if_last_ref);
+  // In contrast with LRUCache's Release, this function won't delete the
+  // handle when the cache is above capacity and the reference is the last
+  // one. Space is only freed up by Evict/PurgeImpl (called by Insert when
+  // space is needed) and Erase. We do this to avoid an extra atomic read of
+  // the variable usage_.
+  // FIFOCache: a release as useful that doesn't erase, which is nearly every
+  // release, is inline here, and the others are ReleaseSlow.
+  bool Release(HandleImpl* h, bool useful, bool erase_if_last_ref) {
+    if (UNLIKELY(!useful || erase_if_last_ref)) {
+      return ReleaseSlow(h, useful, erase_if_last_ref);
+    }
+    // Increment release counter to indicate was used
+    ClockHandle::SlotMeta old_meta;
+    h->meta.Apply(
+        ClockHandle::SlotMeta::ReleaseCounter::PlusTransformPromiseNoOverflow(
+            1),
+        &old_meta);
+    // Correct for possible (but rare) overflow
+    CorrectNearOverflow(old_meta, h->meta);
+    assert(old_meta.IsShareable());
+    // No underflow
+    assert(old_meta.GetAcquireCounter() != old_meta.GetReleaseCounter());
+    if (UNLIKELY(old_meta.IsInvisible())) {
+      return ReleaseErased(h);
+    }
+    return false;
+  }
 
   void Erase(const UniqueId64x2& hashed_key, const Slice* key);
 
@@ -1330,6 +1432,12 @@ class AutoHyperClockTable : public BaseClockTable {
   static constexpr double kMaxLoadFactor = 0.80;
 
  private:  // functions
+  // FIFOCache: Release with erase_if_last_ref, or not as useful.
+  bool ReleaseSlow(HandleImpl* h, bool useful, bool erase_if_last_ref);
+  // FIFOCache: Release of a reference to an entry erased while referenced,
+  // once the reference is dropped (see TryEraseHandle's only_if_invisible).
+  bool ReleaseErased(HandleImpl* h);
+
   // Returns true iff increased usable length. Due to load factor
   // considerations, GrowIfNeeded might call this more than once to make room
   // for one more entry.
@@ -1802,9 +1910,18 @@ class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
 
   HandleImpl* Lookup(const Slice& key, const UniqueId64x2& hashed_key);
 
-  bool Release(HandleImpl* handle, bool useful, bool erase_if_last_ref);
+  // FIFOCache: inline, as is the table's common case, so FIFOCache::Release
+  // inlines both.
+  bool Release(HandleImpl* handle, bool useful, bool erase_if_last_ref) {
+    if (handle == nullptr) {
+      return false;
+    }
+    return table_.Release(handle, useful, erase_if_last_ref);
+  }
 
-  bool Release(HandleImpl* handle, bool erase_if_last_ref = false);
+  bool Release(HandleImpl* handle, bool erase_if_last_ref = false) {
+    return Release(handle, /*useful=*/true, erase_if_last_ref);
+  }
 
   bool Ref(HandleImpl* handle);
 
